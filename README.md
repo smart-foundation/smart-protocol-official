@@ -1,238 +1,247 @@
 # Smart Protocol
 
-**A timeless, universal system contract. Zero-copy. Language-agnostic. Platform-agnostic. AI-first.**
+**A universal, zero-copy, language-agnostic system contract. The first protocol that makes OS boundaries transparent — for humans and AI alike.**
 
 ---
 
-## What Is Smart Protocol?
+## What Makes This Different
 
-Smart Protocol is the **first universal system contract** — a complete, coherent protocol covering every domain a system needs, expressed in Cap'n Proto schemas. It is not a library, not a daemon, not an OS. It is the **contract** that makes everything else interoperate.
-
-### The Eight Properties Nobody Else Has All Of
-
-| Property | What It Means |
-|----------|---------------|
-| **Language-agnostic** | Rust, C, C++, Python, JavaScript, Java, Go, Swift, bash, TOML — any language with a Cap'n Proto compiler |
-| **Platform-agnostic** | Linux, Windows, macOS, SpaceOS, bare metal, WebAssembly, remote — same schemas, different backends |
-| **Shape-agnostic** | Library, CLI, config file (TOML/JSON), script (`.smart`), IPC (Unix socket), network (TCP/WebSocket) — all speak the same protocol |
-| **Complete** | 89 capability domains covering audio, display, input, network, storage, processes, AI, security, UI, and more |
-| **A contract** | Cap'n Proto schemas with forward-compatible evolution — never breaks, ordinals are permanent |
-| **AI-first** | Same protocol for humans and machines — AI agents use the exact same interfaces as CLI and apps |
-| **Zero-cost** | Cap'n Proto zero-copy serialization, library-first backends (no daemons), no runtime diffing |
-| **Vertically integrated** | Kernel → services → UI → AI — every layer speaks the protocol, every layer replaceable |
+| Traditional Approach | Smart Protocol |
+|----------------------|----------------|
+| Daemons (systemd, D-Bus, PulseAudio, etc.) | **Library-first, no daemons** |
+| POSIX/Linux-specific syscalls | **Cap'n Proto IS the syscall** — no ioctl, no FFI |
+| Linux/Windows/macOS separate APIs | **One contract, all platforms** (Linux, Windows, macOS, SpaceOS, bare metal, WASM) |
+| Human CLIs vs Machine APIs | **Same protocol for humans AND AI agents** |
+| C/C++ only, or language-specific bindings | **10+ languages** (Rust, C, C++, Python, JS, Go, Swift, bash, TOML, `.smart` scripts) |
+| Config files, scripts, APIs all separate | **6 unified shapes** — library, CLI, config, script, IPC, network |
+| Version hell, breaking changes | **Forward-compatible forever** — ordinals are permanent, unions have `unknown` |
+| Daemons, context switches, copies | **Zero-copy, zero-cost** — Cap'n Proto zero-copy, monomorphized, no vtables |
 
 ---
 
-## The Six Shapes
+## The Six Shapes — All Equal, All Speaking the Same Language
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Smart Protocol                           │
-├──────────────┬──────────────┬──────────────┬────────────────┤
-│   LIBRARY    │     CLI      │     IPC      │     CONFIG     │
-│   link &     │   `smart`    │   capnp over │   TOML/JSON    │
-│   call       │   command    │   shared mem │   `smart apply`│
-├──────────────┼──────────────┼──────────────┼────────────────┤
-│   NETWORK    │    SCRIPT    │              │                │
-│   TCP/WS     │   `.smart`   │              │                │
-│   remote     │   script     │              │                │
-└──────────────┴──────────────┴──────────────┴────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      Smart Protocol                             │
+├──────────────┬──────────────┬──────────────┬───────────────────┤
+│   LIBRARY    │     CLI      │     IPC      │     CONFIG        │
+│   link &     │   `smart`    │   capnp over │   TOML/JSON       │
+│   call       │   command    │   shared mem │   `smart apply`   │
+├──────────────┼──────────────┼──────────────┼───────────────────┤
+│   NETWORK    │    SCRIPT    │              │                   │
+│   TCP/WS     │   `.smart`   │              │                   │
+│   remote     │   script     │              │                   │
+└──────────────┴──────────────┴──────────────┴───────────────────┘
 ```
 
-Every shape is **equal** — no shape is primary. An AI agent using the network shape has the same power as a human using the CLI.
+**Every shape is equal.** An AI agent calling over TCP has the same power as a human typing `smart audio volume 75`.
 
 ---
 
-## Core Design Principles (Non-Negotiable)
-
-### 1. The Agnostic/Timeless Test
-> **"Is this an EXTERNAL contract (how components interoperate) or an INTERNAL implementation (how a component works)?"**
-- External → in the protocol
-- Internal → inside the component, NEVER in the schema
-
-### 2. The Opacity Principle
-> **Push types as far left (opaque) as possible.**
-- `UInt64` / `Data` / `Text` when consumers don't inspect structure
-- Structured only when fields MUST be read/written for interop
-
-### 3. The Swap Test
-> **Can you swap Linux ↔ seL4 ↔ custom kernel ↔ WebAssembly runtime without changing the protocol?**
-- If no → the schema leaks implementation
-
-### 4. No Platform Nouns in Required Enums
-- No `systemd`, `syslog`, `inode`, `zombie`, `cgroup`, `seccomp`, `cr3`, `HHDM`, `Limine`, `x86_64`
-- Use abstract terms: `BootloaderKind { limine, grub, uefiDirect, custom }`, `TierClass { kernel, platform, system, application, sandbox, custom }`
-
-### 5. Capability System IS the Access Control
-- No permission strings, no RBAC, no boolean flags
-- Methods that need authority take `Capability` parameter
-
-### 6. Zero-Cost, No Runtime Diffing
-- Cap'n Proto zero-copy: messages read directly from wire
-- No serialization/deserialization step
-- Compiler is the only authority — monomorphization, not vtables
-
----
-
-## The 89 Capability Domains
+## The 89 Capability Domains — Complete System Coverage
 
 ### Foundation (3)
-- `types.capnp` — Foundation: IDs, geometry, time, errors, **Quota, ContainmentScope, UserlandImage, EntryContext, BinaryFormat, StateOutcome**
-- `capability.capnp` — Capability issuance, verification, attenuation, revocation, delegation
-- `abi.capnp` — ABI versioning, compatibility negotiation
+`types.capnp` `capability.capnp` `abi.capnp` — Foundation types, capability system, ABI negotiation
 
 ### Kernel & Boot (4)
-- `kernel.capnp` — ENTIRE kernel API — spawn, exec, memory, capabilities, service registry. **No hardware methods.**
-- `boot.capnp` — Boot handoff: HandoffPointer → BootHandoff → BootstrapInfo. Virtual addresses only.
-- `hal.capnp` — Hardware affordances (MMIO, IRQ, DMA, PCI). **Arch-specific I/O in X86PortIo sub-interface.**
-- `init.capnp` — Pure service orchestrator. No Kubernetes, containers, cgroups. Just ServiceSpec lifecycle.
+`kernel.capnp` `boot.capnp` `hal.capnp` `init.capnp` — **Entire kernel API**, boot handoff, hardware affordances, pure service orchestrator
 
 ### System Services (12)
-- `system.capnp` — Entry point, capability discovery, handshake
-- `service.capnp` — Service lifecycle, health, resources, TierClass
-- `process.capnp` — Processes, Quota, ContainmentScope, universal states
-- `session.capnp` — Login, lock, idle, user identity
-- `discovery.capnp` — Service registry, heartbeat, changeFeed, scopeBoundary
-- `logging.capnp` — Structured logs, opaque formats, UInt64 subscriptions
-- `diagnostics.capnp` — Metrics, health, tracing, GPU, resource forecasting
-- `klog.capnp` — Kernel log access, retention, encryption, alerting
-- `time.capnp` — Clocks, timers, alarms, world clocks
-- `queue.capnp` — Inter-app messaging
-- `signal.capnp` — Typed signal/event system
-- `task_scheduler.capnp` — Scheduling policies, priorities
+`system` `service` `process` `session` `discovery` `logging` `diagnostics` `klog` `time` `queue` `signal` `task_scheduler`
 
 ### Hardware & Devices (10)
-- `device.capnp` — Backend-decided device tree, opaque IDs
-- `display.capnp` — Monitors, brightness, HDR, color, wireless
-- `audio.capnp` — Devices, streams, **timeless OS features**: sound events, analysis, mic privacy, loudness safety, routing intelligence, device health, multi-zone
-- `input.capnp` — Keyboard, mouse, touch, gamepad, force feedback
-- `camera.capnp` — Photo, video, preview, AI analysis
-- `usb.capnp` — USB device enumeration, PD, Thunderbolt
-- `bluetooth.capnp` — Bluetooth devices, audio, mesh
-- `nfc.capnp` — NFC tags, card emulation, peer-to-peer
-- `sensor.capnp` — Sensors, telemetry
-- `framebuffer.capnp` — Raw framebuffer access
+`device` `display` `audio` `input` `camera` `usb` `bluetooth` `nfc` `sensor` `framebuffer`
 
 ### UI & Compositing (6)
-- `compositor.capnp` — **Session interface only** — layers, cursor, DnD, input routing
-- `windowmanager.capnp` — **Session interface only** — windows, workspaces, tiling, snapping
-- `ime.capnp` — **Canonical text input** — Session, preedit, commit, virtual keyboard
-- `clipboard.capnp` — Canonical clipboard service
-- `notification.capnp` — Canonical notification service
-- `settings.capnp` — Canonical settings service
+`compositor` `windowmanager` `ime` `clipboard` `notification` `settings` — **Session interfaces only**, no flat duplicates
 
-### Data & Storage (8)
-- `files.capnp` — **File I/O + mount/unmount + trash** (filesystem merged in)
-- `storage.capnp` — Block devices, pools, volumes, snapshots, deduplication, compression
-- `database.capnp` — Key-value, graph, vector, CRDT — no engine assumptions
-- `backup.capnp` — Backup/restore
-- `archive.capnp` — Compression, encryption, content-addressed
-- `mount.capnp` — Mount orchestration, overlay, auto-mount, network mounts
-- `ramfs.capnp` — Filesystem capability domain (ramfs, ext4, fatfs, ntfs, lcpfs backends)
-- `filesystem.capnp` — **DEPRECATED** — merged into files.capnp
+### Data & Storage (7)
+`files` `storage` `database` `backup` `archive` `mount` `ramfs`
 
 ### Network & Communication (7)
-- `network.capnp` — WiFi, ethernet, cellular, interfaces, DNS, DHCP, VPN, firewall
-- `dns.capnp` — DNS resolution, DNSSEC, zone management
-- `web.capnp` — HTTP, WebSocket, URL resolution
-- `socket.capnp` — Connection API — TCP/UDP/Unix, proxy, TLS
-- `tunnel.capnp` — Universal channels, transport-agnostic
-- `endpoint.capnp` — Service endpoints, generic EndpointAddress
-- `telephony.capnp` — Calls, SMS, modem
+`network` `dns` `web` `socket` `tunnel` `endpoint` `telephony`
 
 ### Security & Identity (8)
-- `auth.capnp` — Authentication, privilege escalation
-- `access.capnp` — Access control, recovery
-- `biometric.capnp` — Biometric enrollment, verification
-- `secret.capnp` — Keyring, secrets, SecretRef
-- `crypto.capnp` — Hashing, HMAC, KDF, AEAD, signatures, PQC
-- `key_management.capnp` — Key lifecycle, generation, rotation, revocation
-- `signature.capnp` — Signing, verification, policies
-- `vcard.capnp` — Contact cards, parsing, export
+`auth` `access` `biometric` `secret` `crypto` `key_management` `signature` `vcard`
 
 ### Apps & Intelligence (11)
-- `app.capnp` — App lifecycle, intents, data sharing
-- `appindex.capnp` — App discovery, launch, pinning
-- `package.capnp` — Package management, repos, updates
-- `extension.capnp` — Extension registration, capabilities, sandboxing
-- `ai.capnp` — **AI/ML inference, model management, agent coordination, tensor ops, RAG, tool use**
-- `speech.capnp` — STT, TTS
-- `translation.capnp` — Text translation
-- `contacts.capnp` — Address book
-- `calendar.capnp` — Events, reminders, recurrence
-- `content.capnp` — Encrypted content envelopes, key rotation
-- `system_search.capnp` — Global search, provider registration
+`app` `appindex` `package` `extension` **`ai`** `speech` `translation` `contacts` `calendar` `content` `system_search`
 
 ### Time & System (5)
-- `timezone.capnp` — Timezone query, conversion, DST
-- `update.capnp` — System updates, staged rollout, verification
-- `power.capnp` — Battery, profiles, suspend, charging
-- `print.capnp` — Printer discovery, print jobs
-- `cli.capnp` — Command execution, shell access, custom commands
+`timezone` `update` `power` `print` `cli`
 
 ### Accessibility & Media (4)
-- `accessibility.capnp` — Accessibility tree, roles, states
-- `media.capnp` — Playback control (MPRIS-style)
-- `capture.capnp` — Screenshots, screen recording
-- `theme.capnp` — Semantic tokens, dark/light, accent
+`accessibility` `media` `capture` `theme`
+
+**Plus:** `ai.capnp` — **NEW** — AI/ML inference, model management, agent coordination, RAG, tool use
 
 ---
 
-## What's NOT in the Protocol (By Design)
+## Crates
 
-| Excluded | Reason |
-|----------|--------|
-| Scheduler algorithms | Internal to kernel |
-| Page table structure | Internal to kernel |
-| Filesystem implementations (ext4, btrfs, ZFS) | Backend concern |
-| Network packet formats | Internal to network stack |
-| Init dependency resolution algorithm | Internal to init |
-| Cryptographic signing details | Backend concern (capability.proof is opaque) |
-| Log output destinations (stdout, journal, file) | Backend concern |
-| POSIX permission bits | Capability-based systems don't use them |
+| Crate | Purpose | Required |
+|-------|---------|----------|
+| `smart-protocol` | Cap'n Proto schemas + generated types + SmartBackend trait | Yes |
+| `smart-lib` | Platform backends (Linux, Windows, macOS, etc.) | Optional |
+| `smart` | CLI binary | Optional |
+
+---
+
+## Protocol Shapes
+
+Smart Protocol exists in 6 shapes, all speaking the same language:
+
+```bash
+# Library (Rust)
+let state = smart_lib::audio::get_state()?;
+smart_lib::audio::set_volume(0.75)?;
+
+# C - link libsmart
+smart_audio_get_state(&state);
+smart_audio_set_volume(0.75);
+
+# CLI
+$ smart audio volume 75
+$ smart power battery --json
+$ smart window list --json | jq '.[0].title'
+
+# IPC over Unix socket
+$ smart --socket /run/smart.sock audio volume
+
+# Config file
+$ smart apply my-setup.toml
+
+# Network (TCP)
+$ smart --host 192.168.1.5 audio volume 50
+
+# Script
+$ smart run morning-routine.smart
+```
+
+---
+
+## SmartBackend Trait
+
+The `SmartBackend` trait in `smart-protocol` defines the interface:
+
+```rust
+pub trait SmartBackend {
+    fn audio_get_state(&self) -> Result<AudioState, SmartError>;
+    fn audio_set_volume(&self, device: &str, volume: f32) -> Result<(), SmartError>;
+    fn display_get_monitors(&self) -> Result<Vec<Monitor>, SmartError>;
+    // ... 459 methods across 47 domains
+}
+```
+
+---
+
+## Platform Detection
+
+Smart-lib automatically detects:
+- **Session type**: X11 vs Wayland
+- **Hardware type**: Laptop (battery) vs Desktop (wall power)
+- **Package managers**: apt, pacman, dnf, zypper, apk, xbps, yay, pkg, flatpak, snap, brew, nix-env, emerge, eopkg, swupd, bpkg, nala
+
+---
+
+## Error Handling
+
+All errors flow through `SmartError`:
+
+```rust
+pub enum SmartError {
+    NotFound,
+    PermissionDenied,
+    Failed(String),
+    Unavailable,
+    NotSupported,
+    MissingTool { tool, package, install_hint },
+    // ... more variants
+}
+```
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Compile schemas (generates Rust types in gen/)
-./scripts/regenerate.sh
+# Build
+git clone https://github.com/smart-foundation/smart-protocol-official
+cd smart-protocol-official
+./scripts/regenerate.sh        # Generates Rust bindings in gen/
+./scripts/validate.sh          # Validates all 92 schemas
 
-# 2. Verify all schemas compile
-./scripts/validate.sh
-
-# 3. Use in Rust
+# Use in Rust
 # Cargo.toml:
 # smart-protocol = { path = "../smart-protocol-official" }
-# 
-# In code:
+
 use smart_protocol::types_capnp::*;
 use smart_protocol::audio_capnp::*;
 use smart_protocol::ai_capnp::*;
 
-# 4. Use from CLI (requires smart-lib + smart CLI crates)
+# From CLI (requires smart-lib + smart CLI crates)
 smart audio volume 75
 smart apply my-setup.toml
 smart --host 192.168.1.5 display brightness 80
+
+# AI agent usage — same protocol, same interfaces
+# AI uses InferenceService.complete() exactly like CLI uses audio.set_volume()
 ```
 
 ---
 
-## Schema Evolution Rules
+## Schema Evolution — Never Breaks
 
-1. **Ordinal stability** — Once published, an ordinal is permanent. Never reuse or reorder.
-2. **Additive only** — New methods, types, enum variants, fields → minor version.
-3. **Breaking = new schema ID** — Removing methods, changing signatures, changing field types → major version.
-4. **Deprecate, don't delete** — `# Deprecated: use newMethod instead. Ordinal preserved.`
-5. **Forward compatibility** — Every union MUST have `unknown @N :UnknownEvent { typeId: UInt64, payload: Data }`
-6. **ABI negotiation** — Use `abi.capnp` to declare supported versions at startup.
+1. **Ordinal stability** — Once published, an ordinal is permanent
+2. **Additive only** — New methods/types/fields → minor version
+3. **Breaking = new schema ID** — New `@0x...` for major changes
+4. **Deprecate, don't delete** — `# Deprecated: use X instead. Ordinal preserved.`
+5. **Forward compatibility** — Every union has `unknown @N :UnknownEvent { typeId: UInt64, payload: Data }`
+6. **ABI negotiation** — `abi.capnp` declares supported versions at startup
 
 ---
 
-## License
+## Architecture
 
-MIT OR Apache-2.0 (your choice)
+```
+Layer 7: Applications      → Gallery, Panel, Terminal, File Manager, AI Agent
+Layer 6: SmartUI           → 13 crates, DSL, reactive, rendering
+Layer 5: smart-superset    → Platform backends (fonts, files, audio, etc.)
+Layer 4: smart-protocol    → 89 schemas, universal contract
+Layer 3: SpaceOS services  → Compositor, WM, Shell (all speak protocol)
+Layer 2: SpaceOS kernel    → HelenOS fork, capabilities, IPC
+Layer 1: Hardware          → Framebuffer, input devices, storage
+```
+
+**We control EVERY layer. We can optimize EVERY layer. We can change ANY layer without breaking others.**
+
+---
+
+## The Philosophy
+
+### The Agnostic/Timeless Test
+> **"Is this an EXTERNAL contract (how components interoperate) or an INTERNAL implementation (how a component works)?"**
+
+If it's internal — it stays OUT of the protocol.
+
+### The Opacity Principle
+Push types left (opaque) when consumers don't inspect structure:
+- `ProcessId { id: UInt64 }` ✓ — not PID, not TCB, just a reference
+- `FileHandle { handle: UInt64 }` ✓ — not path, not mode, just a capability
+
+### The Swap Test
+**Can you swap Linux → seL4 → custom kernel → WASM runtime without changing the protocol?**
+- If no → the schema leaks implementation
+
+---
+
+## Status
+
+- **92 schemas** — All compile, all validated
+- **Zero platform leaks** — No POSIX, Linux, x86 nouns in required enums
+- **AI-first** — `ai.capnp` for inference, agents, RAG, tools
+- **Vertical integration** — Kernel to AI, all one protocol
 
 ---
 
@@ -243,3 +252,9 @@ MIT OR Apache-2.0 (your choice)
 > We build a contract that will still make sense in 20 years on hardware that doesn't exist yet, running an OS that hasn't been written, in a language that hasn't been invented — because the schema IS the API, and the wire IS the syscall.
 > 
 > **The protocol is the only thing that must never change. Everything else is replaceable.**
+
+---
+
+## License
+
+MIT OR Apache-2.0 (your choice)
