@@ -1,55 +1,40 @@
 #!/bin/bash
-# Validate all Cap'n Proto schemas compile correctly
+# Validate all Cap'n Proto schemas.
+#
+# Two stages:
+#   1. Compile every schema (the compiler is the only real authority).
+#   2. Run the structural validator, which enforces the protocol's
+#      invariants with a real parser.
+#
+# The previous version of this script checked invariants with grep/cut/awk
+# line matching. That cannot see inline enums, comments, or a `custom`
+# variant that is not last, so it reported almost nothing. Logic now lives
+# in scripts/validate.py.
 
 set -e
 
-SCHEMA_DIR="$(dirname "$0")/../schema"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCHEMA_DIR="$ROOT/schema"
 
-echo "Validating Cap'n Proto schemas..."
+echo "=============================================="
+echo " Stage 1/2: compiling schemas"
+echo "=============================================="
 echo "Schema dir: $SCHEMA_DIR"
-
-# Check all schemas compile
-capnp compile -o - -I "$SCHEMA_DIR" "$SCHEMA_DIR"/*.capnp
-
-echo "All schemas compile successfully!"
-
-# Additional checks
 echo ""
-echo "Running additional validation checks..."
 
-# Check for ordinal gaps
-echo "Checking ordinal stability..."
-for f in "$SCHEMA_DIR"/*.capnp; do
-    echo "Checking $f..."
-    capnp compile -o - -I "$SCHEMA_DIR" "$f" 2>&1 | grep -i "ordinal" || true
-done
+if ! command -v capnp >/dev/null 2>&1; then
+    echo "FATAL: capnp not found on PATH"
+    exit 1
+fi
 
-# Check for required custom variants
-echo "Checking for custom variants in enums..."
-for f in "$SCHEMA_DIR"/*.capnp; do
-    enums=$(grep -n "^enum " "$f" | cut -d' ' -f2)
-    while IFS= read -r enum; do
-        if [ -n "$enum" ]; then
-            # Check if last variant is custom
-            last_variant=$(awk "/^enum $enum/,/^[^ ]/" "$f" | grep -E '^\s+[a-zA-Z]' | tail -1 | awk '{print $1}')
-            if [ "$last_variant" != "custom" ] && [ "$last_variant" != "Custom" ]; then
-                echo "WARNING: $f enum $enum may be missing custom variant (last: $last_variant)"
-            fi
-        fi
-    done <<< "$enums"
-done
-
-# Check for unknown variant in unions
-echo "Checking for unknown variants in unions..."
-for f in "$SCHEMA_DIR"/*.capnp; do
-    unions=$(grep -n "union {" "$f" | wc -l)
-    if [ "$unions" -gt 0 ]; then
-        has_unknown=$(awk '/union \{/,/\}/' "$f" | grep -E "unknown\s+@" || true)
-        if [ -z "$has_unknown" ]; then
-            echo "WARNING: $f has unions but may be missing unknown variant"
-        fi
-    fi
-done
-
+COUNT=$(find "$SCHEMA_DIR" -name '*.capnp' | wc -l | tr -d ' ')
+echo "Compiling $COUNT schemas..."
+capnp compile -o - -I "$SCHEMA_DIR" "$SCHEMA_DIR"/*.capnp > /dev/null
+echo "All $COUNT schemas compile successfully."
 echo ""
-echo "Validation complete!"
+
+echo "=============================================="
+echo " Stage 2/2: structural validation"
+echo "=============================================="
+echo ""
+python3 "$ROOT/scripts/validate.py"

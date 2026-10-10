@@ -1,0 +1,52 @@
+# Audit — compositor.capnp (1550 lines)
+
+## Verdict
+**FIX (targeted).** The Session interface (lines 44–180) is the best surface design in the batch: role-scoped handshake, one event stream with a genuine `unknown @41 :UnknownEvent`, DataHandle for every bulk payload, no per-method tokens. Three problems keep it from a clean KEEP. (1) The flat `Compositor` interface (187–220) survives as a second, parallel contract — cursor, drag, layers, input — duplicating the Session surface, and SCHEMAS.md:68 already claims "Session interface only"; the schema was never made to match. (2) The file forks the accessibility contract: it carries its own `AccessibilityNode`/`Role`/`State`/`Action`/`Tree` (668–750) while `accessibility.capnp` owns the richer canonical types, and `surface.capnp:4` imports accessibility.capnp — so the repo contains both patterns and they disagree. (3) The audit-7/8/9 block is copy-paste: `SpatialPose`/`AnchorType`, `DisplayZone`/`ZoneRole`/`ZonePermission`/`InteractionMode` and `EasingType` are byte-identical twins of `surface.capnp:231–254, 273–299, 397–404`. The design is right; the file needs surgery, not a restart.
+
+## Wire-breakers
+None found. Imports resolve; no ordinal collisions (Session ordinals are contiguous 0–44; the legacy interface keeps 0–22 with no overlap since they are separate interfaces). Note the deleted `ModifierState` (1040–1044) leaves ordinals 0–5 of that struct permanently reserved — correct, documented.
+
+## Doctrine violations
+| Rule | file:line | What fails | Concrete 2046 failure / cost |
+|---|---|---|---|
+| R1 | `compositor.capnp:354` | `SurfaceRole` freezes 24 UI nouns (dialog, tooltip, splash, screensaver, kiosk, osd, gameLoop, voiceOnly, floatingPin, …) into the contract | A compositor for a display paradigm with no "dialog"/"dock" (spatial, holographic, robotic HMI) has no ordinal for its roles; every new paradigm forces a schema edit or lands in `other`. Roles are backend policy, not interop — a window manager already classifies surfaces downstream |
+| R1 | `compositor.capnp:327` | `BackendKind { native, nested, remote, headless, embedded }` names deployment topologies | "nested" is an X11/Wayland-era concept (a compositor running inside another compositor). A future compositor-on-microkernel or a distributed compositor renders the list a lie, and an absent field silently means `native` (validator E8) |
+| R1/R6 | `compositor.capnp:681` | `AccessibilityRole` (39 values) duplicates `accessibility.capnp:369` (70 values) with a different value set | Two role vocabularies in one protocol; a screen reader trained on accessibility.capnp cannot interpret compositor's degraded copy (no `coordinateSpace`, `liveRegion`, `value`, ranges) — implementers must translate between them |
+| R2 | `compositor.capnp:92` | `commit @5 (commit :SurfaceCommit) -> ()` carries the buffer only as `bufferIndex @2 :UInt8` (532); the buffer itself is attached through a *different* interface (`surface.capnp:46 attachBuffer`) | The hot path is split across two contracts that disagree (`SurfaceCommit` vs `FrameSubmission`, `SyncFence.native :UInt64` vs `SyncFence.handle :T.FenceHandle`). An app that commits through compositor Session must also depend on surface.capnp — exactly the merge the doctrine ordered |
+| R6 | `compositor.capnp:46, 59, 74` | `HandshakeRequest.capabilities :List(CapabilityRequest)` uses the only open capability request in the batch; `windowmanager.capnp:32`, `shell.capnp:40`, `ime.capnp:24` use closed `List(Enum)` | A capability invented next year cannot be requested by an app on wm/shell/ime (no ordinal to name it), while compositor can express it via `custom @2`. Five services, two incompatible request grammars |
+| R6 | `compositor.capnp:639` | Local `Theme` struct (colorScheme/accentColor/fontScale) forks `theme.capnp` `ThemeTokens` | `themeChanged @39 :ThemeChangedEvent` delivers a 10-field theme snapshot that is not the canonical theme contract; a theming engine implementing theme.capnp must also implement this fork to feed the compositor |
+| R6 | `compositor.capnp:797` | `OutputInfo`/`OutputMode` (797–817) duplicate `windowmanager.capnp:480–500` (`OutputInfo`) and `OutputInformation` (502–514) — three structs, two files | An output query through compositor returns a type an app cannot pass to windowmanager methods; consumers hand-build converters that will drift |
+| R7 | `compositor.capnp:124, 217` | `query @21 -> QueryResult` and `listLayers` return unbounded `List(...)` with no `totalCount`; `QueryResult` has no error variant (only `notSupported @8`) | A "list my surfaces" answer on a 500-window desktop is one giant message; an empty `surfaces` list is indistinguishable from "query failed". Validator E6 flags the result-less result unions at 417, 427, 477, 506, 556, 564, 572, 630 |
+| R3 | `compositor.capnp:178` | `loadPlugin @43 (pluginId :Text) -> (plugin :PluginInfo)` — code loading by name, ungated on the Session | Holding any session can load compositor code; the authority that gates `captureOutput` does not gate plugin execution. The parameter names a thing, not a reference: an app cannot show it holds the right to load |
+
+## Duplicates & overlaps
+- Flat `Compositor` (187–220) vs `Session` (44–180): duplicate cursor (194–199 vs 101–114), drag (201–203 vs 118–120), input (206 vs events), layers (188–192 vs zone/layer hints). Keep one.
+- `OutputInfo`/`OutputMode` vs `windowmanager.capnp:480, 495`; `SpatialPose`/`AnchorType` vs `surface.capnp:231, 246`; `DisplayZone` trio vs `surface.capnp:265, 273, 283`; `EasingType` vs `surface.capnp:397` and `types.capnp:1239 AnimationEasing` (the canonical one this file ignores); `FocusReason` vs `windowmanager.capnp:754`; `CustomQuery` vs `shell.capnp:637`, `windowmanager.capnp:798`, `buffer.capnp`.
+- Accessibility fork: 668–750 vs `accessibility.capnp:369 roles / 195 nodes / 448 state / 516 actions`; `updateAccessibilityTree @23` delivers a tree ATs can already fetch from `AccessibilityService.getTree`.
+- DRM/plugin systems (`acquireDrmKeys @39`, `loadPlugin @43`): `DrmInfo` (1468) and `PluginInfo` (1517) are backend policy surfaces; DRM key provisioning is a capability exchange (capability.capnp), plugin loading is a host-internal extension mechanism (extension.capnp).
+
+## Gaps & holes
+- **No buffer/commit unification.** The compositor Session's commit takes `bufferIndex` while `surface.capnp` attaches buffers by `T.BufferId`; nothing says which surface of the API is normative. Fix by merging surface.capnp in (see its audit).
+- **No output-change event on the Session stream?** There is: `outputAdded @28`. Good.
+- **Frame callback contract**: `FrameSignal` (579) exists but the legacy `requestFrameCallback @16` (208) takes `callback :UInt64` — an opaque number with no stated meaning. With the legacy interface deleted this goes too.
+
+## Zero-cost / eco
+- `EventStream.next @0 () -> (event :CompositorEvent)` returns exactly one event per RPC — at input rates this is one syscall-per-event; the batch's other services pull `List(...)`. For pointer-move storms (every compositor frame) the per-event round trip is the single most expensive pattern in the file. A `pull (maxEvents)` batch with a monotonic sequence preserves ordering and cuts IPC per event by an order of magnitude.
+- `IconData.pixels`/`CursorImage.pixels`/`DragStartRequest.thumbnail` are correctly `T.DataHandle`; `unknown @41` payload is a DataHandle. The bulk discipline here is the batch's best.
+- `listCursorThemes @18`, `query`, `listLayers` force full-list allocation with no bound (see R7).
+
+## UX & implementer guidance
+- `Compositor.Session` vs `Compositor` naming: two interfaces, one file, one of them undocumented as dead. An implementer reading `createLayer`/`addSurface` on the flat interface may build against the deprecated shape.
+- `SurfaceCommit @92 -> ()`: a silent success on the hottest call. If a commit can be dropped (bad buffer index, lost surface), the app has no way to know; the wire cannot express it. At minimum the interface doc must state drop semantics, or switch to the surface.capnp `T.VoidResult` shape.
+- `SyncFence.native @0 :UInt64` (572): "native" invites every backend to reinterpret the integer; the typed `T.FenceHandle` exists (surface.capnp:169) precisely to stop that.
+- Validator E8: 22 enums have a non-neutral `@0` (`native`, `window`, `keyboard`, `light`, …) — an absent field silently picks a paradigm value. Machine-reported already.
+
+## Recommended actions
+1. **Delete the flat `Compositor` interface (187–220) and its 4 subscription interfaces.** Gain: one compositor contract; kills the duplicate cursor/drag/layer surface and the `callback :UInt64` oddity. Cost: zero — nothing imports it and no external consumer exists pre-release.
+2. **Replace the local accessibility types (668–750) with `using import "accessibility.capnp"`.** Gain: one tree contract, richer node model (ranges, live regions, reading order) reaches the compositor for free. Cost: one import; surface.capnp:4 proves the pattern.
+3. **Absorb `surface.capnp` into this Session** (buffer attach, state subscription, frame metrics, capture/recording). Gain: the commit path stops being split across two files with incompatible `SurfaceCommit`/`FrameSubmission`/`SyncFence`. Cost: Session grows by ~10 methods; surface.capnp is deleted.
+4. **Unify `OutputInfo`/`OutputMode` with windowmanager** (one set, in `types.capnp` or windowmanager, imported by compositor). Gain: output queries compose across services. Cost: a cross-file move.
+5. **Open the handshake capability request to all session services** (adopt this file's `CapabilityRequest` union shape repo-wide). Gain: capability kinds invented after the freeze remain requestable. Cost: wm/shell/ime handshake structs change — free pre-release.
+6. **Batch `EventStream.next` into `pull (maxEvents)`.** Gain: ~10× fewer round trips on the input hot path, backpressure knob for free. Cost: consumers loop instead of single-read; `CompositorEvent` already fits a list.
+7. **Gate `loadPlugin`/`acquireDrmKeys`/`destroySpatialAnchor @28`** (the last takes `anchorId :Text` — a handle by string) behind an accessor that takes a `Capability`, or move DRM to capability exchange and plugins to extension.capnp. Gain: one authority path; removes string-addressed internals. Cost: two methods move files.
+8. **Add error/pagination to `QueryResult` and `listLayers`.** Gain: failure stops being indistinguishable from empty. Cost: two unions gain variants; ordinals preserved.

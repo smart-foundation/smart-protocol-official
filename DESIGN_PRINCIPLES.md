@@ -365,19 +365,36 @@ Every service should accept capabilities as part of its authority model:
 ```capnp
 using import "capability.capnp".Capability;
 
+interface MyRoot {
+    # Ungated: discovery is open to everyone.
+    discover @0 () -> (descriptor :MyDescriptor);
+
+    # Gated once, at acquisition.
+    sensitive @1 (authority :Capability) -> (service :MyService);
+}
+
 interface MyService {
-    # Capability-gated method:
-    doSensitiveThing @0 (cap :Capability, request :SensitiveRequest) 
-                     -> (result :SensitiveResult);
+    # Holding `service` IS the authority. No per-method token.
+    doSensitiveThing @0 (request :SensitiveRequest) -> (result :SensitiveResult);
 }
 ```
 
 **Rules:**
-- Methods that perform privileged operations MUST accept a `Capability` parameter.
-- The capability's `target` field identifies the resource.
-- The capability's `operations` field determines what is permitted.
-- The service verifies the capability before executing.
+- Authority is the **interface reference**, not a per-method parameter. In Cap'n Proto
+  RPC a capability is a reference: holding it conveys authority to call it.
+- Privileged services are obtained through an accessor that takes a `Capability`, and
+  their methods then take no authority token.
+- Ungate discovery: keep "what exists and what can it do" readable without authority,
+  so a caller can learn before it can act.
+- The capability's `target` field identifies the resource; its `operations` field
+  determines what is permitted.
+- Attenuation and revocation are `capability.capnp`'s job, not re-specified per service.
 - Capability verification is a backend concern; the protocol only specifies the contract.
+
+**Why not a per-method parameter?** It duplicates authority the reference already carries,
+leaving two authority paths that must agree forever. The older per-method rule was never
+implemented — 5 methods repo-wide, all inside `capability.capnp` itself. `schema/ai.capnp`
+implements the reference model (validator rule E3).
 
 **Do NOT** define permission strings, boolean flags, or role-based access control in the protocol. The capability system IS the access control mechanism.
 

@@ -126,7 +126,7 @@ Complete index of all 92 Cap'n Proto schemas in smart-protocol-official.
 | `appindex.capnp` | App discovery, launch, pinning | `AppIndexService`, `AppEntry` |
 | `package.capnp` | Package management, repos, updates | `PackageService`, `Package` |
 | `extension.capnp` | Extension registration, capabilities, sandboxing | `ExtensionService`, `Extension` |
-| `ai.capnp` | **AI/ML inference, model management, agent coordination** | `InferenceService`, `AgentService`, `ModelId` |
+| `ai.capnp` | **Universal intelligence contract: inference, models, tools, agents, knowledge, conversations** | `AI`, `InferenceService.derive`, `AgentService`, `KnowledgeBaseService`, `ToolRegistry`, `Artifact` |
 | `speech.capnp` | STT, TTS | `SpeechService`, `Voice` |
 | `translation.capnp` | Text translation | `TranslationService`, `Language` |
 | `contacts.capnp` | Address book | `ContactsService`, `Contact` |

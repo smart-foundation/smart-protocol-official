@@ -134,15 +134,38 @@ An AI agent using the network shape has the same power as a human using the CLI.
 ## Capability System IS the Access Control
 
 - No permission strings, no RBAC, no boolean flags
-- Methods that need authority take `Capability` parameter
+- **Authority IS the interface reference.** In Cap'n Proto RPC a capability is a
+  reference: holding it conveys authority to call it. So authority is expressed
+  by *which reference you hold*, gated once at acquisition — not by a
+  `Capability` parameter on every privileged method.
 - Verification is backend concern; protocol only specifies contract
 
 ```capnp
+interface MyRoot {
+    # Ungated: discovery stays open, so a caller can learn what exists.
+    discover @0 () -> (descriptor :MyDescriptor);
+
+    # Gated once, at acquisition. Holding `service` IS the authority to call
+    # its methods; no further token is passed per call.
+    sensitive @1 (authority :Capability) -> (service :MyService);
+}
+
 interface MyService {
-    doSensitiveThing @0 (cap :Capability, request :SensitiveRequest) 
-                     -> (result :SensitiveResult);
+    # No `cap` parameter — the reference itself is the authority.
+    doSensitiveThing @0 (request :SensitiveRequest) -> (result :SensitiveResult);
 }
 ```
+
+**Why:** a per-method parameter duplicates authority the reference already
+carries, producing two authority paths that must agree forever — every future
+method can get one wrong. Attenuation and revocation belong to
+`capability.capnp` (`attenuate @2`, `revoke @4`, `revokeControlled @9`).
+
+**Reference implementation:** `schema/ai.capnp` — `Capability` appears only on
+`interface AI` accessors, never inside a service method. Enforced by validator
+rule E3. See plan task 16 for the migration of the older per-method pattern,
+which was implemented in only 5 methods repo-wide, all inside `capability.capnp`
+itself.
 
 ---
 

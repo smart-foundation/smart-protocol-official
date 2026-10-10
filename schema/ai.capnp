@@ -1,564 +1,622 @@
-@0xa1b2c3d4e5f60061;
+@0xa1b2c3d4e5f60109;
 
-# AI/ML Inference & Agent Coordination
+# ══════════════════════════════════════════════════════════════════════
+# AI — universal contract for intelligence: inference, models, tools,
+# agents, knowledge and conversations.
 #
-# Universal contract for AI inference, model management, and multi-agent systems.
-# Backend decides: local (llama.cpp, ONNX, tensorrt), remote (OpenAI, Anthropic),
-# distributed (ray, k8s), or future runtimes.
-# The protocol sees: tensors, capabilities, agents, tools, conversations, embeddings.
+# REPLACES @0xa1b2c3d4e5f60061, which was never implemented and is deleted.
+# The retired ID is deliberately not reused: an ID bound forever should not
+# be inherited by a draft that was wrong.
 #
-# Timeless design principles:
-# - No assumption about model architecture (transformer, Mamba, RWKV, future)
-# - No assumption about quantization (q4_k_m, q8_0, f16, bf16, future formats)
-# - No assumption about execution (local GPU, remote API, distributed, WASM, future)
-# - Extensible via opaque Data + custom variants everywhere
-# - Capability-gated for security, subscription-based for streaming
+# ── THE TIMELESSNESS RULE ───────────────────────────────────────────────
+#
+# This file contains ZERO enums. That is a hard rule, enforced by the
+# validator (E1), not a preference.
+#
+# Why: in Cap'n Proto a field ordinal is permanent within a schema ID.
+# Every enumerated value is therefore a permanent commitment to a
+# technology that may not be the right one in twenty years. The previous
+# revision froze `transformer`, `onnx`, `gguf`, `q4km`, `system/user/
+# assistant`, `temperature`, `topP` and `logitBias` into the contract —
+# i.e. it asserted that today's AI would still be today's AI.
+#
+# The rule replaces enumeration with open values:
+#
+#   technology-specific value  ->  T.MimeType   (open media-type vocabulary)
+#   named-but-unbounded value  ->  T.StringMap (open key/value vocabulary)
+#   payload of any size        ->  T.DataHandle
+#
+# Timelessness is a NEGATIVE constraint. You cannot enumerate what will
+# exist in 100 years, because any list is today's list and it ages into
+# a lie. You CAN specify what must never appear. So this file names no
+# architecture, no vendor, no format, no tokenizer, no model family and
+# no topology — only structural invariants, which hold regardless of what
+# implements them.
+#
+# NOTHING IS FORBIDDEN. Every kind of intelligence — autoregressive,
+# diffusion, state-space, recurrent, convolutional, symbolic,
+# neuro-symbolic, non-neural, or something not yet conceived — is
+# expressible, because none of them is named. Architecture is reported by
+# the backend as opaque `metadata`; it is never prescribed.
+#
+# ── UNKNOWN TOLERANCE ──────────────────────────────────────────────────
+#
+# An unrecognized T.MimeType subtype, capability name, contributor token,
+# status token or metadata key MUST be ignored, never rejected. A consumer
+# that does not understand a value skips it; one that does, acts on it.
+# This is what makes new capabilities addable without a schema change.
+#
+# ── AUTHORITY IS THE INTERFACE REFERENCE ───────────────────────────────
+#
+# In Cap'n Proto RPC a capability IS a reference: holding it conveys
+# authority to call it. Authority is therefore expressed by WHICH
+# REFERENCE YOU HOLD, gated exactly once at acquisition on `interface AI`.
+# `Capability` appears nowhere inside a service method.
+#
+# Consequence: "discover what can I ask for" is available to everyone via
+# the ungated `AI.handshake` / `AI.discover`, while every operation that
+# consumes resources or mutates state requires a granted reference. An
+# agent is not handed a privileged magic API; it is handed a capability,
+# exactly like any other participant.
+#
+# Attenuation and revocation are not redefined here — they are
+# `capability.capnp`'s `attenuate @2`, `revoke @4`, `revokeControlled @9`.
+#
+# ── ZERO-COPY IS A CONSTRAINT, NOT A SLOGAN ────────────────────────────
+#
+# Cap'n Proto's zero-copy applies to the serialized message, not to
+# transport. Anything placed in a message field — List(Float32), Text,
+# Data — is COPIED into that message and cannot be zero-copy. Only
+# T.DataHandle (a shared buffer reference) escapes that.
+#
+# Therefore every bulk payload in this file is a T.DataHandle. A 4096-dim
+# embedding or a 512-token sequence travels as a buffer reference, never as
+# an inline list. The validator rejects List(Float32)/List(Text)/List(UInt8)
+# in this file (E2) for this reason.
+#
+# ── WHAT "MODEL" MEANS HERE ────────────────────────────────────────────
+#
+# `ModelId` names the holder of a set of capabilities. It does NOT name an
+# architecture. A diffusion engine, a neuro-symbolic solver and a
+# non-neural reasoner are each a ModelDescriptor; what they are appears only
+# in `metadata`, as opaque reported data. The protocol is agnostic, so it
+# never asks — and never answers — "what kind of intelligence are you?"
+# ══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
 using import "capability.capnp".Capability;
 
-# ── Core Identifiers ──────────────────────────────────────────────
-struct ModelId        { id @0 :UInt64; }
-struct TensorId       { id @0 :UInt64; }
-struct ConversationId { id @0 :UInt64; }
-struct AgentId        { id @0 :UInt64; }
-struct ToolId         { id @0 :UInt64; }
-struct EmbeddingId    { id @0 :UInt64; }
-struct SessionId      { id @0 :UInt64; }
-struct RequestId      { id @0 :UInt64; }
+# ── Identifiers ─────────────────────────────────────────────────────────
+# Opaque references (Opacity Principle). A ModelId is not a file path, a
+# model family, or an architecture. It is a handle.
 
-# ── Model Architecture (Generic Categories - Timeless) ────────────
-# These are ARCHITECTURAL PARADIGMS, not specific models.
-# Transformer has been dominant since 2017. SSM/Mamba since 2023.
-# New paradigms get added; old ones don't disappear.
-enum ModelArchitecture {
-    transformer @0;      # Attention-based (GPT, BERT, Llama, etc.)
-    ssm @1;              # State Space Models (Mamba, RWKV, etc.)
-    rnn @2;              # Recurrent (LSTM, GRU, etc.)
-    cnn @3;              # Convolutional
-    diffusion @4;        # Diffusion models
-    linearAttention @5;  # Linear attention variants (RWKV, etc.)
-    mixtureOfExperts @6; # MoE
-    custom @7;           # Future/unknown paradigms
+struct ModelId         { id @0 :UInt64; }
+struct RequestId       { id @0 :UInt64; }
+struct ToolId          { id @0 :UInt64; }
+struct AgentId         { id @0 :UInt64; }
+struct AgentGroupId    { id @0 :UInt64; }
+struct ConversationId  { id @0 :UInt64; }
+struct KnowledgeBaseId { id @0 :UInt64; }
+struct DocumentId      { id @0 :UInt64; }
+
+# ── The one universal payload ────────────────────────────────────────────
+# Carries anything: text, image, audio, video, a vector, a PDF, a symbolic
+# term, or a format not yet invented. `mimeType` tells a consumer how to
+# decode; an unknown subtype is ignored, not an error.
+#
+# This single type replaces the previous revision's Tensor,
+# TensorShape, TensorDataType, ModelFormat, Embedding.vector,
+# Document.content, ChatMessage.content, Query.text, HybridQuery.vectorQuery,
+# ToolSpec.parameters/returns, ToolCall.arguments, ToolResult.result,
+# CompletionRequest.prompt/messages and MemoryConfig.retentionPolicy.
+#
+# It is what makes vision, audio and PDF retrieval actually expressible:
+# the previous revision DECLARED vision/audio/multimodal capabilities while
+# every payload field was Text, so those models could not be called at all.
+
+struct Artifact {
+    mimeType @0 :T.MimeType;
+    data     @1 :T.DataHandle;
 }
 
-# ── Model Capabilities (What the Model CAN DO - Contract) ──────────
-# This is the EXTERNAL CONTRACT. Backend decides which model provides it.
-enum ModelCapability {
-    completion @0;          # Text generation
-    embedding @1;           # Vector embeddings
-    vision @2;              # Image/video understanding
-    audio @3;               # Audio processing (STT, TTS, understanding)
-    toolUse @4;             # Function calling
-    structuredOutput @5;    # Constrained generation (JSON schema)
-    reasoning @6;           # Chain-of-thought, multi-step
-    multimodal @7;          # Multiple input modalities
-    custom @8;              # Future capabilities
+# ── Capability discovery, as data rather than as an enum ────────────────
+# The previous revision froze `completion, embedding, vision, audio,
+# toolUse, structuredOutput, reasoning, multimodal` into ModelCapability.
+# That list is today's list; a capability invented next year had nowhere to
+# go except a new ordinal in an eternal schema.
+#
+# Here a capability is a NAME plus the content types it accepts and
+# produces. A capability that does not exist yet is representable today, by
+# construction, with no schema change — a consumer that does not recognise
+# the name ignores it.
+
+struct CapabilityDescriptor {
+    name        @0 :Text;                 # opaque token; unknown names are ignored
+    parent      @1 :Text;                 # open hierarchy, e.g. "input"/"output"
+    inputTypes  @2 :List(T.MimeType);     # content types accepted
+    outputTypes @3 :List(T.MimeType);     # content types produced
+    parameters  @4 :T.StringMap;          # open; backend-declared keys
 }
 
-# ── Standard Serialization Formats (Industry Standards) ───────────
-# These ARE timeless standards, not vendor products.
-enum ModelFormat {
-    raw @0;           # Raw tensor weights (no container)
-    onnx @1;          # ONNX (industry standard, supported everywhere)
-    safetensors @2;   # SafeTensors (fast, safe, widely adopted)
-    gguf @3;          # GGUF (quantized format, cross-backend standard)
-    custom @4;        # Backend-specific
+# What a model IS, reported without prescribing it.
+# `cost` and `metadata` absorb everything the deleted enums used to say:
+# architecture, parameter count, quantization scheme, context length,
+# memory footprint, price, latency. All of it stays readable by consumers
+# who care — and none of it is frozen into the contract.
+struct ModelDescriptor {
+    id           @0 :ModelId;
+    name         @1 :Text;
+    capabilities @2 :List(CapabilityDescriptor);
+    inputTypes   @3 :List(T.MimeType);
+    outputTypes  @4 :List(T.MimeType);
+    resident     @5 :Bool;                # currently held in memory
+    cost         @6 :T.StringMap;         # backend keys: memory, price, latency
+    metadata     @7 :T.StringMap;         # backend keys: architecture, params, quantization, context
 }
 
-# ── Tensor Primitives ─────────────────────────────────────────────
-# Tensor data types - uses standard types from types.capnp DataType
-# f32, f16, bf16, i8, i16, i32, i64, u8, u16, u32, u64, bool
-# q4_0, q4_k_m, q5_0, q5_1, q8_0 (STANDARD quantization schemes)
-# custom
+# ── Output negotiation ──────────────────────────────────────────────────
+# Replaces the frozen `ResponseFormat { text, jsonObject, jsonSchema }`
+# enum with an open content type. `schema` is itself content-typed, so a
+# future structural-output mechanism needs no protocol change.
 
-enum TensorDataType {
-    # Standard floating point
-    f32 @0; f16 @1; bf16 @2;
-    # Standard integers
-    i8 @3; i16 @4; i32 @5; i64 @6;
-    u8 @7; u16 @8; u32 @9; u64 @10;
-    bool @11;
-    # Standard quantization schemes (cross-backend)
-    q40 @12; q4km @13; q50 @14; q51 @15; q80 @16;
-    custom @17;
+struct OutputContract {
+    type       @0 :T.MimeType;      # what the caller wants back
+    schema     @1 :T.DataHandle;    # optional structural constraint
+    parameters @2 :T.StringMap;
 }
 
-struct TensorShape {
-    dims @0 :List(UInt64);
-    strides @1 :List(UInt64);  # Optional, for non-contiguous
-}
-
-struct Tensor {
-    id @0 :TensorId;
-    shape @1 :TensorShape;
-    dtype @2 :TensorDataType;    # Tensor data type
-    data @3 :T.DataHandle;       # Zero-copy via types.capnp
-    name @4 :Text;
-    quantization @5 :T.DataHandle;   # Optional: per-tensor quantization params
-}
-
-# ── Model Metadata (Generic - No Product Names) ───────────────────
-struct ModelSpec {
-    name @0 :Text;                    # Human-readable name
-    architecture @1 :ModelArchitecture;  # Generic category
-    format @2 :ModelFormat;           # Standard serialization
-    params @3 :UInt64;                # Parameter count
-    quantization @4 :TensorDataType;  # Quantization scheme
-    contextLength @5 :UInt32;         # Max context window
-    capabilities @6 :List(ModelCapability);  # What this model CAN DO
-    # LoRA/adapter support
-    adapterIds @7 :List(ModelId);
-}
-
-struct ModelInfo {
-    spec @0 :ModelSpec;
-    id @1 :ModelId;
-    loaded @2 :Bool;
-    memoryBytes @3 :UInt64;
-    metadata @4 :T.StringMap;
-}
-
-struct ModelFilter {
-    namePattern @0 :Text;
-    architecture @1 :ModelArchitecture;
-    capability @2 :ModelCapability;
-    loadedOnly @3 :Bool;
-}
-
-# ── Completion/Generation (The Core Contract) ─────────────────────
-struct CompletionRequest {
-    model @0 :ModelId;
-    # Either prompt OR messages (chat format preferred)
-    prompt @1 :Text;
-    messages @2 :List(ChatMessage);
-    maxTokens @3 :UInt32;
-    temperature @4 :Float32;
-    topP @5 :Float32;
-    topK @6 :UInt32;
-    stopSequences @7 :List(Text);
-    stream @8 :Bool;
-    tools @9 :List(ToolSpec);
-    toolChoice @10 :ToolChoice;
-    responseFormat @11 :ResponseFormat;
-    seed @12 :UInt64;
-    presencePenalty @13 :Float32;
-    frequencyPenalty @14 :Float32;
-    logitBias @15 :T.StringMap;
-    user @16 :Text;
-    custom @17 :Data;
-}
-
-struct ChatMessage {
-    role @0 :MessageRole;
-    content @1 :Text;
-    name @2 :Text;           # For tool messages
-    toolCalls @3 :List(ToolCall);
-    toolCallId @4 :Text;     # For tool responses
-}
-
-enum MessageRole {
-    system @0; user @1; assistant @2; tool @3; developer @4; custom @5;
-}
-
-enum ToolChoice {
-    auto @0;           # Model decides
-    none @1;           # No tools
-    required @2;       # Must use a tool
-    specific @3;       # Force specific tool (name in toolName)
-    custom @4;
-}
-
-struct ToolSpec {
-    name @0 :Text;
-    description @1 :Text;
-    parameters @2 :T.DataHandle;  # JSON Schema
-    returns @3 :T.DataHandle;     # JSON Schema for return type
-    custom @4 :Data;
-}
-
-struct ToolCall {
-    id @0 :Text;
-    name @1 :Text;
-    arguments @2 :T.DataHandle;  # JSON
-}
-
-enum ResponseFormatType {
-    text @0; jsonObject @1; jsonSchema @2; custom @3;
-}
-
-struct ResponseFormat {
-    type @0 :ResponseFormatType;
-    jsonSchema @1 :T.DataHandle;  # For jsonSchema type
-}
-
-struct CompletionResponse {
-    id @0 :RequestId;
-    model @1 :ModelId;
-    choices @2 :List(Choice);
-    usage @3 :Usage;
-    created @4 :T.Timestamp;
-    custom @5 :Data;
-}
-
-struct Choice {
-    index @0 :UInt32;
-    message @1 :ChatMessage;
-    finishReason @2 :FinishReason;
-    logprobs @3 :LogProbs;
-}
-
-enum FinishReason {
-    stop @0; length @1; toolCalls @2; contentFilter @3; custom @4;
-}
-
-struct LogProbs {
-    content @0 :List(TokenLogProb);
-}
-
-struct TokenLogProb {
-    token @0 :Text;
-    logprob @1 :Float32;
-    bytes @2 :List(UInt8);
-}
+# ── Metering, without presupposing a tokenizer ──────────────────────────
+# The previous revision counted tokens (promptTokens/completionTokens/
+# totalTokens, maxTokens, tokenCount, MemoryConfig.maxTokens). A byte-level,
+# character-level, continuous-latent or non-generative system has no tokens,
+# yet metering is real for all of them.
+#
+# The unit is a Text token. A backend reports tokens, bytes, seconds,
+# joules, or a unit invented next year. Metering survives; the tokenizer
+# assumption does not.
 
 struct Usage {
-    promptTokens @0 :UInt32;
-    completionTokens @1 :UInt32;
-    totalTokens @2 :UInt32;
+    quantity   @0 :Float64;
+    unit       @1 :Text;             # open: "token", "byte", "second", ...
+    dimensions @2 :T.StringMap;      # e.g. {"input": "12", "output": "30"}
 }
 
-# ── Streaming (Pull-based, UInt64 subscription - standard pattern) ──
-interface CompletionStream {
-    pull @0 () -> (chunk :CompletionChunk);
-    cancel @1 () -> T.VoidResult;
-}
+# ── Execution mode, as a union rather than a second API ─────────────────
+# Streaming is an ALTERNATIVE MODE of one operation, not a parallel API.
+# That matters: the previous revision's CompletionStream returned a
+# ChatMessage delta per pull, which only an autoregressive token model can
+# produce. A masked diffusion model fills a whole sequence in parallel and
+# has no delta, no token index and no causal order — it was declared
+# (`ModelArchitecture.diffusion`) and simultaneously unusable.
+#
+# As a mode, a whole-sequence model simply returns its complete output as
+# one Artifact. No field anywhere in this file assumes incremental tokens.
 
-struct CompletionChunk {
-    id @0 :RequestId;
-    choices @1 :List(StreamChoice);
-    usage @2 :Usage;
-    custom @3 :Data;
-}
-
-struct StreamChoice {
-    index @0 :UInt32;
-    delta @1 :ChatMessage;
-    finishReason @2 :FinishReason;
-}
-
-# ── Embeddings ────────────────────────────────────────────────────
-struct EmbedRequest {
-    model @0 :ModelId;
-    input @1 :List(Text);  # Or single text
-    encodingFormat @2 :EncodingFormat;  # float, base64
-    dimensions @3 :UInt32;  # For models supporting truncation
-    user @4 :Text;
-    custom @5 :Data;
-}
-
-enum EncodingFormat {
-    float @0; base64 @1; custom @2;
-}
-
-struct EmbedResponse {
-    model @0 :ModelId;
-    embeddings @1 :List(Embedding);
-    usage @2 :Usage;
-    custom @3 :Data;
-}
-
-struct Embedding {
-    index @0 :UInt32;
-    vector @1 :List(Float32);  # Or T.DataHandle for large
-    embeddingId @2 :EmbeddingId;
-}
-
-
-
-interface ToolRegistry {
-    register @0 (spec :ToolSpec) -> (tool :ToolId);
-    unregister @1 (tool :ToolId) -> T.VoidResult;
-    get @2 (tool :ToolId) -> (spec :ToolSpec);
-    list @3 (page :T.Pagination) -> (tools :List(ToolSpec), total :UInt64);
-    invoke @4 (tool :ToolId, args :T.DataHandle) -> (result :ToolResult);
-}
-
-struct ToolResult {
-    success @0 :Bool;
-    result @1 :T.DataHandle;  # JSON
-    error @2 :T.Error;
-    custom @3 :Data;
-}
-
-# ── Agents & Multi-Agent ──────────────────────────────────────────
-struct AgentSpec {
-    name @0 :Text;
-    description @1 :Text;
-    model @2 :ModelId;
-    systemPrompt @3 :Text;
-    tools @4 :List(ToolId);
-    memoryConfig @5 :MemoryConfig;
-    handoffConfig @6 :HandoffConfig;
-    custom @7 :Data;
-}
-
-struct MemoryConfig {
-    type @0 :MemoryType;
-    maxTokens @1 :UInt32;
-    retentionPolicy @2 :T.DataHandle;
-    custom @3 :Data;
-}
-
-enum MemoryType {
-    conversation @0;  # Full history
-    semantic @1;      # Vector embeddings
-    episodic @2;      # Event-based
-    hybrid @3;        # Combined
-    reserved @4;      # Reserved for future use
-    custom @5;
-}
-
-struct HandoffConfig {
-    enabled @0 :Bool;
-    targetAgents @1 :List(AgentId);
-    triggerConditions @2 :List(Text);
-    custom @3 :Data;
-}
-
-struct AgentState {
-    id @0 :AgentId;
-    spec @1 :AgentSpec;
-    status @2 :AgentStatus;
-    currentTask @3 :Text;
-    memoryUsage @4 :UInt64;
-    createdAt @5 :T.Timestamp;
-    lastActive @6 :T.Timestamp;
-}
-
-enum AgentStatus {
-    idle @0; running @1; waiting @2; paused @3; error @4; terminated @5; custom @6;
-}
-
-struct AgentMessage {
-    from @0 :AgentId;
-    to @1 :AgentId;
-    content @2 :T.DataHandle;  # JSON or custom
-    messageType @3 :MessageType;
-    replyTo @4 :RequestId;
-    custom @5 :Data;
-}
-
-enum MessageType {
-    task @0; result @1; handoff @2; query @3; event @4; custom @5;
-}
-
-interface AgentService {
-    spawn @0 (spec :AgentSpec) -> (agent :AgentId);
-    terminate @1 (agent :AgentId, graceful :Bool) -> T.VoidResult;
-    sendMessage @2 (msg :AgentMessage) -> (reply :AgentMessage);
-    getState @3 (agent :AgentId) -> (state :AgentState);
-    list @4 (filter :AgentFilter, page :T.Pagination) -> (agents :List(AgentState), total :UInt64);
-    
-    # Multi-agent coordination
-    createSwarm @5 (spec :SwarmSpec) -> (swarm :SwarmId);
-    broadcast @6 (swarm :SwarmId, msg :AgentMessage) -> T.VoidResult;
-    getSwarmState @7 (swarm :SwarmId) -> (state :SwarmState);
-}
-
-struct SwarmSpec {
-    name @0 :Text;
-    agents @1 :List(AgentId);
-    topology @2 :SwarmTopology;
-    coordinator @3 :AgentId;  # Optional central coordinator
-    custom @4 :Data;
-}
-
-enum SwarmTopology {
-    star @0; mesh @1; ring @2; hierarchical @3; custom @4;
-}
-
-struct SwarmState {
-    id @0 :SwarmId;
-    spec @1 :SwarmSpec;
-    agents @2 :List(AgentState);
-    status @3 :SwarmStatus;
-}
-
-enum SwarmStatus {
-    forming @0; active @1; converging @2; completed @3; failed @4; custom @5;
-}
-
-struct SwarmId { id @0 :UInt64; }
-
-struct AgentFilter {
-    status @0 :AgentStatus;
-    namePattern @1 :Text;
-    model @2 :ModelId;
-}
-
-# ── RAG & Knowledge (Abstract - Backend Decides Implementation) ───
-struct KnowledgeBaseSpec {
-    name @0 :Text;
-    embeddingModel @1 :ModelId;
-    chunkingStrategy @2 :ChunkingStrategy;
-    custom @3 :Data;
-}
-
-struct ChunkingStrategy {
-    type @0 :ChunkingType;
-    chunkSize @1 :UInt32;
-    overlap @2 :UInt32;
-    custom @3 :Data;
-}
-
-enum ChunkingType {
-    fixed @0; semantic @1; recursive @2; agentic @3; custom @4;
-}
-
-interface KnowledgeBase {
-    create @0 (spec :KnowledgeBaseSpec) -> (kb :KnowledgeBaseId);
-    delete @1 (kb :KnowledgeBaseId) -> T.VoidResult;
-    addDocuments @2 (kb :KnowledgeBaseId, docs :List(Document)) -> (ids :List(DocumentId));
-    deleteDocuments @3 (kb :KnowledgeBaseId, ids :List(DocumentId)) -> T.VoidResult;
-    query @4 (kb :KnowledgeBaseId, query :Query) -> (results :List(QueryResult));
-    hybridQuery @5 (kb :KnowledgeBaseId, query :HybridQuery) -> (results :List(QueryResult));
-}
-
-struct Document {
-    id @0 :DocumentId;
-    content @1 :Text;
-    metadata @2 :T.StringMap;
-    embeddings @3 :List(Float32);  # Pre-computed optional
-}
-
-struct DocumentId { id @0 :UInt64; }
-struct KnowledgeBaseId { id @0 :UInt64; }
-
-struct Query {
-    text @0 :Text;
-    topK @1 :UInt32;
-    filter @2 :T.StringMap;
-    scoreThreshold @3 :Float32;
-}
-
-struct HybridQuery {
-    textQuery @0 :Text;
-    vectorQuery @1 :List(Float32);
-    alpha @2 :Float32;  # Weight for vector vs keyword
-    topK @3 :UInt32;
-    filter @4 :T.StringMap;
-}
-
-struct QueryResult {
-    document @0 :Document;
-    score @1 :Float32;
-    rank @2 :UInt32;
-}
-
-# ── Conversations & Context ───────────────────────────────────────
-struct ConversationSpec {
-    model @0 :ModelId;
-    systemPrompt @1 :Text;
-    tools @2 :List(ToolId);
-    memoryConfig @3 :MemoryConfig;
-    metadata @4 :T.StringMap;
-}
-
-struct Conversation {
-    id @0 :ConversationId;
-    spec @1 :ConversationSpec;
-    messages @2 :List(ChatMessage);
-    createdAt @3 :T.Timestamp;
-    updatedAt @4 :T.Timestamp;
-    tokenCount @5 :UInt32;
-    metadata @6 :T.StringMap;
-}
-
-interface ConversationService {
-    create @0 (spec :ConversationSpec) -> (conv :ConversationId);
-    get @1 (conv :ConversationId) -> (conversation :Conversation);
-    addMessage @2 (conv :ConversationId, msg :ChatMessage) -> T.VoidResult;
-    fork @3 (conv :ConversationId, fromMessage :UInt32) -> (newConv :ConversationId);
-    delete @4 (conv :ConversationId) -> T.VoidResult;
-    list @5 (filter :ConversationFilter, page :T.Pagination) -> (convs :List(Conversation), total :UInt64);
-    compress @6 (conv :ConversationId, strategy :CompressionStrategy) -> T.VoidResult;
-}
-
-enum CompressionStrategy {
-    summarize @0; truncate @1; slidingWindow @2; custom @3;
-}
-
-struct ConversationFilter {
-    model @0 :ModelId;
-    since @1 :T.Timestamp;
-    metadataFilter @2 :T.StringMap;
-}
-
-# ── Events & Subscriptions (Standard Pull-based UInt64) ───────────
-struct AIEvent {
+struct ExecutionMode {
     union {
-        tokenGenerated @0 :TokenEvent;
-        toolInvoked @1 :ToolEvent;
-        modelLoaded @2 :ModelEvent;
-        agentSpawned @3 :AgentEvent;
-        conversationUpdated @4 :ConversationEvent;
-        errorOccurred @5 :T.Error;
-        unknown @6 :UnknownAIEvent;  # Forward compatibility
+        complete @0 :Void;
+        stream   @1 :Void;
+        # Forward compatibility: a mode added after this schema was frozen
+        # arrives here rather than silently defaulting to `complete`.
+        unknown  @2 :Void;
     }
 }
 
-struct UnknownAIEvent {
-    typeId @0 :UInt64;
-    payload @1 :Data;
+# ── A piece of input ────────────────────────────────────────────────────
+# Replaces the frozen MessageRole enum (system/user/assistant/tool/
+# developer), which was one vendor's 2023 chat API — `developer` was
+# already a renamed role upstream.
+#
+# `contributor` is an open token. That yields three things from one
+# construct: multimodal input (a list of differently-typed Artifacts),
+# multi-agent exchange (an agent is just another contributor, so no
+# separate agent-message protocol is needed), and today's chat roles as
+# ordinary conventions.
+
+struct Part {
+    artifact    @0 :Artifact;
+    contributor @1 :Text;             # "system", "user", "agent", a tool name, ...
+    annotations @2 :T.StringMap;
+    replyTo     @3 :RequestId;        # non-zero when this is a tool result
 }
 
-struct TokenEvent {
-    requestId @0 :RequestId;
-    token @1 :Text;
-    index @2 :UInt32;
+struct InferenceRequest {
+    request    @0 :RequestId;         # caller-chosen identity: retry/dedupe is idempotent
+    model      @1 :ModelId;
+    inputs     @2 :List(Part);
+    output     @3 :OutputContract;
+    mode       @4 :ExecutionMode;
+    parameters @5 :T.StringMap;       # open: sampling knobs, tool selection, stop conditions
+    budget     @6 :T.Duration;        # caller's time budget
 }
-struct ToolEvent {
-    requestId @0 :RequestId;
-    tool @1 :ToolId;
-    success @2 :Bool;
-}
-struct ModelEvent {
-    model @0 :ModelId;
-    eventType @1 :ModelEventType;
-}
-enum ModelEventType {
-    loaded @0;
-    unloaded @1;
-    error @2;
-}
-struct AgentEvent {
-    agent @0 :AgentId;
-    eventType @1 :AgentEventType;
-}
-enum AgentEventType {
-    spawned @0;
-    terminated @1;
-    handoff @2;
-    error @3;
-}
-struct ConversationEvent {
-    conversation @0 :ConversationId;
-    eventType @1 :ConversationEventType;
-}
-enum ConversationEventType {
-    created @0;
-    messageAdded @1;
-    compressed @2;
-    deleted @3;
+# `parameters` deliberately replaces the frozen OpenAI-shaped fields
+# maxTokens / temperature / topP / topK / stopSequences / presencePenalty /
+# frequencyPenalty / logitBias / seed / toolChoice / responseFormat. Two
+# reasons they cannot be fields: they presuppose logits and a tokenizer, so
+# an energy-based, diffusion or retrieval-only backend must fill them with
+# lies; and as published ordinals they could never be removed
+# (TIMELESSNESS.md:96) even after they became meaningless. As open keys they
+# cost nothing when absent and never need an ordinal.
+
+struct InferenceResponse {
+    request  @0 :RequestId;
+    model    @1 :ModelId;
+    outputs  @2 :List(Artifact);
+    usage    @3 :Usage;
+    warnings @4 :List(T.Warning);     # non-fatal degradation
+    custom   @5 :Data;
 }
 
-interface AISubscription {
-    pull @0 () -> (events :List(AIEvent));
+# ── Streams ─────────────────────────────────────────────────────────────
+# A STRUCTURAL terminator. Every chunked stream elsewhere in this protocol
+# returns `done :Bool` (web.capnp, speech.capnp, system_search.capnp,
+# archive.capnp); the previous ai.capnp returned neither, leaving clients to
+# infer termination from a nested finishReason hint.
+
+struct StreamStatus {
+    union {
+        more      @0 :Void;
+        complete  @1 :Void;
+        failed    @2 :T.Error;
+        cancelled @3 :Void;
+        unknown   @4 :Void;
+    }
+}
+
+struct StreamFrame {
+    request  @0 :RequestId;
+    artifact @1 :Artifact;
+    status   @2 :StreamStatus;
+    sequence @3 :UInt64;              # monotonic; detects dropped frames
+    custom   @4 :Data;
+}
+
+interface ArtifactStream {
+    # maxBytes is caller-driven backpressure: the producer may never send
+    # faster than the consumer pulls.
+    pull  @0 (maxBytes :UInt32) -> (frame :StreamFrame);
     cancel @1 () -> T.VoidResult;
 }
 
-# ── Capability-Gated Methods (All privileged ops require Capability) ─
-# Pattern from capability.capnp:
-# loadModel @0 (cap :Capability, spec :ModelSpec) -> (model :ModelId);
-# spawnAgent @0 (cap :Capability, spec :AgentSpec) -> (agent :AgentId);
+# ── Models ──────────────────────────────────────────────────────────────
+# A model arrives as CONTENT, so no serialization format is frozen. The
+# deleted ModelFormat enum named onnx / safetensors / gguf; q4km, q4_0,
+# q5_0 and q8_0 in TensorDataType are GGUF FILENAME TOKENS, not concepts.
+
+struct ModelFilter {
+    namePattern @0 :Text;
+    capability  @1 :Text;             # open token, matches CapabilityDescriptor.name
+    resident    @2 :T.BoolFilter;     # any / yes / no
+    annotations @3 :T.StringMap;
+}
+
+interface ModelService {
+    # Holding this reference IS the authority to load and unload.
+    load     @0 (declaration :Artifact, annotations :T.StringMap) -> (model :ModelId);
+    unload   @1 (model :ModelId) -> T.VoidResult;
+    release  @2 (model :ModelId) -> T.VoidResult;
+    describe @3 (model :ModelId) -> (descriptor :ModelDescriptor);
+    list     @4 (filter :ModelFilter, page :T.Pagination)
+            -> (models :List(ModelDescriptor), total :UInt64);
+}
+
+# ── Inference ───────────────────────────────────────────────────────────
+# ONE method for every single-shot transform. Completion, embedding,
+# classification, reranking, reward scoring and moderation are all
+# `derive` differing only in output contract — so there is no
+# embedding-specific API, and no per-task API to outgrow as tasks appear.
+#
+# The previous revision's README advertised InferenceService.complete(),
+# which existed in no schema, while CompletionRequest, CompletionResponse,
+# EmbedRequest, EmbedResponse, ModelSpec and ModelInfo were orphans
+# referenced by no method at all.
+
+interface InferenceService {
+    derive     @0 (request :InferenceRequest) -> (response :InferenceResponse);
+    openStream @1 (request :InferenceRequest) -> (stream :ArtifactStream);
+    cancel     @2 (request :RequestId) -> T.VoidResult;
+}
+
+# ── Tools ───────────────────────────────────────────────────────────────
+# A tool declaration is content, so tool schemas are not frozen to JSON
+# Schema: JSON Schema today, anything declarative tomorrow.
+#
+# invoke() carries no authority parameter because holding this reference IS
+# the authority. The previous revision's ToolRegistry.invoke took no
+# authority of any kind — unauthenticated remote code execution — while the
+# file's own header claimed all privileged operations were capability-gated.
+
+struct ToolDeclaration {
+    name        @0 :Text;
+    description @1 :Text;
+    parameters  @2 :Artifact;
+    result      @3 :Artifact;
+    annotations @4 :T.StringMap;
+}
+
+struct ToolInvocation {
+    request     @0 :RequestId;
+    tool        @1 :ToolId;
+    arguments   @2 :Artifact;
+    annotations @3 :T.StringMap;
+}
+
+struct ToolOutcome {
+    request @0 :RequestId;
+    success @1 :Bool;
+    result  @2 :Artifact;
+    error   @3 :T.Error;
+    custom  @4 :Data;
+}
+
+interface ToolRegistry {
+    register   @0 (tool :Artifact, declaration :ToolDeclaration) -> (tool :ToolId);
+    unregister @1 (tool :ToolId) -> T.VoidResult;
+    get        @2 (tool :ToolId) -> (declaration :ToolDeclaration);
+    list       @3 (page :T.Pagination) -> (tools :List(ToolDeclaration), total :UInt64);
+    invoke     @4 (invocation :ToolInvocation) -> (outcome :ToolOutcome);
+}
+
+# ── Agents ──────────────────────────────────────────────────────────────
+# No role enum, no MemoryType taxonomy (conversation/semantic/episodic/
+# hybrid — a library's internal memory classes, not a wire contract), no
+# ChunkingType, no SwarmTopology (star/mesh/ring/hierarchical are scheduler
+# internals; TIMELESSNESS.md:84 rejects scheduler hints from the protocol).
+
+struct AgentDeclaration {
+    name         @0 :Text;
+    description  @1 :Text;
+    model        @2 :ModelId;
+    declaration  @3 :Artifact;        # the agent's own contract/manifest
+    instructions @4 :Artifact;        # content, not a text systemPrompt:
+                                      # may carry images, audio, retrieved evidence
+    memory       @5 :Artifact;        # memory described by content type,
+                                      # implemented however the backend likes
+    annotations  @6 :T.StringMap;
+}
+
+struct AgentDescriptor {
+    id                @0 :AgentId;
+    declaration       @1 :AgentDeclaration;
+    grantedAuthority  @2 :List(Capability);  # reported, not checked here
+    status            @3 :Text;        # opaque token; unknown values ignored
+    state             @4 :T.StringMap;
+}
+
+struct AgentMessage {
+    request     @0 :RequestId;
+    from        @1 :Text;             # agent name/id, or any participant
+    to          @2 :Text;
+    content     @3 :Artifact;
+    annotations @4 :T.StringMap;
+    replyTo     @5 :RequestId;
+}
+
+struct AgentGroupSpec {
+    name        @0 :Text;
+    members     @1 :List(AgentId);
+    coordinator @2 :Text;             # open; may be absent for emergent groups
+    topology    @3 :T.StringMap;      # open map, not a frozen enum
+}
+
+struct AgentFilter {
+    namePattern @0 :Text;
+    group       @1 :AgentGroupId;
+    status      @2 :Text;
+    model       @3 :ModelId;
+    annotations @4 :T.StringMap;
+}
+
+interface AgentService {
+    spawn      @0 (agent :AgentDeclaration) -> (agent :AgentId);
+    terminate  @1 (agent :AgentId, graceful :Bool) -> T.VoidResult;
+    send       @2 (message :AgentMessage) -> (reply :AgentMessage);
+    describe   @3 (agent :AgentId) -> (descriptor :AgentDescriptor);
+    list       @4 (filter :AgentFilter, page :T.Pagination)
+             -> (agents :List(AgentDescriptor), total :UInt64);
+    createGroup @5 (group :AgentGroupSpec) -> (group :AgentGroupId);
+    broadcast  @6 (group :AgentGroupId, message :AgentMessage) -> T.VoidResult;
+    getGroup   @7 (group :AgentGroupId) -> (group :AgentGroupSpec);
+}
+
+# ── Knowledge ───────────────────────────────────────────────────────────
+# Documents are LISTS OF ARTIFACTS, so retrieval covers PDFs, images, audio
+# and video — not just text, as the previous revision's
+# `Document.content :Text` made it.
+#
+# Queries are artifacts too: text, an image (visual search), a vector, audio
+# or anything future.
+#
+# query() returns DocumentRef, not Document. The previous revision returned
+# the entire Document — including its full List(Float32) embedding — for
+# every hit, so topK=100 shipped 100 documents plus 100 copied vectors where
+# the caller needed short passages. `evidence` carries the snippet;
+# `KnowledgeBaseService.get` fetches a full document on demand.
+
+struct Document {
+    id          @0 :DocumentId;
+    content     @1 :List(Artifact);
+    annotations @2 :T.StringMap;
+}
+
+struct DocumentRef {
+    id          @0 :DocumentId;
+    annotations @1 :T.StringMap;
+}
+
+struct RetrievalQuery {
+    query           @0 :Artifact;
+    topK            @1 :UInt32;
+    annotations     @2 :T.StringMap;
+    scoreThreshold  @3 :Float32;
+}
+
+struct RetrievalHit {
+    document    @0 :DocumentRef;
+    score       @1 :Float32;
+    rank        @2 :UInt32;
+    evidence    @3 :Artifact;        # optional snippet
+    annotations @4 :T.StringMap;
+}
+
+interface KnowledgeBaseService {
+    # `configuration` absorbs index type, chunking strategy and distance
+    # metric: backend configuration, not protocol.
+    #
+    # No embedding model is REQUIRED, because retrieval here is not
+    # necessarily vector retrieval. An inverted index, a lexical ranker, a
+    # graph walk, a SQL view, a symbolic triple store and a dense vector
+    # store are all the same call. Requiring an embedding model would bake
+    # today's dominant retrieval technique into an eternal contract — the
+    # same error as freezing an architecture enum. Any model a backend uses
+    # internally is named in `configuration`, and its capabilities are
+    # discoverable through AI.discover.
+    create      @0 (name :Text, configuration :T.StringMap)
+               -> (base :KnowledgeBaseId);
+    delete      @1 (base :KnowledgeBaseId) -> T.VoidResult;
+    add         @2 (base :KnowledgeBaseId, documents :List(Document)) -> (ids :List(DocumentId));
+    remove      @3 (base :KnowledgeBaseId, ids :List(DocumentId)) -> T.VoidResult;
+    get         @4 (base :KnowledgeBaseId, id :DocumentId) -> (document :Document);
+    query       @5 (base :KnowledgeBaseId, query :RetrievalQuery) -> (hits :List(RetrievalHit));
+    queryStream @6 (base :KnowledgeBaseId, query :RetrievalQuery) -> (stream :ArtifactStream);
+}
+
+# ── Conversations ───────────────────────────────────────────────────────
+# `context` is an Artifact, not a Text systemPrompt — a conversation can be
+# grounded in images, audio or retrieved evidence.
+
+struct ConversationSpec {
+    model        @0 :ModelId;
+    tools        @1 :List(ToolId);
+    context      @2 :Artifact;
+    configuration @3 :T.StringMap;   # compression strategy and the like, as open keys
+}
+
+struct Conversation {
+    id          @0 :ConversationId;
+    spec        @1 :ConversationSpec;
+    messages    @2 :List(Part);
+    created     @3 :T.Timestamp;
+    updated     @4 :T.Timestamp;
+    usage       @5 :Usage;
+    annotations @6 :T.StringMap;
+}
+
+struct ConversationFilter {
+    model        @0 :ModelId;
+    since        @1 :T.Timestamp;
+    annotations  @2 :T.StringMap;
+}
+
+interface ConversationService {
+    create @0 (spec :ConversationSpec) -> (conversation :ConversationId);
+    # Paginated: the previous revision's get returned unbounded history.
+    get    @1 (conversation :ConversationId, page :T.Pagination)
+         -> (conversation :Conversation, total :UInt64);
+    append @2 (conversation :ConversationId, parts :List(Part)) -> (request :RequestId);
+    fork   @3 (conversation :ConversationId, fromIndex :UInt32) -> (conversation :ConversationId);
+    delete @4 (conversation :ConversationId) -> T.VoidResult;
+    list   @5 (filter :ConversationFilter, page :T.Pagination)
+         -> (conversations :List(Conversation), total :UInt64);
+}
+
+# ── Events ──────────────────────────────────────────────────────────────
+# Content-typed, so no event type can ever need adding: a lifecycle event
+# for a request, model, agent, conversation or knowledge base is an Artifact
+# whose mimeType names it. The previous revision froze ModelEventType,
+# AgentEventType and ConversationEventType — three enums, none of which had
+# a custom variant, so a backend adding one had nowhere to go.
+#
+# at is monotonic, so ordering survives clock adjustment. sequence supports
+# dedup and gap detection.
+
+struct UnknownEvent {
+    typeId  @0 :UInt64;
+    payload @1 :Data;
+}
+
+struct AIEvent {
+    union {
+        request       @0 :Artifact;
+        model         @1 :Artifact;
+        agent         @2 :Artifact;
+        conversation  @3 :Artifact;
+        knowledge     @4 :Artifact;
+        notice        @5 :T.Warning;
+        unknown       @6 :UnknownEvent;
+    }
+    at       @7 :T.MonotonicTimestamp;
+    sequence @8 :UInt64;
+}
+
+interface AISubscription {
+    pull  @0 () -> (events :List(AIEvent));
+    cancel @1 () -> T.VoidResult;
+}
+
+# ── Entry point ─────────────────────────────────────────────────────────
+# ONE root, so every interface above is reachable — the previous revision
+# declared six interfaces and not one method in the entire protocol returned
+# any of them, so nothing in it could actually be called.
+#
+# Returning interfaces matches speech.capnp (AudioStream) and web.capnp
+# (HttpStream).
+#
+# Authority is gated HERE, at acquisition, and nowhere else. Only handshake
+# and discover are ungated, so capability discovery is open to everyone
+# while every resource-consuming or state-mutating operation requires a
+# reference that was granted. handshake publishes known models so that
+# discovery is possible before any capability is held — otherwise
+# acquire-to-discover would deadlock.
+
+interface AI {
+    handshake     @0 () -> (info :T.Version,
+                            contentTypes :List(T.MimeType),
+                            models :List(ModelDescriptor));
+    discover      @1 (model :ModelId) -> (descriptor :ModelDescriptor);
+
+    models        @2 (authority :Capability) -> (service :ModelService);
+    inference     @3 (authority :Capability) -> (service :InferenceService);
+    tools         @4 (authority :Capability) -> (service :ToolRegistry);
+    agents        @5 (authority :Capability) -> (service :AgentService);
+    knowledge     @6 (authority :Capability) -> (service :KnowledgeBaseService);
+    conversations @7 (authority :Capability) -> (service :ConversationService);
+    subscribe     @8 (authority :Capability, filter :T.StringMap) -> (subscription :AISubscription);
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Nothing above depends on any declaration in this section. They are
+# published so that today's tools have a discoverable spelling, not so that
+# the protocol can require one. This section can therefore grow without
+# touching a single ordinal, and an unrecognized value MUST be ignored
+# rather than rejected.
+#
+# They are Text and T.MimeType values, deliberately NOT enums: an enum here
+# would be an eternal commitment to today's spelling of a concept.
+# ══════════════════════════════════════════════════════════════════════
+
+const textContent   :T.MimeType = (type = "text",        subtype = "plain");
+const jsonContent   :T.MimeType = (type = "application", subtype = "json");
+const binaryContent :T.MimeType = (type = "application", subtype = "octet-stream");
+
+# A dense vector is content, not a List(Float32) in the schema. The subtype
+# is a convention; parameters carry dimensionality, e.g. {"dimensions":"4096"}.
+const embeddingContent :T.MimeType = (type = "application", subtype = "vnd.smart.embedding");
+
+# Tool parameter schemas. Any declarative format is equally valid — a
+# protocol that required JSON Schema would be frozen against its successor.
+const jsonSchemaContent :T.MimeType = (type = "application", subtype = "schema+json");
+
+const contributorSystem :Text = "system";
+const contributorUser   :Text = "user";
+const contributorAgent  :Text = "agent";
+const contributorTool   :Text = "tool";
+
+const statusIdle     :Text = "idle";
+const statusRunning  :Text = "running";
+const statusWaiting  :Text = "waiting";
+const statusPaused   :Text = "paused";
+const statusError    :Text = "error";
+const statusFinished :Text = "finished";

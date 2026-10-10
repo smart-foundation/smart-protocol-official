@@ -1,0 +1,51 @@
+# Audit — package.capnp (573 lines)
+
+## Verdict
+**FIX (targeted).** The package service is the right home for install/update/verify/dependencies, and its pagination, subscription, and verification-result model are contract-correct. But the file answers the founder's own rule — "an app format that does not exist yet must be describable without schema change" — in the opposite direction: `PackageType` (151) is a closed enum of *package kinds* (app, library, framework, driver, os, theme, extension), while `manifest.capnp` — declared the universal self-description for "apps, services, devices, plug-ins, snapshots, payload bundles" (manifest.capnp:5–12) — is **not referenced by this file at all**; `PackageInfo` re-declares bundle metadata (name, version, deps, license, homepage) that `Manifest` already owns, and `Provenance` (267) is a byte-identical twin of `manifest.capnp:251 ManifestProvenance`. Beyond that: `install @2` returns a bare `T.PackageId` with no error path (install failures are the *normal* case — conflicts, bad signature, missing deps), `OciImageInstallRequest` embeds a **password field** (453), and audit-8/9 added OCI-first, mirroring, caching, and staged-rollout machinery that is a *distribution server's* internals. Fix: reference Manifest, return results, and move the server machinery out.
+
+## Wire-breakers
+None structurally. `OciImageInstallRequest.unpack @3 :Bool = true` (444) uses a default value — defaults on wire fields make absent-vs-set indistinguishable; acceptable here but note the pattern.
+
+## Doctrine violations
+| Rule | file:line | What fails | Concrete 2046 failure / cost |
+|---|---|---|---|
+| R6 | `package.capnp:162–194` | `PackageInfo` re-declares what `manifest.capnp:17–76 Manifest` owns (name, version, description, license, homepage, dependencies) while `Manifest` is declared the universal bundle self-description | Two bundle-description schemas in one protocol; an installer that reads the manifest gets a different shape than the package service returns, and every field must be kept in sync by hand. `Provenance` (267–278) vs `ManifestProvenance` (manifest.capnp:251–257) is the proof: five identical fields, two homes |
+| R7 | `package.capnp:23, 24, 25` | `install @2 (path :Text, options) -> (packageId :T.PackageId)` — no error path; `uninstall @3`/`update @4` return VoidResult (good), but install cannot | The most failure-prone operation in the batch returns success tokens: signature mismatch, dependency conflict, quarantine verdict, insufficient space all arrive as a valid-looking id an app will show as installed. Contrast `VerificationResult @29` which *does* carry `error :T.Error` |
+| R1 | `package.capnp:151` | `PackageType { app, library, framework, driver, os, theme, extension, custom }` — a closed taxonomy of today's package kinds | A 2046 bundle kind (a model, a policy pack, a sandbox profile, a neuro-compatible runtime) has no ordinal; the founder already deleted format-specific knowledge from the kernel path (types.capnp:1800 `BinaryFormat` is the one legacy holdout), and packages import formats too. The open answer exists: `Manifest.shape` (manifest.capnp:126 — and it has `custom @13`), or a `T.MimeType`-typed "kind" string |
+| R5 | `package.capnp:82, 436–454` | `installOciImage @24` + `OciImageInstallRequest/OciCredentials` make OCI containers a first-class install path with a registry username/password model | OCI is one 2026 distribution technology; the contract should accept an opaque image *reference + credential capability*, not OCI's vocabulary (media types, platform strings like "linux/amd64", unpack semantics). And `OciCredentials.password @2 :Text` (453): a plaintext password in a protocol message — credentials belong to secret.capnp or capability references, never a struct field |
+| R5 | `package.capnp:230–239` | `SupplyChainResult { slsaLevel, inTotoVerified, sigstoreVerified }` and `SupplyChainAttestation { slsaLevel, inTotoLayout, sigstoreBundle, buildProvenance }` — SLSA/in-toto/Sigstore named in required fields | Today's supply-chain tooling as a frozen dependency (the doctrine's "journal/stdout" class of error, logging.capnp at :226 — but for security). A 2035 attestation ecosystem names none of these; the fields force per-version schema edits or silently-meaningless false booleans |
+| R1 | `package.capnp:333, 407` | `UpdateDownloadStatus`, `UpdatePhase` (9 values) — closed state machines for the update pipeline | States are honestly closed, but they are *one implementation's* pipeline (checking → available → downloading → verifying → installing → pendingRestart → rolledBack) frozen into wire; a delta-updating or side-loading backend maps awkwardly, and `RollbackCondition.latency/crashRate` (376–388) is deployment-ops vocabulary, not interop |
+| Agnostic | `package.capnp:458–508` | `PackageMirrorConfig { sourceUrl, mirrorUrl, regions }`, `PackageCacheConfig { cacheDir @2 :Text }` — a mirror fleet and cache *filesystem path* as contract | `cacheDir` is an implementation detail of one install; mirror regions are a distribution-service topology. Neither is an interop contract between components — they are a specific server's config, and requiring them makes every other package backend pretend |
+| R4 | `package.capnp:56, 88` | `createSnapshot @16 -> (snapshotId :T.SnapshotId)` but `getMirrorStatus @26 (mirrorId :Text)`, `configureCache @27` — mirror/cache addressed by free text while snapshots get typed ids | Text-addressed resources cannot be verified or enumerated coherently; `listMirrors` does not exist, so `getMirrorStatus`'s target is undiscoverable |
+| R7 | `package.capnp:18` | `listPackages @0 (filter, pagination) -> (packages :List(PackageInfo))` — no `totalCount` | Callers cannot render "500 of 3,400"; every other paginated batch method returns a total |
+
+## Duplicates & overlaps
+- `PackageInfo` vs `Manifest` (the R6 row) — merge direction: `PackageInfo { manifest, installState, size, source }` with the manifest carrying identity; `PackageDetailInfo` (196) already nests `info @0`, so the shift is small.
+- `Provenance` vs `manifest.capnp ManifestProvenance` — identical; delete this one.
+- `OciImageInstallRequest` vs `manifest.capnp:276 OciImageManifest` — the same OCI vocabulary in two files; one home (or none, per R5 row).
+- Update lifecycle vs `app.capnp:18 checkForUpdate`/`AppUpdateNotification` — duplicated update surface (see app audit); this file's is the complete one.
+- `PackageDependency` (206) vs `manifest.capnp:112 Dependency` — two dependency structs (id+version+optional vs schemaId+semver range) with different identity models (T.PackageId vs T.SchemaId).
+
+## Gaps & holes
+- **What is a package container format?** `install (path :Text)` — the format of what is being installed is never declared (a capnp message? an archive? a directory?). `Manifest` + an entry-point payload would make this self-describing; as written, each backend defines an install format and apps cannot prepare packages portably.
+- **Install consent/verification ordering**: `quarantine @12` exists but nothing states whether install verifies-then-quarantines or quarantines-then-verifies — security-relevant order left to the backend.
+
+## Zero-cost / eco
+- `updateDelta @13` exists — good delta thinking — but with `getSettingsDiff` (settings.capnp:102) and `AppIndexSubscriptionFilter.coalesceWindowMs` (appindex.capnp:385) the batch has three different delta/coalesce shapes; one primitive would let all three reuse it. Not a defect, a missed consolidation.
+- `downloadUpdate @19 -> UpdateDownloadSubscription` is pull+cancel — good; progress carries bytes/counters (no bulk).
+- `PackageInfo.icon @10 :T.DataHandle` — correct, and contradicts the app/appindex inline icons (cite this when fixing those).
+
+## UX & implementer guidance
+- `verify @6 -> VerificationResult { valid, error :T.Error, checkedAt, supplyChain }` — this is the error model done right; `install` should return the same union (id + T.Error).
+- `PackageFilter.source @2 :Text` — documented as "repository or distribution name"; free-text source matching is a de-facto vocabulary.
+- `PackageEvent` (123–129) has no `unknown` variant (validator E6: package.capnp:123) — a future event kind (e.g., "pinned", "rolled back") is unroutable by a consumer.
+- `scripts @6 :T.StringMap` in `PackageDetailInfo` — install scripts as protocol data with no execution contract (same class as extension.capnp's `ScriptAction`; dangerous to specify loosely).
+
+## Recommended actions
+1. **Reference `manifest.capnp` instead of re-declaring**: `PackageInfo { manifest, installed, updatable, size, sizes, rating… }`; delete this file's `Provenance` (manifest owns it). Gain: one bundle-description contract — an app format invented tomorrow is describable by *adding a Manifest*, no package schema change (the founder's rule). Cost: one struct refactor; `PackageDetailInfo`/`Asset`-style deep-links move to the manifest.
+2. **`install`/`installOciImage` return `InstallResult { id } | T.Error`** (mirror `VerificationResult`). Gain: failed installs stop masquerading as success; `retryable` becomes meaningful. Cost: two signatures.
+3. **Replace `PackageType` with `Manifest.shape`** (or a content-typed kind). Gain: the closed kind-taxonomy freezes no formats; the founder's own rule holds for apps. Cost: one enum deleted, one field retyped.
+4. **Remove `OciCredentials.password`** — registry credentials as a capability reference or secret namespaced key (secret.capnp). Gain: no plaintext credentials on the wire; the doctrine's secrets handling applies. Cost: credentials plumbing moves to a secret reference — the honest path.
+5. **Move mirror/cache/OCI machinery to a distribution schema** (or delete until a consumer exists); rename remaining OCI generically to "image install with opaque reference". Gain: the package contract stops being one server's ops manual; `cacheDir` disappears from wire. Cost: ~8 methods to a new home or deleted.
+6. **`listPackages` gains `totalCount`; `PackageEvent` gains `unknown`.** Gain: bounded UI + forward-compat events. Cost: trivial.
+7. **State the install-container format** (self-describing via Manifest + payload). Gain: app packages become portable across backends; today every backend defines its own. Cost: one paragraph + reuse of the manifest.

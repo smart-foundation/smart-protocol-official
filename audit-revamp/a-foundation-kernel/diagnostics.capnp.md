@@ -1,0 +1,47 @@
+# Audit — diagnostics.capnp (722 lines)
+
+## Verdict
+**FIX (targeted).** The telemetry core is well-built: honest pagination (`getMetrics @1` `:21`), `T.DataHandle` for crash dumps/debug info/profile payloads (`:336`, `:577`, `:483`) — three correct R2 choices in one file, `MetricValue` union with counter/gauge/histogram/summary/custom (`:137-154`), `TraceContext` with opaque `Data` ids (`:277-289`). Then the file accumulates the batch's heaviest taxonomy — `DiagnosticScope` with 22 values (`:390-428`), `ProfileTarget` with 19 (`:446-479`), `MetricCategory` with 14 (`:189-204`), all naming today's subsystems and profiler targets — and duplicates log/trace primitives for a *third* time against logging and klog, including `LogEntry`/`LogFilter` under the same names as `logging.capnp`'s. The header's claim "no Prometheus, no OpenTelemetry" (`:9-11`) is contradicted by `TraceCarrierFormat { httpHeaders, grpcMetadata }` (`:716-722`) — a vendor noun the doctrine names explicitly.
+
+## Wire-breakers
+None: ordinals unique (`@0..@27`), `T.*` resolve. Name-level hazards: `LogEntry`, `LogFilter`, `TraceSpan`, `TraceContext`, `HealthSubscription`, `HealthStatus` collide with same-named types in `logging.capnp`/`discovery.capnp` (different shapes) — codegen collisions, not compile errors.
+
+## Doctrine violations
+| Rule | file:line | What fails | Concrete 2046 failure / cost |
+|---|---|---|---|
+| R5 / header contradiction | `diagnostics.capnp:716-722` `TraceCarrierFormat { httpHeaders, grpcMetadata, binary, textMap, custom }`; used at `:78` `injectTraceContextTyped`, `:79` `extractTraceContextTyped` | gRPC named in a required enum, in a file whose header claims "Zero backend assumptions: no Prometheus, no OpenTelemetry, no systemd assumptions" (`:9`) | 2046: gRPC is a 2016 transport; the contract cannot carry traces over whatever replaces it without an eternal-enum edit. Self-contradiction is the finding |
+| R1 / 2046 test | `diagnostics.capnp:390-428` `DiagnosticScope` (22 values: graphics, gpu, thermal, power, audio, input, memory, scheduler, security, ipc, battery, lockContention, ioLatency, networkIo, virtualMemory…) | The 2026 subsystem map as a closed enum | 2046: a subsystem that doesn't exist yet (fabric-attached memory, an inference co-processor) has no ordinal; every consumer's scope parser breaks. `custom @21` exists but carries no self-description |
+| R1 / 2046 test | `diagnostics.capnp:446-479` `ProfileTarget` (19 values: lightweightThread, offCpu, perCpu, numa, wakeup, gpuMemory, battery…) | The 2026 profiler-target map as a closed enum — same failure class | 2046: a hardware-profiler target (e.g., cache-coherence traffic on a CXL fabric) has no ordinal. Both enums should be open Text tokens or `T.StringMap`-carried configuration |
+| R6 | `diagnostics.capnp:502-513` `LogEntry` vs `logging.capnp:103-126` `LogEntry`; `:515-526` `LogFilter` vs `logging.capnp:138-144` `LogFilter`; `:260-275` `TraceSpan` vs `logging.capnp:338-353`; `:277-289` `TraceContext` vs `logging.capnp:323-336`; `:308-315` `TraceStatus` vs `logging.capnp:364-369` `SpanStatus`; `:95-98` `HealthSubscription` vs `discovery.capnp:591-594`; `:102-117` `HealthStatus` (struct) vs `discovery.capnp:154-169` `ServiceHealth`-adjacent naming | Six same-name-different-shape pairs across three files; `queryLogs @11` (`:51`) is a *third* log-query contract | Codegen collisions (`LogEntry` in two schemas cannot be imported into one translation unit unaliased); three log-grammar clients for every consumer; the generic "unknown-tolerant" consumer from `ai.capnp:44-47` cannot be written once |
+| R8 (dead types) | `diagnostics.capnp:635-648` `BatteryMetric`, `:652-663` `LockContentionMetric`, `:667-680` `IpcMetric` | Three structs returned by **no method** (verified: no interface returns them; `getMetrics` returns `List(Metric)`) | R8's gate in spirit: unreachable types cannot be validated or consumed. `Metric.category` (`:186`) is the general mechanism; these three are 2026-specific special cases frozen as orphans |
+| R3 (subscription authority) | `diagnostics.capnp:24` `subscribeMetrics @2 () -> (subscriptionId :UInt64)`, `:48` `subscribeHealth @10 () -> (subscriptionId :UInt64)`, `:91` `MetricsSubscription.pull @0 (subscriptionId :UInt64)`, `:96` `HealthSubscription.pull @0 (subscriptionId :UInt64)` | Raw-id subscriptions whose `pull` takes the id as a parameter — two authority paths, same defect class as `system.capnp:22-23`/`klog.capnp:123` | Holding the id vs. holding the reference must agree forever; ai.capnp returns subscription *references*. Three files in this batch repeat the pattern — the fix is one shared decision, not three |
+| R5 (soft) | `diagnostics.capnp:324` `CrashDumpInfo.signal @4 :Text ("SIGSEGV", "EXC_BAD_ACCESS")` | POSIX/Mach signal names as free text | Should be `T.SignalKind` (`types.capnp:512`); a consumer must string-match `SIGSEGV`. Non-POSIX backend: what string? Undeclared |
+| R1 (soft) | `diagnostics.capnp:548-555` `AlertCondition`, `:557-563` `AlertSeverity`, `:209-231` enums | Closed vocabularies (all with `custom`) | Lower severity — flagged |
+
+## Duplicates & overlaps
+- The six pairs above, plus: uptime checks (`:585-602`, `createUptimeCheck @18`) is a *web-ops* monitor (HTTP status expectations, `:597`) inside an OS contract — no counterpart elsewhere, but also no demonstrated consumer; resource forecasting `:683-689` (`forecastResourceUtilization @26`) and symbolication `:692-698` duplicate `logging`-adjacent AI/observability thinking.
+- `ComponentHealth` (`:127-133`) vs `service.capnp:302-307` `ServiceHealthStatus` vs `discovery.capnp:154-169` `ServiceHealth` — three health shapes.
+- `MetricFilter` (`:244-256`) vs `task_scheduler.capnp` filters vs `LogFilter` — this file has three filter types for three sub-domains that a unified telemetry query could serve.
+
+## Gaps & holes
+- No retention/bounding contract for metrics *history*: `MetricFilter.timeRange` (`:255`) implies history exists; nothing declares how long, at what resolution, or whether downsampled. A 2046 consumer plotting a week of per-second metrics gets silently different answers per backend — demonstrated fork.
+- `collectDiagnostics @8 (scope :DiagnosticScope) -> (report)` (`:42`): nothing declares what the report *contains* per scope, or its size bound — a "full" scope could return unbounded sections in one message.
+
+## Zero-cost / eco
+- Correct: `CrashDump.data @1 :T.DataHandle` (`:336`), `DebugInfo.data :T.DataHandle` (`:577`), `ProfileData.profile :T.DataHandle` (`:483`) — the file's best habit, and the pattern the batch should copy.
+- `getCrashDump @6 (… dumpId :Text)` (`:36`): crash dumps addressed by `Text` id — fragile string identity; a typed id belongs here.
+- `queryLogs @11` returns `List(LogEntry)` with `totalCount` (`:51`) — bounded, fine.
+
+## UX & implementer guidance
+- `Metric.labels @2` ("{"instance": "web-1", "region": "us-east"}" `:171`) — example teaches datacenter, not device; an implementer on a phone learns nothing about what labels a phone's metrics carry.
+- `RegisterState.registers @0 :T.StringMap` (`:373-377`, "hex string" values) — registers as hex strings force string parsing in every consumer; a `T.StringDataMap` or byte pairs would parse-free. (Small, but the file otherwise models crisp typed payloads.)
+- The three metric structs no method returns (Battery/Lock/Ipc) are precisely what an implementer would build *instead of* the general `Metric` mechanism — the orphans actively teach the wrong lesson.
+
+## Recommended actions
+1. **Delete `TraceCarrierFormat` + the typed carrier methods** (`:710-722`, `:78-79`), keeping the untyped `injectTraceContext`/`extractTraceContext` over `T.StringMap` (`:59-60`). Gain: removes the gRPC noun and the header's self-contradiction; cost: two ordinals retired.
+2. **Delete the taxonomy enums**: `DiagnosticScope` → open `Text` scope tokens (or a `T.StringMap` configuration), `ProfileTarget` → same, `MetricCategory` → open tokens or delete (`Metric.name`/labels already categorize). Gain: a 2046 subsystem/profile target is expressible with no schema edit — the file's own `T.StringMap`-based flexibility exists one field away; cost: consumers switch from enum-matching to token-matching (unknown-tolerance per `ai.capnp:44-47`).
+3. **Delete the orphaned metric structs** (`BatteryMetric`, `LockContentionMetric`, `IpcMetric`, `:635-680`) and the web-ops uptime block (`:585-614`, `:18-69` methods). Gain: no unreachable types (R8), no HTTP-monitor in an OS contract; cost: none.
+4. **Consolidate log/trace primitives** with `logging.capnp`/`klog.capnp`: one canonical `LogEntry`/`LogFilter`/`TraceContext`/`TraceSpan` (recommend `types.capnp` as canonical home); delete this file's copies (`:502-526`, `:260-315`). Gain: kills six codegen collisions; one log client for the tree; cost: the focused three-file merge the batch needs anyway.
+5. **Subscription ids → references** (`:24`, `:48`, `:91`, `:96`). Gain: one authority path, matching the ai.capnp reference model — and this batch's fourth copy of the fix; cost: four ordinals.
+6. **Declare metric-history retention/resolution and per-scope report bounds** (`collectDiagnostics`). Gain: closes two forks (silent history divergence, unbounded reports); cost: spec text + one limit field.
+7. **`CrashDumpInfo.signal` → `T.SignalKind`; `dumpId :Text` → typed id.** Gain: kills string-matching and fragile ids in the crash path; cost: mechanical.

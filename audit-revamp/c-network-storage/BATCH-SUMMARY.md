@@ -1,0 +1,86 @@
+# Batch C — Network & Storage · Batch Summary
+
+19 schemas audited against DESIGN_PRINCIPLES.md, TIMELESSNESS.md, `ai.capnp` (gold standard), `types.capnp`, `capability.capnp`. Method notes are at the bottom — every finding was checked mechanically where a mechanical check was possible.
+
+---
+
+## 1. Verdict table
+
+| # | Schema | Verdict |
+|---|---|---|
+| 1 | network | FIX (targeted — heaviest in batch: 18 enums, 5 dead structs, buffer-less NIC frames) |
+| 2 | dns | FIX (targeted — `resolve` has no error path; local IpAddress; header/schema unit mismatch) |
+| 3 | socket | FIX (targeted — POSIX flags, congestion-algorithm enum, no receive-readiness signal) |
+| 4 | tunnel | FIX (targeted, small — handle leaks routing state; duplicate HealthStatus/MeshAlgorithm) |
+| 5 | endpoint | **REWRITE** — 14-variant transport catalog with POSIX uid/gid, VSOCK consts, vendor IPC names |
+| 6 | web | FIX (targeted — `fetch` has no error path; `getStreamReader` unimplementable; 6 dead types) |
+| 7 | telephony | FIX (targeted — 7 orphan interfaces; no accessor pattern; free/busy duplicates calendar) |
+| 8 | files | FIX (targeted — must absorb filesystem; write path still inline Data; 3 doctrine-named defects) |
+| 9 | filesystem | **MERGE-INTO-files** (doctrine decision, executed: direction resolved in §3) |
+| 10 | storage | FIX (targeted, heavy — header contradicts its own PoolType enum; BusType shadow; poll-by-getter) |
+| 11 | database | FIX (targeted — "No SQL" header vs SQL query; inline Float32 vectors; unbounded graph results) |
+| 12 | backup | FIX (targeted — unbounded manifest/diff; 6 dead types; BackupStrategy≡BackupKind) |
+| 13 | archive | FIX (targeted — streaming API copies every chunk; 35-value format catalog; POSIX entry ownership) |
+| 14 | mount | FIX (targeted — MountOptions/MountFlags duplicated vocabulary; unused 45-value FilesystemType) |
+| 15 | buffer | **KEEP** — model citizen; four small honesty fixes only (fd, MADV names, event-union variant) |
+| 16 | clock | **KEEP** — exemplary core; alarm block becomes the canonical home for the batch's alarms |
+| 17 | time | FIX (targeted — co-owns the TAI epoch wire-breaker; alarms/timezone/leap-seconds duplicate siblings) |
+| 18 | timezone | FIX (targeted — false TimeRange re-export comment; ungated privileged setter; dead types) |
+| 19 | update | FIX (targeted, small — `T.BackupId` as operation id; changelog inline Text; A/B-only partition model) |
+
+---
+
+## 2. Ranked top-10 actions (each with the gain it buys and what it costs)
+
+**1. Execute the files↔filesystem merge, resolving the canonical-home direction.** `files.capnp` is canonical (DESIGN_PRINCIPLES.md:212); `SpecialPathType` moves there with identical enum ordinals so `getSpecialPath @13`'s wire shape is untouched; trash/recent-files/default-apps fold into `Files`; the mount surface folds into `mount.capnp` (keeping mount.capnp's richer `MountOptions`/`MountPoint`/event-union, deleting filesystem's conflicting copies); then `filesystem.capnp` is deleted. *Gain:* closes the doctrine's only documented High-severity conflict and removes the import edge from files into the doomed file. *Cost:* one type move + one file deletion + header corrections; all pre-release.
+
+**2. Close the TAI epoch wire-breaker (`time.capnp:219` vs `timezone.capnp:399`).** Two `UInt64`-seconds TAI structs whose epochs differ by 12 years + 37 s, with one-letter-case-different names; nothing catches a consumer passing one to the other's converter. Adopt timezone's Unix-epoch `TaiTimestamp`, retarget `time.capnp`'s `taiToUtc`/`utcToTai` @13/@14, delete the 1958 struct. *Gain:* eliminates a silent, compile-clean 120-year data-corruption class. *Cost:* one method pair retargeted — must happen pre-release.
+
+**3. Define the transport profile — the batch's known gap.** What every consumer of every capability-returning service must be told, and today is not: **(a) how the reference travels** (transport vocabulary — `endpoint.capnp` already catalogs them but is a technology catalog, see action 5); **(b) the channel's security level** — currently three homes (`socket.capnp` `TlsSession`, `endpoint.capnp` `TlsConfig`, *nothing* in `web.capnp`, so `wss://` verification is undefined); **(c) framing and max message size** (nowhere; `tunnel.capnp` has `maxFrameSize`, nothing else); **(d) flow control/backpressure convention** (three unrelated shapes: `ai.capnp` `maxBytes`, `socket.capnp` `maxLength`, `web.capnp` unbounded pull); **(e) connection lifecycle ownership** (two incompatible `ConnectionPoolConfig` shapes + no keepalive/migration ownership). *Where it belongs:* promote one `TransportProfile`/`TlsConfig` pair to `types.capnp` (shared by socket/endpoint/web/tunnel) and state the normative rule in DESIGN_PRINCIPLES that a capability reference inherits the profile of its acquisition. *Gain:* a 2046 client of Files/Dns/Storage can reach and secure any service without out-of-band knowledge. *Cost:* one small struct family + three reference edits.
+
+**4. Collapse the duplicate vocabularies (R6).** In-batch verified collisions: `MountOptions` (filesystem vs mount — **different fields**), `MountEvent` (struct vs union), `MountOperation`, `AutoMountRule`, `Overlay*`, `FilesystemCheckResult`, `HealthStatus` ×3 (two incompatible), `TlsVersion` ×2 (incompatible), `IpAddress`, `MountId`/`FilesystemId`/`StoragePoolId`/`VolumeId`/`SnapshotId`/`EndpointId` (locals vs promoted), `CompressionAlgorithm` ×4, `HashAlgorithm` ×4, `TimeRange` ×5 (two incompatible units), `SyncStatus` (enum vs struct), `RetentionPolicy` (struct vs union), `ProxyType` ×3 (three value sets), `ProxyConfig` ×3, `ConnectionPoolConfig` ×2, `AddressFamily` ×2, `NetworkType` ×3 (three meanings), `ServiceCategory` ×2. *Gain:* one canonical type per concept; consumers stop hand-mapping between same-named incompatible types. *Cost:* delete-or-align passes across ~6 files — mostly deletions of the *loser*, so most of the cost is spent making the corpus smaller.
+
+**5. Erase platform nouns from required positions (R5).** `endpoint.capnp:348-352` uid/gid/octal-permissions, `:560` Linux abstract sockets, `:388` VSOCK consts, `:232` IpcMechanism (dbus/grpc/binder/mach/fidl), `:487` mmap/namedpipe/sharedmem variants; `files.capnp:373` FilePermissions, `:476` inode/device; `mount.capnp:156,151` st_dev/inodes, `:163` Linux mount flags, `:594` FsMountFlag; `archive.capnp:249-261` uid/gid/mode; `buffer.capnp:551` `fd :Int32`, `:162` dontFork/MADV; `filesystem.capnp:273` FUSE ABI. *Gain:* capability, distributed, and browser backends implement the contract without fabricating uid/gid/fd values consumers then trust. *Cost:* fields move to `T.StringMap` backend metadata — where they survive for backends that genuinely have them.
+
+**6. Open the technology enums (R1).** Worst offenders: `mount.capnp:367` `FilesystemType` (45 values, **unused** — the same file's `fsType :Text` is the live spelling), `archive.capnp:135` `ArchiveFormat` (35 values; `tar×codec` combinatorics), `storage.capnp:379` `PoolType` (17 vendor nouns in a header that forbids them), `network.capnp:257/697/765/909` (`NetworkType`/`WifiSecurity`/`VpnKind`/`TransportProtocol`), `telephony.capnp:97` (`NetworkType` generation catalog), `tunnel.capnp:203` (Kyber spellings already superseded), `socket.capnp:420` (`CongestionAlgorithm` — also a TIMELESSNESS:84 algorithm hint), plus `CompressionAlgorithm`×4/`HashAlgorithm`×4 consolidation from action 4. *Gain:* a 2046 value is a `Text` token with unknown-tolerance instead of a fork; per `ai.capnp:16-21`, today's lists stop being commitments. *Cost:* consumers lose exhaustive enum matching — but with `custom` variants present in nearly all of them, they never had it safely.
+
+**7. Convert the remaining inline bulk payloads to `T.DataHandle` (R2).** `files.capnp:35/:63` (`writeFile`/`createFile` inline `Data` — the highest-volume write path in the storage batch; readFile was already converted), `database.capnp:21/:27` (get/set), `:613/:619/:628` (`List(Float32)` vectors — explicitly rejected by `ai.capnp:74-75`; a 4096-dim top-100 search copies ~1.6 MB per response), `archive.capnp:93/:102` (the *streaming* API's chunks), `web.capnp:128/:190` (WebSocket binary), `network.capnp:500` (DTN payload). *Gain:* writes, vector search, streaming, and WS stop duplicating bytes into message arenas. *Cost:* type changes on hot paths — all wire-*breaking*, all free before first release, all permanent after.
+
+**8. Add error paths where failures are swallowed (R7).** `dns.capnp:524/:527` (`resolve`/`srvLookup` return no error variant — SERVFAIL is indistinguishable from NXDOMAIN), `web.capnp:25` (`fetch` has no error field), `files.capnp:42/:104/:211` (`statFile`/`getFileVersion`/`getFileHash` sentinel returns — backends fork on the sentinel), `telephony.capnp:288` (`makeCall`), `endpoint.capnp:39` (`parse`), plus `time.capnp:69` (`verifyHsmTimestamp` bool+text vs `T.BoolResult`). *Gain:* honest, retryable-settable failures instead of N impl conventions. *Cost:* one result-union per method.
+
+**9. Add pagination to the unbounded lists and stop the polling patterns.** Unbounded: `files.capnp:251/:270`, `filesystem.capnp:103`, `mount.capnp:78/:68/:92`, `clock.capnp:280/:148`, `telephony.capnp:291/:368`, `dns.capnp:579`, `database.capnp:199/:196`, `backup.capnp:62/:59` (manifest/diff — millions of entries in one message), `archive.capnp:727`, `update.capnp:96`, `timezone.capnp:46`, `socket.capnp:358`. Polling-forcing: `clock.capnp:117` (`checkTimer` beside an existing subscription), `files.capnp:159` (`pollAsyncOperation`), `socket.capnp:306` (`receive` with no readiness signal), `storage.capnp:82/:88/:105/:139` (five day-long operations reachable only by getter — while `backup.capnp:274` shows the right pattern). *Gain:* bounded memory; event-driven instead of busy-poll on the eco lens. *Cost:* `T.Pagination` params + one `StorageProgressSubscription`-style interface.
+
+**10. Remove dead and unreachable surface (R8).** Verified by reference-counting the whole repo: dead types — `network.capnp` `MeshNetwork`/`LoraNetwork`/`BleMeshNetwork`/`PacketRadioNetwork`/`MultiLinkConfig`; `tunnel.capnp` `TunnelInfo`; `web.capnp` `WebRtcSession`/`Http2Stream`/`CspReport`/`AbortSignal`/`StorageEstimate`/`ServiceWorkerInfo`; `telephony.capnp` `LanguageFallback`; `files.capnp` `DiskUsageExtended`/`LifecycleRule`/`MetadataCacheEntry`; `backup.capnp` 6 types (incl. `BackupStrategy`≡`BackupKind`); `mount.capnp` `FilesystemType`/`NetworkMountCredentials`; `database.capnp` `NamespaceQuota`; `time.capnp` `MonotonicClockInfo`/`RelativeAlarm`; `timezone.capnp` `TaiUtcConversion`/`TimezoneRegion`; `update.capnp` `UpdateQuarantine`; local ID structs in mount/storage/endpoint despite documented promotions. Unreachable interfaces: telephony's seven Audit-8 services (Satellite/MeshCall/MeshMessage/LineManager/Recording/Voicemail/Screening — need the root-accessor pattern per DESIGN_PRINCIPLES:364-380); `NicProvider`/`BlockProvider`/`FsProvider` need their injection path documented (the validator's E4 rationale at `scripts/validate.py:172-179` excuses roots but not silence). *Gain:* the false contract surface shrinks ~40%; implementers stop building to types no service emits. *Cost:* near zero — nothing in the repo references any of it.
+
+---
+
+## 3. Cross-schema findings
+
+**The files/filesystem canonical-home question, resolved.** `filesystem.capnp:10` claims "Canonical source for SpecialPathType — imported by files.capnp," and `files.capnp:11` echoes it. DESIGN_PRINCIPLES.md:212 decides the opposite: merge into `files.capnp`, delete `filesystem.capnp`. The current edge would leave the canonical type inside the deleted schema. **Resolution: `files.capnp` is canonical** — move `SpecialPathType` there with identical ordinals, keep `getSpecialPath @13` unchanged, reverse the dependency, delete `filesystem.capnp` after its unique surface (trash, recent files, default apps, mount ops, FUSE/network-mount info) is relocated.
+
+**Cross-batch duplicates that span my 19 schemas** (beyond the per-file lists): `partition.capnp`-side overlap for `update.capnp`'s `InstallOptions`/`UpdateCheckResult`/`DeviceGroup`/install-progress; `calendar.capnp` owns the real free/busy contract that `telephony.capnp:481-497` re-implements; `system_search.capnp` holds `SimilarityMetric`/`GraphEdge`/`SearchResult` twins; `key_management.capnp` owns the real `KeyMetadata`/`KeySubscription` names. These are flagged for the other batches' owners.
+
+**Machine-checked rule state (repo validator, `scripts/validate.py`).** E6 (every union has unknown/custom — TIMELESSNESS.md:98 MUST): 17 violations in my batch (`buffer.capnp` ×8, `archive` ×2, `storage` ×2, dns/endpoint/web/clock/timezone ×1 each) — currently report-only for non-ai schemas. E7 (every struct has an open extension point): ~460 in my batch (files ×45, storage ×43, network ×39, buffer ×37 worst) — the systemic cause is that these schemas were written without the open-extension habit `ai.capnp` uses (`T.StringMap`/`custom :Data` on nearly every struct). E8 (enum @0 must be a neutral sentinel): ~176 in my batch. Recommend: promote E6 to blocking now (it is a MUST in the doctrine); for E7/E8 apply the fix to *descriptor/result/event* types where extension is foreseeable, not mechanically to all 460 structs — adding `custom :Data` everywhere would be machinery whose cost exceeds its gain.
+
+**The transport-layer gap, stated as the contract requirement** (batch-level, from action 3): the protocol currently has **no normative transport profile** — unix socket vs TCP vs shared memory is decided per backend, and `socket.capnp`/`endpoint.capnp` are where the leak concentrates (`UnixAddress`/`UnixEndpoint` with abstract namespaces, VSOCK constants, `IpcMechanism` naming dbus/grpc/binder/mach). Every consumer of every capability-carrying service (Files, Dns, Storage, Web, Telephony, Update...) must be told five things it cannot learn today: how the reference travels, the channel's security guarantees, framing/message-size limits, backpressure convention, and connection-lifecycle ownership. The cheapest correct home for that statement is a small shared profile in `types.capnp` plus a normative paragraph in DESIGN_PRINCIPLES — **not** a new transport schema; adding a schema would be the speculative-machinery failure.
+
+---
+
+## 4. Contradictions with the doctrine documents themselves (escalated)
+
+1. **DESIGN_PRINCIPLES.md:212 vs the schemas**: the doctrine merges filesystem into files; the schema edge (and both headers) says the opposite, making the canonical `SpecialPathType` live in the deleted file. The doctrine's verdict is correct; the schemas encode the opposite.
+2. **Unperformed promotions claimed as done**: `types.capnp` comments at :1076-1086, :1088-1100, :1102-1114, :1130-1167 state "replace local definition" for EndpointId/MountId/FilesystemId/StoragePoolId/VolumeId/SnapshotId — none were replaced (`endpoint.capnp:75`, `mount.capnp:126-127`, `storage.capnp:337/436/498` still define locals). `types.capnp:755-761` promotes `T.Port` naming dns/network exactly; `dns.capnp:112` and `network.capnp` still use raw UInt16. The promotion comments are documentation, not history.
+3. **DESIGN_PRINCIPLES.md:212** describes files.capnp as "30 methods"; it now has 86 (ordinals @0-@85). Doctrine method counts are stale and understate the surface being merged.
+4. **buffer.capnp:14** still says "The deprecated Buffer interface is preserved for migration" — no `Buffer` interface exists (the doctrine's deprecation was completed; the comment wasn't).
+5. **Headers that contradict their own bodies**: `storage.capnp:8-9` "no LVM, no mdadm, no ZFS..." vs `PoolType` naming all four; `archive.capnp:18-20` "no libarchive, no 7-Zip, no tar..." vs a 35-format catalog; `dns.capnp:23-25` claims `T.Duration` conversions the schema doesn't have; `network.capnp:11` "generic, not POSIX"-style claims in socket's flags. This pattern (accurate headers, non-conforming bodies) is worse than either alone — it teaches implementers to distrust schema headers, which are the doctrine's main teaching tool.
+6. **`time.capnp:163-165`** honestly documents a sentinel-value contract ("-1 means any") as frozen-by-wire-format; correct as written, but it is an acknowledged doctrine exception living in code rather than in a doctrine exception list.
+
+---
+
+## 5. Method & verification notes
+
+- All 19 files parsed for duplicate field ordinals within structs/enums/interfaces: **none found**. All `T.*` references resolve against `types.capnp`: **none undefined**. No duplicate schema IDs across the 92-schema tree.
+- Reachability/dead-type analysis: every locally declared struct/enum/interface in each file was reference-counted against the whole 92-schema corpus; the unused lists are in §2 action 10 and per-file R8 rows.
+- Duplicate type-name analysis: all schemas parsed, names defined in more than one file enumerated (the collisions cited in per-file "Wire-breakers"/"Duplicates" sections are from that scan).
+- The repo's own validator (`scripts/validate.py`) was run read-only; E1-E5 are ai.capnp-only by design, E6/E7/E8 are repo-wide reports — counts per file are cited in each audit.
+- No schemas were modified. No builds were run.

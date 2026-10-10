@@ -74,7 +74,7 @@
 ### Accessibility & Media (4)
 `accessibility` `media` `capture` `theme`
 
-**Plus:** `ai.capnp` — **NEW** — AI/ML inference, model management, agent coordination, RAG, tool use
+**Plus:** `ai.capnp` — universal intelligence contract. **Zero enums by rule**: architecture, weight format, tokenizer, roles, sampling knobs and topology are all expressed as open `T.MimeType` / `T.StringMap` values, so no AI paradigm is ever frozen into the wire contract. Entry point `interface AI`; authority is the interface reference.
 
 ---
 
@@ -186,7 +186,7 @@ smart apply my-setup.toml
 smart --host 192.168.1.5 display brightness 80
 
 # AI agent usage — same protocol, same interfaces
-# AI uses InferenceService.complete() exactly like CLI uses audio.set_volume()
+# AI uses InferenceService.derive() exactly like CLI uses audio.set_volume()
 ```
 
 ---
@@ -240,7 +240,7 @@ Push types left (opaque) when consumers don't inspect structure:
 
 - **92 schemas** — All compile, all validated
 - **Zero platform leaks** — No POSIX, Linux, x86 nouns in required enums
-- **AI-first** — `ai.capnp` for inference, agents, RAG, tools
+- **AI-first** — `ai.capnp` for inference, agents, knowledge, tools
 - **Vertical integration** — Kernel to AI, all one protocol
 
 ---

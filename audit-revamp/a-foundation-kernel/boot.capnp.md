@@ -1,0 +1,52 @@
+# Audit — boot.capnp (1166 lines)
+
+## Verdict
+**REWRITE — keep the bootstrap core, purge the technology museum.** DESIGN_PRINCIPLES.md:502 calls this file "stage-transitioning artifacts, no implementation assumptions" — exemplary. The actual file is the largest single collection of frozen technology in the entire 92-schema tree: `StorageBus { nvme, ahci, ide, scsi, virtio, sd, emmc, fcoe }` (`boot.capnp:258-270`), `BootloaderKind { grub, grub2, refind, shim, uBoot, barebox, limine }` (`:470-479`), `FirmwareKind { uefi, bios, coreboot, libreboot, uBoot, bareMetal }` (`:389-397`), `NetworkBootMethod { pxe, http, ipxe, iscsi }` (`:490-496`), `Architecture`/`CpuFeature` (`:345-376`), `PartitionTableKind { gpt, mbr, apt, sun }` (`:298-304`), `InitrdFormat { cpioGz, cpioXz, cpioZstd, erofs, squashfs }` (`:560-568`), plus ACPI/SMBIOS/DMI/TPM/serial-UART structs (`:430-468`, `:534-609`). Every one fails the 2046 test: a 2046 bootloader, bus, or partition format has no ordinal and must ride `custom` with no self-description. What must survive is small and good: the one well-known bootstrap capability (`:15-18`, `kernelService @31 :127`), `HandoffPointer` (`:1091-1097`, "24 bytes at a well-known address, then everything is capnp"), `BootBlob` inline/reference union (`:150-157` — correct R2), `IpcChannel`/`ChannelInfo` shared-memory arenas (`:25-30`, `:1118-1127` — correct zero-copy), `Module`/`BootImage` content-addressed images.
+
+## Wire-breakers
+None of the compile kind: `T.*`, `K.KernelType`, `FB.Framebuffer` (verified: `struct Framebuffer` exists at `framebuffer.capnp:48`), `Screenlock`-style imports all resolve; ordinals unique. One architectural hazard: the `kernel ↔ boot` circular import (`:22` / `kernel.capnp:26`) is legal but welds the two files into one compilation unit — acceptable, noted for the rewrite plan.
+
+## Doctrine violations
+| Rule | file:line | What fails | Concrete 2046 failure / cost |
+|---|---|---|---|
+| R1 | `boot.capnp:258-270` `StorageBus` | 10 bus technologies incl. `fcoe`, `fsblk` | 2046: a bus invented in 2031 (CXL, fabric-attached memory) has no ordinal. A consumer matching `virtio` today breaks on the storage of tomorrow; `custom @10` carries no name |
+| R1 | `boot.capnp:470-479` `BootloaderKind` | Vendor/product names — the exact class TIMELESSNESS.md:79 rejects ("systemd, syslinux (boot) → product names") | The doctrine self-contradicts (it prescribes `BootloaderKind { limine, grub, uefiDirect, custom }`), and the file implements the wrong half with 9 products. A 2046 bootloader cannot be identified without an eternal-enum extension |
+| R1 | `boot.capnp:345-358` `Architecture` (`wasm32`, `s390x`…), `:360-376` `CpuFeature` (`avx512`, `riscvV`, `wasmSimd`) | CPU taxonomy; `ComputeNode.arch @1` is the *required* position | Same class: RISC-V vector extensions arrive, post-ARM ISA — the enum is permanent. Opacity fix: `arch :Text` + `features :List(Text)` open tokens (the file already uses the Text pattern at `KernelSelection.architecture @6 :Text` `:1016` — inconsistent) |
+| R1 | `boot.capnp:298-304`, `:560-568` | `PartitionTableKind` (gpt/mbr/apt/sun), `InitrdFormat` (cpioGz/squashfs…) | A 2046 disk layout or initrd container has no ordinal |
+| R1 | `boot.capnp:389-397`, `:490-496`, `:436-448` | `FirmwareKind`, `NetworkBootMethod` (pxe/ipxe/iscsi), `TpmVersion`/`TpmAlgorithm` (sha1..sha512) | Hash algorithms in an enum age: SHA-3 variants exist today with no ordinal; post-quantum arrives before 2046 |
+| R5 | `boot.capnp:534-558` `AcpiTable`/`SmbiosEntry`/`DmiInfo`; `:248-256` `StorageCapability { trim, secureErase }`; `:579-609` UART parity/flow | x86/PC firmware tables and POSIX-device semantics in a *required* field of `BootManifest` (`acpiTables @20`, `smbios @21`, `dmi @22`) | An ARM/DTB or capability-machine boot has no ACPI; the manifest must carry empty structs pretending to describe absent tables. Non-POSIX backend break is structural, not incidental |
+| R5 | `boot.capnp:603-609` `SerialDevice { port, irq, dmaChannel, uartConfig }`, `:487` `BootloaderInfo.hhdmOffset` | HHDM named — the exact x86 noun TIMELESSNESS.md:78 bans ("cr3, HHDM (kernel) → x86-specific") | Self-contradiction with the doctrine file the schema cites; also duplicated with the commented-out `hhdmOffset` at `:1161-1165` |
+| R6 | `boot.capnp:647-658` `BootCapability` vs `abi.capnp:259-270` `BootCapability` | Byte-identical enum, two type IDs, two files | Codegen collision: any importer of both schemas gets two unrelated `BootCapability` classes; wire values silently diverge (they don't today, but nothing guarantees that stays true) |
+| R3-permission | `boot.capnp:647-658` `BootCapability { readMemory, writeMemory, … }` used at `:64`, `:119`, `:808`, `:954`, `:1084` | A permission enum parallel to `capability.capnp.Operation` | DESIGN_PRINCIPLES.md:399 forbids exactly this; the boot stage's authority should be capabilities, not a fixed verb list |
+| R6 | `boot.capnp:708-714` `RecoveryAction { retry, skip, fallback, halt, custom }` vs `types.capnp:1922-1931` `RecoveryAction { retry, retryWithBackoff, resetDevice, resetBus, … }` | Same name, different vocabularies; `CommFailure.recoveryAction @3` uses the local one (`:705`) | Two recovery grammars; a generic recovery consumer cannot be written |
+| R2 | `boot.capnp:1112-1116` `Module { name, data :Data, hash }` | Module blobs inline; only `BootBlob` has the reference union | A 100 MB kernel module is copied into the manifest message. The file already models the fix (`BootBlobRef` `:159-164`); `Module` should be one |
+| Bootstrap promise | `boot.capnp:1107-1109` `BootHandoff.handlerTableVaddr :UInt64` | Raw function-pointer table survives in the handoff | Contradicts the file's own promise (`:1088-1089`: "the schema takes ownership of every memory handoff… then everything is capnp") and the kernel-side `registerService` that exists to replace it (`kernel.capnp:187-189`) |
+
+## Duplicates & overlaps
+- `BootCapability` ↔ `abi.capnp:259` (above); `RecoveryAction` ↔ `types.capnp:1922` (above).
+- `ServiceEndpoint` (`:1129-1136`) vs `discovery.capnp:129-142` `ServiceEndpoint` — same name, different shapes (doorbell/channelSlot vs address/weight/protocol).
+- `IpcChannel` (`:25-30`) vs `ChannelInfo` (`:1118-1127`) — two channel structs in one file; `ChannelInfo` is the superset.
+- `AbPartitionState` (`:815-826`) vs `kernel.capnp:741-750` `AbSlotInfo` — same concept, same fields, two files.
+- Discovery-stack overlap: `NetworkBootInfo`/`DhcpLease` (`:498-514`) vs `network.capnp`/`dns.capnp` (outside batch, noted).
+
+## Gaps & holes
+- `BootManifest` has no declared behavior for a *failed* stage: `CommFailure` exists (`:701-706`) but nothing defines who consumes it or how the next stage learns the boot degraded. `FailoverChain` (`:793-800`) names fallbacks but no contract says when they engage. Demonstrated fork: two boot implementations, two failure-grammar interpretations.
+- `secureBoot @14`/`SecureBootState` (`:408-428`) mixes measurement (PCR) with policy — but there is no contract for what a *consumer* (e.g., init deciding trust) is allowed to conclude. Trust decisions are exactly where implementers would invent nonstandard behavior.
+
+## Zero-cost / eco
+- Correct: `IpcChannel`/`ChannelInfo` arena vaddrs (`:25-30`, `:1118-1127`) — genuine shared-memory zero-copy; `bootService @33` capability (`:136`) — the right peer pattern; doorbell vaddrs are a documented fast path.
+- Wrong: `Module.data` inline (`:1114`), see R2 row; `BootManifest` carries the full `devices/compute/hardware/acpiTables/smbios` lists inline — bounded by enumeration, acceptable in volume but every one is a technology-frozen copy.
+
+## UX & implementer guidance
+- The header (`:3-19`) is the bootstrap contract stated crisply — preserve it in the rewrite.
+- `BootManifest` field count (38) with sub-structs per technology reads as "describe your machine by enumerating every bus" — the opposite of the doctrine's affordance model. An implementer cannot tell which fields are required for a minimal boot.
+- `KLog`-adjacent: `BootDiagnostic.level @2 :T.LogLevel` (`:614`) — fine.
+- `BootStage`/`AuthorityLevel` (`:166-178`, `:638-645`) are two enums with identical member names (firmware/bootloader/kernel/init/userspace) — pick one.
+
+## Recommended actions
+1. **Rewrite the manifest core as open content.** Keep `BootStage`, `BootManifest` envelope, `BootHandoff`, `HandoffPointer`, `IpcChannel`/`ChannelInfo`, `BootBlob`, `Module`/`BootImage`; replace each technology struct with: (a) opaque `T.DataHandle` to the raw artifact (DTB blob, ACPI table, SMBIOS entry — `hal.capnp:443` `HardwareDescription` already models exactly this), (b) typed use of existing neutral primitives (`T.BusAddress` `types.capnp:1703`, `T.DeviceId`, `T.MimeType`), (c) open `Text` tokens where a name is genuinely open (`arch`, firmware kind, bootloader name). Gain: a 2046 bootloader satisfies the contract without touching it — the Swap Test the doctrine claims this file already passes. Cost: real work (one file, ~1100 lines → ~250), but nothing external consumes the protocol, so there is no migration price.
+2. **Delete `StorageBus`, `BootloaderKind`, `FirmwareKind`, `NetworkBootMethod`, `PartitionTableKind`, `InitrdFormat`, `Architecture`, `CpuFeature`, `TpmVersion`, `TpmAlgorithm`, `UartParity`, `UartFlowControl`, `BootCapability`, local `RecoveryAction`** (12 enums). Where the distinction matters, it is either open Text or `capability.capnp.Operation`. Gain: kills the duplicate-enum collisions (`abi`, `types`) and the forbidden permission model in one move.
+3. **Delete `hhdmOffset`** (`:487`) and the commented shadow (`:1165`). Gain: removes the banned x86 noun; cost: none (the same value flows via `ChannelInfo`).
+4. **`Module.data` → reference union** (`:1114`) modeled on `BootBlob`. Gain: no initrd-size copies into the manifest; cost: one struct.
+5. **Resolve `handlerTableVaddr`** (`:1109`): either the handoff is capnp-only (delete it; `registerService` covers it) or document why a function pointer must survive. Gain: keeps the bootstrap promise literally true — one well-known pointer, nothing else; cost: backends lose the raw fast path they were told not to use.
+6. **Define failed-stage behavior** in `BootEvent` (`commFailed` consumer, `FailoverChain` engagement). Gain: closes the fork where every boot implementation invents its failure grammar; cost: a spec paragraph.

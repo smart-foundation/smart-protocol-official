@@ -1,0 +1,45 @@
+# Audit — surface.capnp (418 lines)
+
+## Verdict
+**MERGE-INTO-compositor.capnp.** The doctrine's verdict (DESIGN_PRINCIPLES:214, :564) and SCHEMAS.md:167 both say this file is DEPRECATED into compositor's Session, and neither has been executed: the file is a fully live, *second* surface contract. The damage is concrete and current, not historical: the two commit paths have drifted into incompatibility. `surface.capnp:147 FrameSubmission { surfaceId, frameId, bufferId, bufferOffset, damage, present, fence :SyncFence, transform }` vs `compositor.capnp:529 SurfaceCommit { surfaceId, frameId, bufferIndex, format, damage, present, fence :SyncFence, transform }` — same purpose, different buffer mechanism (T.BufferId vs UInt8 index) and *different fence types* (`SyncFence { handle :T.FenceHandle, name }` here, 168–171 vs `SyncFence { native :UInt64 | none }` there, 572–577). An app that commits through one path cannot reason about its fence through the other. Both `DamageOption` (138–145) and `PresentIntent` (158–166) are byte-identical twins. The protocol also carries **two `SurfaceRole` enums with different value sets in the two files** (323–334 vs compositor.capnp:354–380) — a name collision that will silently confuse every importer. Nothing imports this file (verified repo-wide). Merge its unique parts into compositor Session, delete the rest.
+
+## Wire-breakers
+Two `SurfaceRole` enums with divergent value sets (this file: window/layer/overlay/cursor/notification/bubble/spatial/audio; compositor's: 24 window-management roles). Two `SyncFence` types. Two `DamageOption`/`PresentIntent`/`SpatialPose`/`DisplayZone` families with *ordinal-identical, content-different* members (e.g. this file's `PresentIntent` has `periodic @3` and `custom @4`; compositor's stops at `atTime @2`). Any code importing both files gets ambiguous type names — the collision is a compile-time hazard the moment one file imports both.
+
+## Doctrine violations
+| Rule | file:line | What fails | Concrete 2046 failure / cost |
+|---|---|---|---|
+| R6 | `surface.capnp:42` | The entire `Surface` interface (create/destroy/attach/commit/damage/state/queries/subscriptions) overlaps `compositor.Session` surface management (createSurface @2, updateSurface @4, commit @5, query @21, subscribe @22) | The active fork: `FrameSubmission` vs `SurfaceCommit` disagree on how a buffer is referenced (T.BufferId vs bufferIndex :UInt8), so a compositor implementing both must maintain two buffer-attachment semantics forever — and an app learns which one "its" backend implements only at runtime |
+| R6 | `surface.capnp:323` | `SurfaceRole` collides with `compositor.capnp:354 SurfaceRole` under the same name, different values | An importer of both files cannot name which role model it means; role routing code silently binds to whichever import wins. Two role vocabularies for one concept |
+| R6 | `surface.capnp:168` | Local `SyncFence { handle :T.FenceHandle, name :Text }` vs `compositor.capnp:572 SyncFence { native :UInt64 | none }` | Fence semantics split across two types; a fence issued on this path is uninterpretable on the compositor path. The typed `T.FenceHandle` here is the *correct* one — compositor's `native :UInt64` is the offender |
+| R5 | `surface.capnp:40` | `setGpu @40 (gpu :GpuSelection { gpuId :UInt32, requireHwAccel })` — GPU selection and hardware-accel flags in the contract | "Which GPU" and "require HW accel" are driver/driver-framework rendezvous (the Agnostic Test rejects them: swapping GPUs or going software-only breaks the contract instead of the backend). A software renderer must lie in `requireHwAccel` |
+| Agnostic | `surface.capnp:90` | `createZone @29 (displayId :T.SurfaceId, ...)` — a display addressed as a `T.SurfaceId` while `T.OutputId` exists | Type-confusion by design: display regions are outputs, not surfaces. Backends must detect "this surface id actually names an output" heuristically — a fork with no correct answer |
+| R1 | `surface.capnp:181` | `SurfaceMaterial { default, glass, paper, metal, ceramic, fabric }` — 2020s design-tool material vocabulary as a wire enum | A 2046 material vocabulary (energy-field, projected, volumetric) has no ordinal; materials are styling policy and belong in theme tokens, not the surface contract |
+| R1 | `surface.capnp:346, 361` | `CaptureFormat { png, jpeg, webp, raw }`, `RecordingCodec { vp8, vp9, av1, h264, h265 }` freezes today's codecs | The same error as `logging.capnp LogFormat` (doctrine:226): a 2035 codec (av2, or a neural codec) has no ordinal and every backend ships `custom` with its own naming. Codecs are content types — `T.MimeType` is the open value the protocol already owns |
+| R7 | `surface.capnp:69, 90` | `listSurfaces @19` unbounded; `createZone @29 -> (zoneId :Text)` returns a zone by free text | Zones are then addressed by unverifiable strings; `setZOrder @38`'s sibling/relation config (372–385) is good, but zone ids aren't |
+| R2 | `surface.capnp:356` | `RecordingConfig.fps @2 :UInt32` + `codec @0` — frame-rate-accurate video recording config in a struct with no stream: where do frames go? | `startRecording @36` produces no handle, no stream, no destination — recording is fire-and-forget. Every backend invents where the file lands; `surfaceRecorder` extensions will fork |
+
+## Duplicates & overlaps
+- The audit-7/8/9 blocks are copy-paste twins, verified identical to compositor.capnp: `SpatialPose`+`SpatialAnchor`+`AnchorType` (231–254 ↔ 1300–1323), `DisplayZone`+`ZoneRole`+`ZonePermission`+`InteractionMode` (265–299 ↔ 1326–1369), `EasingType` (397–404 ↔ 1443–1450; canonical: `types.capnp:1239 AnimationEasing`), `ContextBubbleSurface`+`BubbleContent` (302–320 ↔ shell.capnp:852–869), `CaptureFormat`/`RecordingConfig` (355–369 — unique here, but see the codec finding).
+- **The one import this file got right**: `using A11y = import "accessibility.capnp"` (line 4) and `SurfaceAccessibilityTree @407 :List(A11y.AccessibilityNode)` — the pattern compositor.capnp should have followed instead of forking its own node types. Cite this when fixing compositor.
+- Unique-to-this-file (must survive the merge): `subscribeState`/`pullState`/`StateSubscription` (23–25, 133–136 — surface state as a stream), `FrameData` (191) with `committedDamage :T.Region`, `FrameMetrics` (337), `captureSurface`/`startRecording`/`stopRecording` (35–37), `SurfaceState` (201).
+
+## Gaps & holes
+- Nothing unique to fill; the holes live in compositor (the merge target).
+
+## Zero-cost / eco
+- Frame subscription is single-event `pull` (129) — fine at commit rates, wrong at input rates; adopt the batch's `pull (maxEvents)` shape on merge.
+- `FrameData.committedDamage @6 :T.Region` (rects list) — good: damage arrives as geometry, not pixels. Preserve exactly this on merge.
+- No inline pixel payloads anywhere in the file — the bulk discipline is correct; the merge must not regress it.
+
+## UX & implementer guidance
+- The file's header (9–40) is a changelog of improvements with no deprecation marker, while SCHEMAS.md:167 says DEPRECATED — the exact documentation-vs-schema contradiction catalogued in the batch summary. An implementer has to guess which document is normative; the schema is, and it is fully alive.
+- `createZone(displayId :T.SurfaceId)` (see Agnostic row): the type lie will take an implementer a day to discover and a week to work around.
+- `ShadowShape.blur :Float32` (174) — a blur radius is a rendering directive in the surface contract; the compositor decides presentation. Keep the *declaration* (a shadow exists, its color/offset), not the blur instruction — or move wholesale to theme tokens.
+
+## Recommended actions
+1. **Merge into compositor Session and delete this file.** Specifically: promote `StateSubscription`/`SurfaceState`, `FrameData`/`FrameMetrics`, `attachBuffer` (by `T.BufferId` — the right mechanism), capture/recording, and the typed `SyncFence`; delete the copy-paste twins. Gain: one commit path with one fence type and one buffer mechanism; the drift between `FrameSubmission` and `SurfaceCommit` ends; the two-`SurfaceRole` collision ends. Cost: compositor Session absorbs ~15 methods; this file disappears with zero importers.
+2. **When merging, promote `A11y.AccessibilityTree` usage instead of compositor's local types** (this file's import pattern is the correct one). Gain: consistent with fix #2 of the compositor audit.
+3. **`T.FenceHandle` SyncFence wins; compositor's `native :UInt64` retires.** Gain: fences stay opaque and typed. Cost: one struct in compositor.
+4. **Delete `setGpu`, `SurfaceMaterial`, codec enums, `createZone`'s display-as-surface, `ShadowShape.blur` directives.** Gain: the surface contract stops instructing GPU/rendering policy; codecs become `T.MimeType` (open). Cost: three enums + one method deleted; features live in theme/driver schemas.
+5. **Give recording a stream** (`startRecording -> (handle, subscription)`) or drop it. Gain: fire-and-forget recording stops forcing each backend to invent a destination. Cost: one method re-shape; or delete with zero consumers today.

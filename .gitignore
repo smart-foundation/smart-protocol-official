@@ -1,0 +1,6 @@
+# Cap'n Proto bindings — regenerate with scripts/regenerate.sh, never commit.
+gen/
+
+# Python bytecode from scripts/validate.py
+__pycache__/
+*.pyc

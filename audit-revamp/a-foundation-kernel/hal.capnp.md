@@ -1,0 +1,46 @@
+# Audit — hal.capnp (664 lines)
+
+## Verdict
+**FIX (targeted).** The driver-facing affordance core is the right shape and matches the doctrine ("HAL describes what hardware-access a driver may ask for, NOT how those requests are implemented"): `claim`/`map`/`unmap` with `T.MappedRegionId` (`hal.capnp:205-209`), IRQ subscription, DMA channels, power states, all backend-decided. The defects: (1) `HalService` grew a "Hardware Foundation" block (`:280-319`) that exposes page-table creation, physical-page allocation, and `X86PortIo` — i.e., exactly the kernel-internal machinery DESIGN_PRINCIPLES.md:64 says stays OUT, plus an x86-only interface inside the "arch-agnostic core" (the file's own comment at `:652-654` admits it); (2) IRQs have two disjoint mechanisms (`subscribe`+`waitIrq` by vector vs `subscribeIrq`+`waitIrqHandle` by handle) with no event delivery — a polling design where a subscription belongs; (3) the audit-5/7/8/9 descriptor layer duplicates `types.capnp` primitives (`DeviceResource`, `PcmFormat`, `InterruptMode`).
+
+## Wire-breakers
+None: ordinals unique (`@0..@60`), all `T.*` resolve. Note `hal.capnp:185-190` `DeviceResource` (type/address/size/flags as raw `UInt8`/`UInt32`) collides by name with `types.capnp:2124-2129` `DeviceResource` (typed `ResourceType`) — two different structs, one name, across the two most-imported files in the tree.
+
+## Doctrine violations
+| Rule | file:line | What fails | Concrete 2046 failure / cost |
+|---|---|---|---|
+| R5 | `hal.capnp:319` `getX86PortIo @60 () -> (service :X86PortIo)`, `:656-663` `interface X86PortIo { inb, outb, inw, outw, inl, outl }` | x86 port-I/O inside `HalService`; the interface is present-or-NotImplemented on every other architecture | ARM/RISC-V backends must stub six methods that cannot exist; a portable driver that accidentally depends on the reference breaks only when it runs off-x86. The file comments acknowledge the carve-out but keep the method in the core interface anyway |
+| DESIGN_PRINCIPLES.md:64 | `hal.capnp:287-299` `allocPhysicalPage`, `freePhysicalPage`, `createAddressSpace (levels, mode)`, `destroyAddressSpace`, `mapVirtual`, `unmapVirtual`, `switchAddressSpace` | Page-table and physical-page management as app-facing HAL methods — "page table structure is a kernel-internal memory management detail… KEEPS OUT" | 2046: a kernel without page tables (single-address-space, capability-paged, CHERI-style) cannot implement `mapVirtual` at all. The protocol leaks the one mechanism the doctrine names explicitly |
+| R8 / duplicates | `hal.capnp:185-190` vs `types.capnp:2124-2129` | `DeviceResource` name collision, untyped local copy (`type @0 :UInt8` where `T.ResourceType` exists `types.capnp:2115`) | Same-name-different-shape across the two most-imported files: codegen collision; a generic driver cannot parse resources without knowing which schema produced them |
+| R5 / duplicates | `hal.capnp:71-76` `IrqLevel { edge, level, message }` vs `types.capnp:2010-2014` `InterruptLevel { edge, level, message }`; `hal.capnp:41-53` `MemFlag` vs `types.capnp:1863-1872` `PageFlags` | Verbatim duplicates of types.capnp primitives | Two spellings of edge/level/message; an interrupt consumer must normalize. `types.capnp` Batch 16 explicitly claims consolidation "only the missing pieces are added" — HAL kept its copies |
+| R1 | `hal.capnp:419-436` `AiAcceleratorType { tpu, npu, gpu, fpga, dsp }`, `AiPrecision { fp32, fp16, bf16, int8, int4, binary }`, `:542-549` `IommuType { smmu, intelIommu, amdVi, armSmmu, virtioIommu }` | Vendor/technology lists | 2046: a photonic or memristive accelerator, or an IOMMU generation, has no ordinal. `frameworks @6 :List(Text)` (`:416`) is the correct open pattern sitting one field away from the enum |
+| R5 | `hal.capnp:449-454` `HardwareDescFormat { deviceTree, acpi, smbios, devicetreeOverlay }` in `HardwareDescription` | PC/ARM firmware-table names | Non-POSIX break: a boot ROM with neither must return a stub. The struct's *data* is correctly a `T.DataHandle` (`:443`) — the enum is the only leak; open Text `format` suffices |
+| R2 / polling | `hal.capnp:211-217` `subscribe @3 -> (ticket :IrqTicket)` then `waitIrq @5 (vector, timeout)`; `:269-272` `subscribeIrq @32 -> (vector :UInt8, handle :UInt64)` + `waitIrqHandle @34` | Two parallel IRQ mechanisms; neither delivers events — both require the driver to block/poll per vector | Eco cost: every IRQ forces a syscall-shaped RPC round trip or a blocking wait; the ticket from `subscribe` can't be awaited at all (`IrqTicket` has no wait method and no subscription). A 2046 latency-critical driver (or an energy-budgeted one) pays wake-ups the protocol forced |
+| R4 | `hal.capnp:259` `mapMmio -> (virt :UInt64, handle :UInt64)`, `:263` `allocDmaBuf -> (phys, virt, handle :UInt64)`, `:287` `allocPhysicalPage -> (phys :UInt64)`, `:628` PerCpuService-style raw addresses | Raw addresses as return values | Addresses are backend-internal structure; handing them to driver-apps as bare UInt64 invites cross-address-space confusion (cf. the `DmaHandle.physicalAddress` comment `types.capnp:1718` which at least documents the hazard) |
+| R7 | `hal.capnp:256` `listDevices @25 () -> (devices :List(DeviceDescriptor))`; `:248` `discoverBus @19 () -> (topology :BusTopology)` | Unbounded lists, no pagination (compare `listRegions @11` which is paginated `:228`) | Large bus enumerations return in one message; inconsistent with the file's own pagination discipline |
+
+## Duplicates & overlaps
+- `PowerState` (`:122-131`) vs `types.capnp:2140-2149` `PowerSleepState` — two power enums, overlapping members (`on/idle/standby/sleep/deepSleep/off/custom` vs `busMasterActive/on/idle/standby/sleep/deepSleep/off/custom`).
+- `HalCapability { dma, irq, mmio, portIo, busMaster }` (`:495-502`) vs `types.capnp:2096-2106` `CapabilityType { mmio, portIo, dma, interrupt, busMaster, … }` — same list again.
+- IRQ vectors/handles: `subscribeIrq @32 (mode :UInt8)` + `registerIrq @49 (mode :UInt8)` — a third IRQ registration path with untyped mode bytes (should be `T.InterruptMode`).
+- `Si`… `DmaDirection` (`:104-109`) vs `T.DmaHandle.direction :UInt8` (`types.capnp:1720`) — typed vs raw.
+
+## Gaps & holes
+- No contract for IRQ *delivery* to a userspace driver at all (see R2/polling row): `subscribe` gives a ticket, `subscribeIrq` gives a handle, and both require the driver to block in `waitIrq`. The subscription interfaces that exist elsewhere in the file (`BusTopologySubscription` `:611-614`) show the correct pattern was available.
+- `claim @0` returns `HalAuthority` but nothing states what evidence `ClaimRequest.proof @1 :Data` (`:324`) must satisfy — verification is backend-defined with no declared interface. An implementer cannot tell what to check; a driver cannot tell what to present.
+
+## Zero-cost / eco
+- DMA sharing via `DmaBufInfo` (`:458-469`) with a shared buffer is correct zero-copy in spirit — but `fd @0 :UInt32` is a POSIX file descriptor (`unshareBuffer @16 (fd :UInt32)` `:241`): a platform noun in a required position. Non-POSIX backends break; should be `T.MappedRegionId`/`T.BufferId`.
+- `parseAcpi @21 -> (data :Data)` (`:250`): full ACPI table inline — use `T.DataHandle` (`:443` already does for `HardwareDescription`).
+
+## UX & implementer guidance
+- `IrqRequest.needingAck @3 :Bool = true` (`:68`) is well defaulted; keep defaults on optional behaviors.
+- `DriverInfo.respawnPolicy @4 :UInt8` (`:200`) and `registerDevice @36 (policy :UInt8)` (`:275`), `getRespawnContext @38 (state :UInt8 …)` (`:277`) — raw codes where `T.RestartPolicy` (`types.capnp:1954`), `T.EntityState` (`:1969`), `T.FailureReport` (`:1878`) exist.
+- `probeDevice @22` / `registerIrq`-family comments mix "Audit-5" provenance with contract text; the audit trail does not teach the domain.
+
+## Recommended actions
+1. **Cut the "Hardware Foundation" block** (`:280-319`: physical pages, address spaces, `X86PortIo`) out of `HalService`. If a backend needs it, it belongs in a separate privileged schema, not the arch-agnostic core. Gain: HAL becomes implementable on non-x86 and by any kernel that owns its own page tables — the doctrine's explicit KEEPS-OUT list; cost: hypothetical raw-access backends lose a (stub-only, today) path.
+2. **Unify IRQ handling to one mechanism with event delivery**: subscription returning a subscription whose `pull` delivers firings (pattern: `BusTopologySubscription`). Gain: removes per-vector blocking/polling; one IRQ path instead of three; eco: interrupt-driven, not poll-driven. Cost: re-shape 6 methods (ordinals free pre-release).
+3. **Replace duplicated primitives with types.capnp versions** (`DeviceResource`, `IrqLevel`→`InterruptLevel`, `MemFlag`→`PageFlags`, `HalCapability`→`CapabilityType`, `PowerState`→`PowerSleepState`). Gain: kills 5 name/semantic collisions across the two most-imported files; cost: mechanical, and free pre-release.
+4. **`parseAcpi` → `T.DataHandle`; `DmaBufInfo.fd` → typed buffer handle; raw `UInt64`/`UInt8` codes → typed values** (`:241`, `:250`, `:200`, `:275`, `:277`). Gain: removes POSIX fd from a required position, kills raw-code traps; cost: small.
+5. **Add pagination to `discoverBus`/`listDevices`** (`:248`, `:256`). Gain: bounded enumeration; cost: two ordinals.
