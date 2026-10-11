@@ -1,356 +1,266 @@
 @0xa1b2c3d4e5f60065;
 
+# ═══════════════════════════════════════════════════════════════════════
+# Signal — typed asynchronous notification of processes and threads.
+#
+# The kernel of this file has always been right: `T.SignalKind` (no POSIX
+# numbers, no exceptions), `T.DataHandle` payloads, filter + subscription
+# + cancel. What surrounds it was an invented feature stack that no 2046
+# implementer could derive from the contract.
+#
+# ── THE ONE DELIVERY AUTHORITY ─────────────────────────────────────────
+#
+# Three interfaces could deliver a signal — this one, `KernelService
+# .signal`, and `Process.kill` — each with its own permission check and
+# its own error model (`SignalDeliveryResult.notPermitted` here,
+# `T.VoidResult` there). A supervisor had to implement and keep three
+# checks identical.
+#
+# `SignalService.send` is now the ONLY delivery path, because it has the
+# richest identity (process, thread or group), the typed result, and the
+# zero-copy payload. The kernel still performs the delivery; the contract
+# for asking it to is here. `kernel.signal` and `process.kill` are gone.
+#
+# ── WHAT WAS DELETED, AND WHY ──────────────────────────────────────────
+#
+#   * `SignalMappingTable` / `SignalMapping` / `getSignalMapping` — POSIX
+#     signal numbers re-imported through the back door
+#     (`platformSignal :UInt32`, `backendName "posix"/"linux"`) in the one
+#     file whose header promises "No POSIX signal number assumptions". A
+#     message-based runtime has no numbers to map; native numbering
+#     belongs in backend documentation, not on the wire.
+#   * the buffering block (`bufferSignal`, `flushBuffer`,
+#     `getBufferSize`) — producer-side buffering of undelivered signals
+#     with no bound and no declared policy. Where a subscription pull
+#     belongs, the design forced server-held queues.
+#   * cascades (`setCascadeRule`, `getCascadeRule`, `setCascadeDepthLimit`,
+#     `getCascadeDepthLimit`) — an invented cascade algebra with depth
+#     limits, no consumer, and no derivable semantics.
+#   * group persistence (`persistSignalGroup`, `loadSignalGroup`,
+#     `deletePersistedGroup`, `listPersistedGroups`) — a persistence
+#     protocol for a grouping concept that process.capnp already owns as
+#     `ProcessGroup`.
+#   * `classifySignal` / `routeSignal` — "AI-assisted routing" as an OS
+#     method: no classification vocabulary, no confidence semantics, no
+#     fallback, and a `suggestedHandler` string every backend would spell
+#     differently.
+#   * `replaySignalWith` — replaying a recorded signal with a MODIFIED
+#     payload and receiver. The capability to receive does not imply the
+#     capability to redirect: this was a privilege-escalation primitive.
+#   * thread-mask duplication (`setThreadMask`, `getThreadMask`,
+#     `getThreadPending`) — a second mask model beside `setMask`/`getMask`.
+#   * `SignalAuditEntry` + `getAuditLog` + `exportAuditLog` — a fourth
+#     audit-entry shape (capability, session, klog, here) and an ungated
+#     audit export. A signal delivery is a loggable event: it belongs in
+#     the log stream with its typed kind, which keeps ONE audit grammar.
+#   * `SignalGroup` — duplicated process.capnp's `ProcessGroup` under a
+#     UInt32 id with a "0 = new group" sentinel.
+#   * the `pull` / `pullPaged` ambiguity — two pull methods with different
+#     request/response pairing. One paginated pull remains.
+#
+# ── STANDARD SIGNAL SEMANTICS, DECLARED ────────────────────────────────
+#
+# `T.SignalKind.terminate` means the receiver MUST stop. Whether it runs
+# a handler first is the receiver's business. `listAvailable` is a
+# CONTRACT, not a hint: a backend MUST answer truthfully about which
+# kinds exist, what their default action is, and whether they can be
+# blocked or caught. A consumer that is told `canCatch = false` may
+# assume the signal cannot be intercepted.
+#
+# Authority is the interface reference: holding `SignalService` is the
+# authority to send within the receivers the backend permits. No
+# per-method token (R3).
+# ═══════════════════════════════════════════════════════════════════════
+
 using T = import "types.capnp";
 
-# ══════════════════════════════════════════════════════════════════════
-# Signal — Typed signal/event system for inter-process notification.
-#
-# Referenced by:
-#   - process.capnp (signal delivery, AppCrashEvent.signal)
-#   - app.capnp (AppCrashEvent.signal)
-#   - kernel.capnp (signal handling)
-#
-# Design principles:
-#   - No POSIX signal number assumptions (SIGTERM=15, SIGKILL=9, etc.)
-#   - No Android signal assumptions (signal 9 = kill)
-#   - Signal semantics are cross-platform; backends map to native signals
-#   - The T.SignalKind enum in types.capnp defines the canonical signal types
-#   - This schema adds the service layer: send, subscribe, list, handle
-#
-# Signal semantics:
-#   - Signals are asynchronous notifications sent to a process or thread
-#   - Each signal has a kind (terminate, interrupt, kill, etc.) and optional payload
-#   - Signals can carry a small data payload (user-defined signals)
-#   - Signal delivery is best-effort; the receiver may not handle the signal
-#   - Multiple signal handlers can be registered for different signal kinds
-# ══════════════════════════════════════════════════════════════════════
+# Who sent a signal. The pre-revamp `sender :T.ProcessId` with
+# "0 = system signal" collided with kernels where PID 0 is a real (idle)
+# task, so "was this the system?" was unanswerable.
+struct SenderRef {
+    union {
+        process @0 :T.ProcessId;
+        service @1 :T.ServiceId;
+        # The system itself, with no process behind it.
+        system @2 :Void;
+        unknown @3 :T.UnknownEvent;
+    }
+}
 
-# ── Enums ────────────────────────────────────────────────────
-
-enum SignalAction {
-    ignore @0;          # Discard the signal
-    default @1;         # Use backend-default action for this signal
-    handler @2;         # Invoke registered handler
-    custom @3;          # Backend-specific action
+# One signal, as delivered or as pending.
+struct SignalEvent {
+    id @0 :T.EventId;
+    # Monotonic time, so ordering survives clock adjustment.
+    at @1 :T.MonotonicTimestamp;
+    signalKind @2 :T.SignalKind;
+    sender @3 :SenderRef;
+    # Payload, zero-copy.
+    payload @4 :T.DataHandle;
+    # What happened when the signal was delivered.
+    result @5 :SignalDeliveryResult;
+    # Thread the signal was delivered to (zero = any thread).
+    threadId @6 :T.ThreadId;
+    # Group the signal was addressed to (zero = none).
+    groupId @7 :T.GroupId;
 }
 
 enum SignalDeliveryResult {
-    delivered @0;       # Signal was delivered to the target
-    notFound @1;        # Target process/thread does not exist
-    notPermitted @2;    # Caller lacks permission to send signal
-    throttled @3;       # Signal delivery was rate-limited
-    queued @4;          # Signal was queued (target not yet ready)
-    timedOut @5;        # Signal delivery timed out
-    custom @6;          # Backend-specific result
+    unknown @0;
+    # Handed to the receiver.
+    delivered @1;
+    # The receiver's mask blocks this kind; the signal is now pending.
+    blocked @2;
+    # The caller may not signal this receiver.
+    notPermitted @3;
+    # No handler and no default action: the kind is unknown to this
+    # backend. A consumer must treat this as "nothing happened" and not
+    # as success.
+    noHandler @4;
+    # Accepted for later delivery: the receiver is not runnable now.
+    queued @5;
+    custom @6;
 }
 
-# Audit-8: Signal priority levels.
-enum SignalPriority {
-    urgent     @0;   # Highest priority, delivered immediately
-    high       @1;   # High priority, delivered before normal
-    normal     @2;   # Normal priority (default)
-    low        @3;   # Low priority, delivered after normal
-    background @4;   # Background priority, delivered when idle
-    custom     @5;   # Backend-specific priority
-}
-
-# ── Structs ──────────────────────────────────────────────────
-
-struct SignalEvent {
-    sender @0 :T.ProcessId;          # 0 = system signal (no sender)
-    receiver @1 :T.ProcessId;        # Target process
-    signal @2 :T.SignalKind;         # Signal type (from types.capnp)
-    timestamp @3 :T.Timestamp;
-    payload @4 :T.DataHandle;        # Optional data payload (for userDefined signals)
-    threadId @5 :T.ThreadId;         # 0 = process-level signal
-}
-
-struct SignalMask {
-    # Which signal kinds are blocked (will not be delivered).
-    blocked @0 :List(T.SignalKind);
-    # Which signal kinds are pending (queued but not yet delivered).
-    pending @1 :List(T.SignalKind);
-}
-
-struct SignalHandler {
-    signal @0 :T.SignalKind;         # Which signal this handler is for
-    action @1 :SignalAction;
-    # For handler action: optional handler identifier
-    handlerId @2 :Text;              # Backend-decided handler reference
+struct SignalSendRequest {
+    signalKind @0 :T.SignalKind;
+    receiver @1 :T.ProcessId;
+    # Payload, zero-copy. Small payloads inline automatically.
+    payload @2 :T.DataHandle;
+    # Thread to deliver to (zero = any thread of the receiver).
+    threadId @3 :T.ThreadId;
+    # Group to deliver to (zero = this process only). The group type is
+    # process.capnp's canonical `ProcessGroup` identity.
+    groupId @4 :T.GroupId;
+    metadata @5 :T.StringMap;
 }
 
 struct SignalInfo {
-    kind @0 :T.SignalKind;
-    defaultAction @1 :SignalAction;  # What happens if no handler is registered
-    description @2 :Text;            # Human-readable description
-    canBlock @3 :Bool;               # Whether this signal can be blocked
-    canCatch @4 :Bool;               # Whether this signal can have a custom handler
+    signalKind @0 :T.SignalKind;
+    # What the backend does with this kind by default.
+    defaultAction @1 :SignalAction;
+    canBlock @2 :Bool;
+    canCatch @3 :Bool;
+    description @4 :Text;
 }
 
-# ── Filter ───────────────────────────────────────────────────
+enum SignalAction {
+    unknown @0;
+    # Stop the receiver (after any handler it is permitted to run).
+    terminate @1;
+    # Stop without running handlers.
+    terminateNow @2;
+    # Ignore.
+    ignore @3;
+    # Continue if stopped.
+    continueExecution @4;
+    # Stop without terminating.
+    stop @5;
+    custom @6;
+}
+
+struct SignalHandler {
+    signalKind @0 :T.SignalKind;
+    action @1 :SignalAction;
+    # Thread the handler runs on (zero = any).
+    threadId @2 :T.ThreadId;
+}
+
+# Which kinds the receiver blocks, and which are waiting.
+struct SignalMask {
+    blocked @0 :List(T.SignalKind);
+    pending @1 :List(T.SignalKind);
+}
 
 struct SignalFilter {
-    # Filter by sender (empty = any sender)
-    sender @0 :T.ProcessId;
-    # Filter by receiver (empty = any receiver)
-    receiver @1 :T.ProcessId;
-    # Filter by signal kinds (empty = all kinds)
-    kinds @2 :List(T.SignalKind);
-    # Filter by time range
-    since @3 :T.Timestamp;           # 0 = no lower bound
-    before @4 :T.Timestamp;          # 0 = no upper bound
-    pagination @5 :T.Pagination;
+    signalKinds @0 :List(T.SignalKind);
+    # Restrict to signals from this sender.
+    fromProcess @1 :T.ProcessId;
+    # Restrict to signals addressed to this group.
+    groupId @2 :T.GroupId;
+    since @3 :T.Timestamp;
+    # Restrict to signals delivered to this thread.
+    threadId @4 :T.ThreadId;
+    # Only signals with this delivery result.
+    results @5 :List(SignalDeliveryResult);
 }
 
-# ── Subscription ─────────────────────────────────────────────
-
-interface SignalSubscription {
-    pull @0 () -> (events :List(SignalEvent), pagination :T.Pagination, total :UInt64);
-    cancel @1 () -> T.VoidResult;
-
-    # Audit-8: Paginated event retrieval.
-    pullPaged @2 (pagination :T.Pagination)
-        -> (events :List(SignalEvent), total :UInt64);
-}
-
-# ── Audit-8: Signal Rate Limit ────────────────────────────────────────
-
+# A declared ceiling, so a misbehaving producer cannot flood a receiver.
 struct SignalRateLimit {
-    # Maximum signals per second.
-    maxPerSecond @0 :UInt32;
-    # Maximum burst size.
-    maxBurst @1 :UInt32;
-    # Cooldown duration after burst.
-    cooldownDuration @2 :T.Duration;
-    # Whether rate limiting is enabled.
-    enabled @3 :Bool;
+    # Maximum signals of this kind per window.
+    maxPerWindow @0 :UInt32;
+    window @1 :T.Duration;
+    # What the backend does at the ceiling, so a producer can predict.
+    atLimit @2 :SignalTimeoutAction;
 }
-
-# ── Audit-8: Signal Timeout ───────────────────────────────────────────
 
 struct SignalTimeout {
-    # Signal kind this timeout applies to.
-    signalKind @0 :T.SignalKind;
-    # Timeout duration.
-    timeout @1 :T.Duration;
-    # Action on timeout.
-    onTimeout @2 :SignalTimeoutAction;
+    # How long to wait for the receiver to acknowledge the signal.
+    timeout @0 :T.Duration;
+    # What to do when the timeout elapses.
+    action @1 :SignalTimeoutAction;
 }
 
 enum SignalTimeoutAction {
-    escalate @0;   # Escalate to a higher-priority signal
-    abort    @1;   # Abort the target process
-    retry    @2;   # Retry signal delivery
-    log      @3;   # Log the timeout and continue
-    custom   @4;   # Backend-specific action
+    unknown @0;
+    escalate @1;
+    abort @2;
+    retry @3;
+    log @4;
+    custom @5;
 }
 
-# ── Audit-8: Signal Audit Entry ───────────────────────────────────────
-
-struct SignalAuditEntry {
-    # When the signal was sent.
-    timestamp @0 :T.Timestamp;
-    # Sender process.
-    sender @1 :T.ProcessId;
-    # Receiver process.
-    receiver @2 :T.ProcessId;
-    # Signal kind.
-    signal @3 :T.SignalKind;
-    # Whether the signal was delivered.
-    delivered @4 :Bool;
-    # Handler result (if handled).
-    handlerResult @5 :Text;
-}
-
-# ── Audit-8: Signal Mapping Table ─────────────────────────────────────
-
-struct SignalMappingTable {
-    # Backend name (e.g., "posix", "windows", "linux").
-    backendName @0 :Text;
-    # Signal mappings.
-    mappings @1 :List(SignalMapping);
-}
-
-struct SignalMapping {
-    # Platform-specific signal number.
-    platformSignal @0 :UInt32;
-    # Mapped cross-platform signal kind.
-    mappedKind @1 :T.SignalKind;
-    # Human-readable description.
-    description @2 :Text;
-}
-
-# ── Audit-8: Replayable Signal ────────────────────────────────────────
-
-struct ReplayableSignal {
-    # Event ID of the original signal.
-    eventId @0 :T.EventId;
-    # Original timestamp.
-    originalTimestamp @1 :T.Timestamp;
-    # Signal kind.
-    signal @2 :T.SignalKind;
-    # Signal payload.
-    payload @3 :T.DataHandle;
-}
-
-# ── Audit-8: Signal Group ─────────────────────────────────────────────
-
-struct SignalGroup {
-    # Group identifier (0 = new group).
-    groupId @0 :UInt32;
-    # Human-readable group name.
-    name @1 :Text;
-    # Processes in this group.
-    processes @2 :List(T.ProcessId);
-    # Signal kinds this group receives.
-    signalKinds @3 :List(T.SignalKind);
-}
-
-# ── Audit-8: Signal Cascade ───────────────────────────────────────────
-
-struct SignalCascade {
-    # Original signal kind.
-    originalSignal @0 :T.SignalKind;
-    # Processes to cascade the signal to.
-    cascadedTo @1 :List(T.ProcessId);
-    # Cascade policy.
-    cascadePolicy @2 :SignalCascadePolicy;
-}
-
-enum SignalCascadePolicy {
-    forward   @0;   # Forward the signal as-is
-    transform @1;   # Transform the signal (backend-specific)
-    drop      @2;   # Drop the signal (no cascade)
-    custom    @3;   # Backend-specific policy
-}
-
-# ── Audit-8: Signal Classification (AI-assisted) ─────────────────────
-
-struct SignalClassification {
-    # Signal kind.
-    signalKind @0 :T.SignalKind;
-    # Confidence score (0.0-1.0).
-    confidence @1 :Float32;
-    # Suggested handler name.
-    suggestedHandler @2 :Text;
-    # Classification category (e.g., "system", "user", "error").
-    category @3 :Text;
-}
-
-# ── Service ──────────────────────────────────────────────────
+# ── The delivery authority ──────────────────────────────────────────────
+# The root of the signal domain: handed to the caller by the host, so it
+# is deliberately not returned by any method. `SignalSubscription` IS
+# returned (by `subscribe`), so every interface here is reachable.
 
 interface SignalService {
-    # Send a signal to a process or thread
-    send @0 (signal :T.SignalKind, receiver :T.ProcessId,
-             payload :T.DataHandle,
-             threadId :T.ThreadId) -> (result :SignalDeliveryResult);
+    # THE delivery path. One call, one typed result.
+    send @0 (request :SignalSendRequest) -> (result :SignalDeliveryResult);
 
-    # Batch send: send the same signal to multiple processes
-    sendBatch @1 (signal :T.SignalKind, receivers :List(T.ProcessId),
-                  payload :T.DataHandle) -> (results :List(SignalDeliveryResult));
+    # Batch send: several requests, one call, results in order.
+    sendBatch @1 (requests :List(SignalSendRequest)) -> (results :List(SignalDeliveryResult));
 
-    # Query available signal kinds and their default actions
-    listAvailable @2 () -> (signals :List(SignalInfo));
+    # Send to every member of a process group.
+    sendToGroup @2 (request :SignalSendRequest) -> (results :List(SignalDeliveryResult));
 
-    # Manage signal handlers for the calling process
-    setHandler @3 (handler :SignalHandler) -> T.VoidResult;
-    removeHandler @4 (signal :T.SignalKind) -> T.VoidResult;
-    getHandlers @5 () -> (handlers :List(SignalHandler));
+    # Query the kinds this backend actually has, and their declared
+    # semantics. Truthful by contract.
+    listAvailable @3 () -> (signals :List(SignalInfo));
 
-    # Manage signal mask for the calling process
-    setMask @6 (mask :SignalMask) -> T.VoidResult;
-    getMask @7 () -> (mask :SignalMask);
+    # Handlers for the calling process.
+    setHandler @4 (handler :SignalHandler) -> T.VoidResult;
+    removeHandler @5 (signal :T.SignalKind) -> T.VoidResult;
+    getHandlers @6 () -> (handlers :List(SignalHandler));
 
-    # Query pending signals
-    getPending @8 (processId :T.ProcessId) -> (pending :List(SignalEvent));
+    # Mask for the calling process.
+    setMask @7 (mask :SignalMask) -> T.VoidResult;
+    getMask @8 () -> (mask :SignalMask);
 
-    # Signal history (for debugging / audit)
-    listSignals @9 (filter :SignalFilter) -> (events :List(SignalEvent), total :UInt64);
+    # What is waiting right now.
+    getPending @9 (processId :T.ProcessId) -> (pending :List(SignalEvent));
 
-    # Event subscription
-    subscribe @10 (filter :SignalFilter) -> (subscription :SignalSubscription);
+    # History, bounded and paginated.
+    listSignals @10 (filter :SignalFilter, pagination :T.Pagination)
+               -> (events :List(SignalEvent), total :UInt64);
 
-    # Audit-8: Send signal to a process group (cross-platform killpg equivalent).
-    sendToGroup @11 (signal :T.SignalKind, groupId :UInt32,
-        payload :T.DataHandle) -> (results :List(SignalDeliveryResult));
+    # Live stream. Holding the subscription IS the authority to pull.
+    subscribe @11 (filter :SignalFilter) -> (subscription :SignalSubscription);
 
-    # Audit-8: Get/set rate limits per signal kind.
+    # Declared ceiling for one kind.
     getRateLimit @12 (signal :T.SignalKind) -> (limit :SignalRateLimit);
     setRateLimit @13 (signal :T.SignalKind, limit :SignalRateLimit) -> T.VoidResult;
 
-    # Audit-8: Get/set signal timeout for a process.
+    # Declared timeout behaviour.
     getSignalTimeout @14 (processId :T.ProcessId) -> (timeout :SignalTimeout);
     setSignalTimeout @15 (processId :T.ProcessId, timeout :SignalTimeout) -> T.VoidResult;
+}
 
-    # Audit-8: Get signal audit log.
-    getAuditLog @16 (filter :SignalFilter, pagination :T.Pagination)
-        -> (entries :List(SignalAuditEntry), total :UInt64);
-
-    # Audit-8: Export signal audit log for compliance.
-    exportAuditLog @17 (filter :SignalFilter, format :Text) -> (data :T.DataHandle);
-
-    # Audit-8: Set thread-level signal mask.
-    setThreadMask @18 (threadId :T.ThreadId, mask :SignalMask) -> T.VoidResult;
-
-    # Audit-8: Get thread-level signal mask.
-    getThreadMask @19 (threadId :T.ThreadId) -> (mask :SignalMask);
-
-    # Audit-8: Get thread-level pending signals.
-    getThreadPending @20 (threadId :T.ThreadId) -> (pending :List(SignalEvent));
-
-    # Audit-8: Get signal mapping for a backend.
-    getSignalMapping @21 (backendName :Text) -> (mapping :SignalMappingTable);
-
-    # Audit-8: Replay a previously delivered signal.
-    replaySignal @22 (eventId :T.EventId) -> (result :SignalDeliveryResult);
-
-    # Audit-8: List replayable signals.
-    listReplayable @23 (filter :SignalFilter) -> (signals :List(ReplayableSignal));
-
-    # Audit-8: Get signal group info.
-    getSignalGroup @24 (groupId :UInt32) -> (group :SignalGroup);
-
-    # Audit-8: Create a signal group.
-    createSignalGroup @25 (group :SignalGroup) -> (groupId :UInt32);
-
-    # Audit-8: Delete a signal group.
-    deleteSignalGroup @26 (groupId :UInt32) -> T.VoidResult;
-
-    # Audit-8: Configure signal cascade rules.
-    setCascadeRule @27 (originalSignal :T.SignalKind, rule :SignalCascade) -> T.VoidResult;
-
-    # Audit-8: Get signal cascade rules.
-    getCascadeRule @28 (originalSignal :T.SignalKind) -> (rule :SignalCascade);
-
-    # Audit-8: Buffer signals for slow receivers.
-    bufferSignal @29 (signal :T.SignalKind, receiver :T.ProcessId,
-        payload :T.DataHandle) -> T.VoidResult;
-
-    # Audit-8: Flush buffered signals for a process.
-    flushBuffer @30 (processId :T.ProcessId) -> (count :UInt32);
-
-    # Audit-8: Get buffer size for a process.
-    getBufferSize @31 (processId :T.ProcessId) -> (size :UInt32, oldestTimestamp :T.Timestamp);
-
-    # Audit-8: Classify a signal using AI-assisted routing.
-    classifySignal @32 (signal :T.SignalKind, payload :T.DataHandle)
-        -> (classification :SignalClassification);
-
-    # Audit-10: Route a signal automatically based on classification.
-    routeSignal @33 (signal :T.SignalKind, payload :T.DataHandle, receiver :T.ProcessId,
-        threadId :T.ThreadId) -> (result :SignalDeliveryResult, classification :SignalClassification);
-
-    # Audit-10: Replay signal with modified payload.
-    replaySignalWith @34 (eventId :T.EventId, modifiedPayload :T.DataHandle,
-        modifiedReceiver :T.ProcessId) -> (result :SignalDeliveryResult);
-
-    # Audit-10: Signal group persistence for cross-session management.
-    persistSignalGroup @35 (groupId :UInt32) -> (persistenceId :Text);
-    loadSignalGroup @36 (persistenceId :Text) -> (group :SignalGroup);
-    deletePersistedGroup @37 (persistenceId :Text) -> T.VoidResult;
-    listPersistedGroups @38 () -> (persistenceIds :List(Text));
-
-    # Audit-10: Cascade depth limits to prevent infinite loops.
-    setCascadeDepthLimit @39 (maxDepth :UInt32) -> T.VoidResult;
-    getCascadeDepthLimit @40 () -> (maxDepth :UInt32, currentDepth :UInt32);
+interface SignalSubscription {
+    # ONE pull method, paginated: the request states the page, the
+    # response states the total, so request and response pairing is
+    # unambiguous. (The pre-revamp file had `pull` returning a pagination
+    # echo and `pullPaged` doing it properly.)
+    pull @0 (pagination :T.Pagination) -> (events :List(SignalEvent), total :UInt64);
+    cancel @1 () -> T.VoidResult;
 }

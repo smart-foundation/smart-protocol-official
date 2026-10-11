@@ -1,168 +1,173 @@
 @0xa1b2c3d4e5f6003a;
 
 # ═══════════════════════════════════════════════════════════════════════
-# Boot - handoff from bootloader to OS, and OS to apps
+# Boot — the handoff from bootloader to OS, and OS to apps.
 #
-# Stage-transitioning artifacts: firmware/bootloader hands off to kernel;
-# kernel announces startup to init; init announces state to apps.
-# Each stage produces a BootManifest that the next stage consumes.
-# Backends may add stages or fold them; the protocol is timeless.
+# ── THE FOUNDER'S DESIGN DIRECTIVE ─────────────────────────────────────
 #
-# All identifiers are typed. All durations use T.Duration.
-# All timestamps use T.Timestamp. All errors use T.Error.
-# Architecture is typed enum with Text fallback.
+#   The bootloader contract must be TRIVIAL. The bootloader's ONLY job is
+#   to place typed capnp data at ONE well-known pointer. No HHDM, no
+#   handoff math, no old-paradigm orchestration. Abstracting is the
+#   winner: a person writing an operating system should be able to write
+#   a bootloader for this protocol without learning the machine.
 #
-# The ONLY well-known capability in SpaceOS:
-#   Handle 1 in every process's capability table = KernelService.
-#   The kernel MUST place this at handle 1 before entering userspace.
-#   This is the bootstrap capability — no other handles are hardcoded.
+# What that means concretely, and what this schema therefore contains:
+#
+#   1. ONE well-known pointer. `HandoffPointer` — 24 bytes at a fixed
+#      address — points at a `BootHandoff` capnp message. That message
+#      carries the `BootManifest`. Everything else in this file is either
+#      in that chain or is the configuration plane a running system uses
+#      to talk about boot. There is no second handoff mechanism and no
+#      raw function-pointer table: the pre-revamp
+#      `BootHandoff.handlerTableVaddr` (services writing dispatch
+#      pointers into a table by slot index) is DELETED. Channels and
+#      `ServiceEndpoint` replace it.
+#
+#   2. The manifest is DECLARATIVE. It describes what was handed over:
+#      memory regions with opaque kind/flags, modules as opaque regions,
+#      the kernel-selection menu, an optional framebuffer handle, and
+#      args as a string map. It does not compute anything: no physical
+#      address arithmetic, no page-table concepts, no hhdmOffset
+#      anywhere. A region's base is reported, never derived.
+#
+#   3. No technology museum. The pre-revamp file named 2026 storage
+#      buses, bootloaders, firmware, partition tables, initrd
+#      compression formats, UART parity, ACPI/SMBIOS/DMI table layouts
+#      and CPU feature sets — every one a frozen commitment. All of it is
+#      gone. What survives is either an opaque handle to the bytes
+#      (`T.DataHandle`) or an open token the backend declares
+#      (`T.StringMap` / `Text`). A 2046 bootloader satisfies this
+#      contract unmodified, which is the Swap Test the doctrine claims
+#      this file already passed.
+#
+#   4. Hardware bring-up is not boot's job. Bus enumeration, device
+#      discovery and hardware description belong to hal.capnp and
+#      device.capnp. This manifest says what memory and which images it
+#      received; it does not catalogue the machine.
+#
+# ── THE BOOTSTRAP CAPABILITY ───────────────────────────────────────────
+#
+# The ONLY well-known capability: handle 1 in every process's capability
+# table is `KernelService`. The kernel MUST place it there before
+# entering userspace. Every other capability is dynamic — issued by
+# capability.capnp's `CapabilityService.issue` and delegated with
+# `attenuate` + `transfer`. There is no boot capability enum and no
+# delegation method here; both were pre-revamp second authority
+# grammars.
+#
+# Authority, everywhere in this file, is the interface reference: the
+# `BootService` reference is granted once, at acquisition, and each of
+# its methods takes no authority token (R3, ai.capnp precedent).
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
 using K = import "kernel.capnp";
-using FB = import "framebuffer.capnp";
 
-    struct IpcChannel {
-        requestArenaVaddr @0 :UInt64;
-        requestArenaSize @1 :UInt32;
-        replyArenaVaddr @2 :UInt64;
-        replyArenaSize @3 :UInt32;
-    }
+# ── The one well-known pointer ─────────────────────────────────────────
+# 24 bytes at a fixed address, then everything is capnp. The magic is
+# "SMART_PR" truncated to fit a UInt64. `handoffAddr` is a VIRTUAL address
+# the kernel pre-maps, so no stage ever performs address translation.
+
+struct HandoffPointer {
+    magic        @0 :UInt64;
+    handoffAddr  @1 :UInt64;
+    handoffBytes @2 :UInt64;
+}
+
+# The capnp message the well-known pointer resolves to.
+struct BootHandoff {
+    abiVersion       @0 :T.Version;
+    producer         @1 :BootStage;
+    entryContext     @2 :T.EntryContext;
+    manifest         @3 :BootManifest;
+    serviceEndpoints @4 :List(HandoffEndpoint);
+    channels         @5 :List(ChannelInfo);
+    images           @6 :List(BootImage);
+    # Modules as opaque regions (see Module): bytes already mapped, never
+    # copied into the message.
+    modules          @7 :List(Module);
+}
+
+# ── The manifest ───────────────────────────────────────────────────────
+# Purely declarative. Everything optional is optional because a minimal
+# boot is minimal: a stage that has one memory region, one image and no
+# args is fully described.
 
 struct BootManifest {
     # Identifier of the producing stage.
     producer @0 :BootStage;
     # Identifier of the intended next stage.
     nextStage @1 :BootStage;
-    # Time the producer started.
+    # Time the producer started / the handoff fired / how long it took.
     startedAt @2 :T.Timestamp;
-    # Time the handoff fired.
     finishedAt @3 :T.Timestamp;
-    # Duration of this stage.
     duration @4 :T.Duration;
 
-    # Memory plan the next stage inherits.
-    memory @5 :List(MemoryRange);
+    # Memory plan the next stage inherits. `kind` is an OPEN token
+    # ("ram", "mmio", "reserved", "persistent", or a 2046 kind); the
+    # pre-revamp 12-value `MemoryKind` enum named today's taxonomy and
+    # forced a 2046 backend to extend an eternal contract. `base` is
+    # reported, never derived — the protocol performs no address
+    # arithmetic and prescribes no translation.
+    memory @5 :List(MemoryRegion);
 
-    # Storage devices discovered.
-    devices @6 :List(StorageDevice);
+    # Boot arguments: kernel command line, environment, and anything else
+    # the producer must pass. Open keys, unknown ones ignored.
+    args @6 :T.StringMap;
 
-    # Logical CPUs / cores available.
-    compute @7 :List(ComputeNode);
-
-    # Persistent variables / boot args.
-    args @8 :T.StringMap;
-
-    # Optional initrd or initial filesystem blob.
-    # For blobs >1KB, use a reference handle instead.
-    initrd @9 :BootBlob;
+    # Optional initrd / initial filesystem blob. Inline for small
+    # payloads, a reference for anything larger (R2).
+    initrd @7 :BootBlob;
 
     # Negotiated log level.
-    logLevel @10 :T.LogLevel;
+    logLevel @8 :T.LogLevel;
 
-    # Capabilities / authority handed to next stage.
-    capabilities @11 :List(BootCapability);
+    # The boot-time kernel menu: every envelope this boot can hand control
+    # to, which one was selected, and why.
+    kernels @9 :KernelSelectionSet;
 
-    # Firmware information.
-    firmware @12 :FirmwareInfo;
+    # Optional framebuffer handed over by the bootloader, as a HANDLE.
+    # Mode and pixel format are queried from the framebuffer contract —
+    # the manifest does not carry a physical address for it.
+    framebuffer @10 :T.FramebufferId;
 
-    # Boot mode.
-    bootMode @13 :BootMode;
+    # A long-lived BootService peer channel (request/response). The next
+    # stage calls methods on it, never a side-channel API.
+    bootService @11 :BootService;
 
-    # Secure boot state.
-    secureBoot @14 :SecureBootState;
-
-    # Boot diagnostics (timing, warnings).
-    diagnostics @15 :List(BootDiagnostic);
-
-    # Partition tables discovered on block devices.
-    partitionTables @16 :List(PartitionTable);
-
-    # Network boot information (if applicable).
-    networkBoot @17 :NetworkBootInfo;
-
-    # Device tree blob (ARM/RISC-V systems).
-    deviceTree @18 :DeviceTreeBlob;
-
-    # Hardware devices discovered.
-    hardware @19 :List(HardwareDevice);
-
-    # ACPI tables discovered.
-    acpiTables @20 :List(AcpiTable);
-
-    # SMBIOS entries discovered.
-    smbios @21 :List(SmbiosEntry);
-
-    # DMI system information.
-    dmi @22 :DmiInfo;
-
-    # Bootloader information.
-    bootloader @23 :BootloaderInfo;
-
-    # TPM capability.
-    tpmCapability @24 :TpmCapability;
-
-    # Initrd metadata (format, compression, modules).
-    initrdMetadata @25 :InitrdMetadata;
-
-    # Serial devices discovered.
-    serialDevices @26 :List(SerialDevice);
-
-    # Audit-7: boot optimization and resilience.
-    # Per-stage timing profile for boot optimization.
-    profile @27 :BootStageProfile;
-    # Typed boot environment (bareMetal, container, vm, etc.).
-    environment @28 :BootEnvironment;
-    # Ordered failover chains for boot resilience.
-    failoverChains @29 :List(FailoverChain);
-    # Capability requests from each stage.
-    capabilityRequests @30 :List(BootCapabilityRequest);
-
-    # ── SpaceOS Bootstrap ─────────────────────────────────────────────────
-    # The ONLY hardcoded capability in SpaceOS.
-    # Every process's capability table at handle 1 is KernelService.
-    # The kernel places this here so init and all subsequent processes
-    # can immediately call spawn(), exec(), mapRegion(), etc.
-    # All other capabilities are dynamic — issued by KernelService or services.
-    kernelService @31 :K.KernelService;
-    # Framebuffer (mode + physical address). The kernel renders the boot
-    # screen from this; in the SAS model the kernel maps the physical
-    # range via HHDM and writes pixels.
-    framebuffer @32 :FB.Framebuffer;
-    # The boot path exposes a long-lived capnp BootService peer channel
-    # (request/response). The kernel reads this capability from the manifest
-    # and calls methods on it (handOff, state, subscribe, configureCompute,
-    # enableHardwareDevice, etc.) — never via a side-channel Rust API.
-    bootService @33 :BootService;
     # IPC channels mapped to userspace-accessible shared memory.
-    # The kernel populates this list so init can discover channel addresses.
-    channels @34 :List(IpcChannel);
+    channels @12 :List(IpcChannel);
+
     # All userland images the bootloader handed us.
-    userlandImages @35 :List(T.UserlandImage);
+    images @13 :List(BootImage);
+
+    # Modules: opaque regions, never inline bytes.
+    modules @14 :List(Module);
+
     # Isolation boundaries declared at boot.
-    isolationManifest @36 :List(T.IsolatedScope);
-    # Binary data blobs referenced by UserlandImage.moduleIndex.
-    modules @37 :List(Module);
-    # Virtual address where kernel places BootstrapInfo for each service.
-    bootstrapVaddr @38 :UInt64;
+    isolationManifest @15 :List(T.IsolatedScope);
+
+    # The bootstrap capability. The kernel places KernelService at handle
+    # 1 in every process before entering userspace, so init and every
+    # later stage can immediately call the kernel contract.
+    kernelService @16 :K.KernelService;
+
+    # Measured per-stage timings, reported. Declarative: no history, no
+    # analytics, no optimisation target.
+    timings @17 :List(StageTiming);
+
+    # Anything else the producer must say, as open metadata.
+    metadata @18 :T.StringMap;
 }
 
-struct BootBlob {
-    union {
-        inline @0 :Data;
-        reference @1 :BootBlobRef;
-    }
-    # Metadata about the blob (format, compression, modules).
-    metadata @2 :InitrdMetadata;
+struct StageTiming {
+    stage @0 :BootStage;
+    duration @1 :T.Duration;
+    startedAt @2 :T.Timestamp;
 }
 
-struct BootBlobRef {
-    handle @0 :UInt64;
-    sizeBytes @1 :UInt64;
-    hash @2 :Data;
-    format @3 :Text;
-}
-
+# The stage chain. `custom` covers a 2046 stage (payload verification, a
+# firmware second phase) without extending an eternal enum.
 enum BootStage {
     firmware @0;
     bootloader @1;
@@ -170,949 +175,163 @@ enum BootStage {
     init @3;
     userspace @4;
     custom @5;
-    # Audit-7: extended boot stages for container/VM/embedded.
-    container @6;
-    hypervisor @7;
-    wasm @8;
-    embedded @9;
 }
 
-struct MemoryRange {
-    base @0 :UInt64;
-    length @1 :UInt64;
-    kind @2 :MemoryKind;
-    # Typed memory flags instead of raw UInt32.
-    flags @3 :MemoryFlags;
+struct MemoryRegion {
+    # Open kind token: "ram", "rom", "mmio", "reserved", "persistent",
+    # "unusable", or a kind invented after this schema was frozen.
+    kind @0 :Text;
+    # Where the region is, as the producer sees it. The protocol never
+    # computes with it.
+    base @1 :UInt64;
+    length @2 :UInt64;
+    # Typed page attributes (canonical).
+    flags @3 :T.PageFlags;
+    # Open metadata the producer wants to attach.
+    metadata @4 :T.StringMap;
 }
 
-struct MemoryFlags {
-    cacheable @0 :Bool;
-    writeCombining @1 :Bool;
-    writeProtected @2 :Bool;
-    executeDisabled @3 :Bool;
-    nonVolatile @4 :Bool;
+# ── Blobs ──────────────────────────────────────────────────────────────
+# The inline/reference union is the correct R2 shape: a small payload
+# rides inline, a large one is a handle. Small stays cheap, large stays
+# zero-copy.
+
+struct BootBlob {
+    union {
+        inline @0 :Data;
+        reference @1 :BootBlobRef;
+        unknown @2 :T.UnknownEvent;
+    }
+    # Metadata about the blob: format and hash as open tokens, never an
+    # enum of today's container formats.
+    metadata @3 :BootBlobMetadata;
 }
 
-enum MemoryKind {
-    ram @0;
-    rom @1;
-    mmio @2;
-    acpi @3;
-    persistent @4;
-    reserved @5;
-    unusable @6;
-    device @7;
-    bootloader @8;
-    kernel @9;
-    user @10;
-    custom @11;
-}
-
-struct StorageDevice {
-    id @0 :Text;
-    # Backend-assigned device identifier (opaque to the protocol).
-    deviceId @1 :Text;
-    kind @2 :StorageKind;
-    sectors @3 :UInt64;
-    sectorBytes @4 :UInt32;
-    # Typed capabilities instead of List(Text).
-    capabilities @5 :List(StorageCapability);
-    # Human-readable name.
-    name @6 :Text;
-    # Total size in bytes.
-    sizeBytes @7 :UInt64;
-    # Storage bus protocol.
-    bus @8 :StorageBus;
-    # Partition table on this device (if applicable).
-    partitionTable @9 :PartitionTable;
-    # Bus-specific info (backend populates the relevant one).
-    # NVMe-specific info (if bus is nvme).
-    nvmeInfo @10 :NvmeInfo;
-    # AHCI-specific info (if bus is ahci).
-    ahciInfo @11 :AhciInfo;
-    # SCSI-specific info (if bus is scsi).
-    scsiInfo @12 :ScsiInfo;
-}
-
-enum StorageKind {
-    block @0;
-    network @1;
-    memory @2;
-    optical @3;
-    virtual @4;
-    removable @5;
-    persistent @6;
-    custom @7;
-}
-
-enum StorageCapability {
-    read @0;
-    write @1;
-    trim @2;
-    flush @3;
-    secureErase @4;
-    cache @5;
-    custom @6;
-}
-
-enum StorageBus {
-    nvme @0;
-    ahci @1;
-    ide @2;
-    scsi @3;
-    virtio @4;
-    sd @5;
-    emmc @6;
-    fsblk @7;
-    usb @8;
-    fcoe @9;
-    custom @10;
-}
-
-struct NvmeInfo {
-    controllerId @0 :UInt32;
-    namespaceId @1 :UInt32;
-    queueCount @2 :UInt32;
-    maxTransferSize @3 :UInt32;
-    nvmeVersion @4 :Text;
-    lbaFormat @5 :UInt32;
-    utilization @6 :UInt64;
-}
-
-struct AhciInfo {
-    port @0 :UInt32;
-    deviceType @1 :Text;
-    commandListDepth @2 :UInt32;
-    signature @3 :UInt32;
-}
-
-struct ScsiInfo {
-    targetId @0 :UInt32;
-    lun @1 :UInt32;
-    vendor @2 :Text;
-    product @3 :Text;
-    revision @4 :Text;
-    scsiVersion @5 :Text;
-}
-
-enum PartitionTableKind {
-    gpt @0;
-    mbr @1;
-    apt @2;
-    sun @3;
-    custom @4;
-}
-
-struct PartitionTable {
-    kind @0 :PartitionTableKind;
-    diskGuid @1 :Text;
-    entryCount @2 :UInt32;
-    backupLba @3 :UInt64;
-    currentLba @4 :UInt64;
-    partitions @5 :List(Partition);
-}
-
-struct Partition {
-    index @0 :UInt32;
-    typeGuid @1 :Text;
-    uniqueGuid @2 :Text;
-    firstLba @3 :UInt64;
-    lastLba @4 :UInt64;
-    sizeBytes @5 :UInt64;
-    name @6 :Text;
-    attributes @7 :UInt64;
-    bootable @8 :Bool;
-    filesystem @9 :Text;
-}
-
-struct ComputeNode {
-    id @0 :Text;
-    # Typed architecture enum with Text fallback.
-    arch @1 :Architecture;
-    vendor @2 :Text;
-    cores @3 :UInt32;
-    threads @4 :UInt32;
-    # Typed CPU feature flags.
-    features @5 :List(CpuFeature);
-    # Clock speed in MHz (0 if unknown).
-    clockMhz @6 :UInt32;
-    # L1 cache size in bytes (0 if unknown).
-    l1CacheBytes @7 :UInt32;
-    # L2 cache size in bytes (0 if unknown).
-    l2CacheBytes @8 :UInt32;
-}
-
-enum Architecture {
-    x86 @0;
-    x8664 @1;
-    arm32 @2;
-    aarch64 @3;
-    riscv32 @4;
-    riscv64 @5;
-    wasm32 @6;
-    wasm64 @7;
-    ppc64 @8;
-    s390x @9;
-    unknown @10;
-    custom @11;
-}
-
-enum CpuFeature {
-    sse @0;
-    sse2 @1;
-    sse3 @2;
-    ssse3 @3;
-    sse41 @4;
-    sse42 @5;
-    avx @6;
-    avx2 @7;
-    avx512 @8;
-    neon @9;
-    fp16 @10;
-    atomics @11;
-    riscvV @12;
-    wasmSimd @13;
-    custom @14;
-}
-
-struct FirmwareInfo {
-    vendor @0 :Text;
-    version @1 :Text;
-    # Firmware type.
-    kind @2 :FirmwareKind;
-    # UEFI/BIOS/Libreboot/coreboot version string.
-    firmwareVersion @3 :Text;
-    # Secure boot database status.
-    secureBootDb @4 :Text;
-}
-
-enum FirmwareKind {
-    uefi @0;
-    bios @1;
-    coreboot @2;
-    libreboot @3;
-    uBoot @4;
-    bareMetal @5;
-    custom @6;
-}
-
-enum BootMode {
-    normal @0;
-    recovery @1;
-    safe @2;
-    diagnostic @3;
-    maintenance @4;
-    custom @5;
-}
-
-struct SecureBootState {
-    enabled @0 :Bool;
-    # Whether the boot chain is verified.
-    verified @1 :Bool;
-    # TPM PCR measurements (if available).
-    pcrMeasurements @2 :List(PcrMeasurement);
-    # Signing key database status.
-    keyDatabaseStatus @3 :Text;
-    # TPM version detected.
-    tpmVersion @4 :TpmVersion;
-    # TPM capability information.
-    tpmCapability @5 :TpmCapability;
-    # Attestation quote (if available).
-    attestation @6 :AttestationQuote;
-    # Audit-7: chain-of-trust attestation items.
-    chainItems @7 :List(BootChainItem);
-    # Audit-7: boot policy (required/optional stages).
-    policy @8 :BootPolicy;
-    # Audit-7: typed boot environment.
-    environment @9 :BootEnvironment;
-}
-
-struct PcrMeasurement {
-    index @0 :UInt32;
-    algorithm @1 :Text;
-    digest @2 :Data;
-}
-
-enum TpmVersion {
-    tpm12 @0;
-    tpm20 @1;
-    custom @2;
-}
-
-enum TpmAlgorithm {
-    sha1 @0;
-    sha256 @1;
-    sha384 @2;
-    sha512 @3;
-    custom @4;
-}
-
-struct TpmCapability {
-    version @0 :TpmVersion;
-    pcrBanks @1 :List(TpmPcrBank);
-    nvStorage @2 :Bool;
-    keyStorage @3 :Bool;
-    attestation @4 :Bool;
-}
-
-struct TpmPcrBank {
-    algorithm @0 :TpmAlgorithm;
-    pcrCount @1 :UInt32;
-}
-
-struct AttestationQuote {
-    pcrSelection @0 :List(UInt32);
-    pcrValues @1 :List(Data);
-    signature @2 :Data;
-    timestamp @3 :T.Timestamp;
-}
-
-enum BootloaderKind {
-    grub @0;
-    grub2 @1;
-    refind @2;
-    shim @3;
-    uBoot @4;
-    barebox @5;
-    custom @6;
-    limine @7;
-}
-
-struct BootloaderInfo {
-    kind @0 :BootloaderKind;
-    version @1 :Text;
-    configPath @2 :Text;
-    secureBootChain @3 :Bool;
-    shimTrustAnchor @4 :Text;
-    hhdmOffset @5 :UInt64;
-}
-
-enum NetworkBootMethod {
-    pxe @0;
-    http @1;
-    ipxe @2;
-    iscsi @3;
-    custom @4;
-}
-
-struct NetworkBootInfo {
-    method @0 :NetworkBootMethod;
-    dhcpLease @1 :DhcpLease;
-    serverAddress @2 :Text;
-    bootFile @3 :Text;
-    httpUrl @4 :Text;
-    proxy @5 :Text;
-}
-
-struct DhcpLease {
-    ip @0 :Text;
-    subnet @1 :Text;
-    gateway @2 :Text;
-    dns @3 :List(Text);
-    leaseTime @4 :T.Duration;
-    serverName @5 :Text;
-}
-
-struct DeviceTreeBlob {
+struct BootBlobRef {
     handle @0 :UInt64;
     sizeBytes @1 :UInt64;
     hash @2 :Data;
-    compatible @3 :List(Text);
-    overlay @4 :Bool;
+    # Open format token ("cpio.gz", "erofs", "squashfs", or a 2046 one).
+    format @3 :Text;
 }
 
-struct HardwareDevice {
-    id @0 :Text;
-    class @1 :Text;
-    vendor @2 :Text;
-    model @3 :Text;
-    drivers @4 :List(Text);
-    dtCompatible @5 :List(Text);
-    acpiPath @6 :Text;
-}
-
-struct AcpiTable {
-    signature @0 :Text;
-    oemId @1 :Text;
-    revision @2 :UInt32;
-    sizeBytes @3 :UInt32;
-    handle @4 :UInt64;
-}
-
-struct SmbiosEntry {
-    type @0 :UInt32;
-    length @1 :UInt32;
-    handle @2 :UInt16;
-    data @3 :Data;
-}
-
-struct DmiInfo {
-    systemManufacturer @0 :Text;
-    systemProductName @1 :Text;
-    biosVersion @2 :Text;
-    biosVendor @3 :Text;
-    chassisType @4 :Text;
-    chassisManufacturer @5 :Text;
-    boardManufacturer @6 :Text;
-    boardProductName @7 :Text;
-}
-
-enum InitrdFormat {
-    cpioGz @0;
-    cpioXz @1;
-    cpioZstd @2;
-    erofs @3;
-    squashfs @4;
-    none @5;
-    custom @6;
-}
-
-struct InitrdMetadata {
-    format @0 :InitrdFormat;
+struct BootBlobMetadata {
+    # Open format token, as above.
+    format @0 :Text;
     compression @1 :Text;
     sizeBytes @2 :UInt64;
     hash @3 :Data;
-    rootFilesystem @4 :Text;
-    kernelModules @5 :List(Text);
+    # Module names contained in the blob, if the producer knows them.
+    moduleNames @4 :List(Text);
 }
 
-enum UartParity {
-    none @0;
-    odd @1;
-    even @2;
-    mark @3;
-    space @4;
-    custom @5;
-}
-
-enum UartFlowControl {
-    none @0;
-    hardware @1;
-    software @2;
-    custom @3;
-}
-
-struct UartConfig {
-    baudRate @0 :UInt32;
-    dataBits @1 :UInt8;
-    stopBits @2 :UInt8;
-    parity @3 :UartParity;
-    flowControl @4 :UartFlowControl;
-}
-
-struct SerialDevice {
-    port @0 :Text;
-    irq @1 :UInt32;
-    dmaChannel @2 :UInt32;
-    uartConfig @3 :UartConfig;
-    fifoDepth @4 :UInt32;
-}
-
-struct BootDiagnostic {
-    stage @0 :BootStage;
-    message @1 :Text;
-    level @2 :T.LogLevel;
-    timestamp @3 :T.Timestamp;
-    # Duration of the operation being diagnosed.
-    duration @4 :T.Duration;
-}
-
-struct BootState {
-    # Currently active stage.
-    currentStage @0 :BootStage;
-    # All stages that have completed.
-    completed @1 :List(BootStage);
-    # All stages remaining.
-    pending @2 :List(BootStage);
-    # Total boot time so far.
-    totalDuration @3 :T.Duration;
-}
-
-# Capability filter extension for boot - which authority level a stage holds.
-struct BootAuthority {
-    level @0 :AuthorityLevel;
-    # Specific stage tokens available.
-    stages @1 :List(BootStage);
-}
-
-enum AuthorityLevel {
-    firmware @0;
-    bootloader @1;
-    kernel @2;
-    init @3;
-    userspace @4;
-    custom @5;
-}
-
-enum BootCapability {
-    readMemory @0;
-    writeMemory @1;
-    readStorage @2;
-    writeStorage @3;
-    executeCode @4;
-    accessDevice @5;
-    configureCompute @6;
-    modifyBootArgs @7;
-    networkAccess @8;
-    custom @9;
-}
-
-# Boot service - observable boot-progress; lets apps know what's going on.
-interface BootService {
-    # Get the most-recent handoff artifact.
-    handOff @0 () -> (manifest :BootManifest);
-    # Get current boot state.
-    state @1 () -> (state :BootState);
-    # Subscribe to boot events.
-    subscribe @2 () -> (subscription :BootSubscription);
-    pull @3 (subscription :BootSubscription) -> (events :List(BootEvent));
-    cancel @4 (subscription :BootSubscription) -> T.VoidResult;
-
-    # Audit-9: verify the full attestation chain against a trust root.
-    # Returns chain-of-trust verification result with per-item status.
-    verifyAttestationChain @5 (chain :List(BootChainItem), trustRoot :Data)
-                           -> (result :AttestationVerificationResult);
-
-    # Audit-9: trigger a firmware update with integrity verification.
-    firmwareUpdate @6 (request :FirmwareUpdateRequest) -> (result :FirmwareUpdateResult);
-
-    # Audit-9: rollback firmware to a previous version.
-    firmwareRollback @7 (targetVersion :Text) -> T.VoidResult;
-
-    # Audit-9: manage network boot orchestration (DHCP→TFTP→iSCSI chain).
-    configureNetworkBoot @8 (config :NetworkBootConfig) -> T.VoidResult;
-
-    # Audit-9: enable a hardware device during boot.
-    enableHardwareDevice @9 (deviceId :Text, driver :Text) -> T.VoidResult;
-
-    # Audit-9: delegate capabilities from one boot stage to another.
-    delegateCapability @10 (request :CapabilityDelegationRequest) -> T.VoidResult;
-}
-
-struct BootEvent {
-    union {
-        stageStarted @0 :BootManifest;
-        stageFinished @1 :BootManifest;
-        commFailed @2 :CommFailure;
-        diagnosticsReady @3 :List(BootDiagnostic);
-    }
-}
-
-struct CommFailure {
-    stage @0 :BootStage;
-    reason @1 :T.Error;
-    retryHint @2 :T.Duration;
-    recoveryAction @3 :RecoveryAction;
-}
-
-enum RecoveryAction {
-    retry @0;
-    skip @1;
-    fallback @2;
-    halt @3;
-    custom @4;
-}
-
-interface BootSubscription {
-    # Deprecated: use pullPaginated for bounded results.
-    pull @0 () -> (events :List(BootEvent));
-    cancel @1 () -> T.VoidResult;
-    # Paginated pull — returns at most `limit` events starting from `offset`.
-    pullPaginated @2 (pagination :T.Pagination) -> (result :BootPullResult);
-}
-
-struct BootPullResult {
-    events    @0 :List(BootEvent);
-    totalCount @1 :UInt32;
-}
-
-# ═══════════════════════════════════════════════════════════════════════
-# Audit-7: Extended boot capabilities
-#
-# Boot attestation chain, boot analytics, multi-environment boot,
-# failover chains, and boot policy. These extend the basic
-# firmware-to-userspace model to support container, VM, embedded,
-# and distributed boot scenarios.
-# ═══════════════════════════════════════════════════════════════════════
-
-# ── Boot Chain Attestation ────────────────────────────────────
-
-struct BootChainItem {
-    # Stage that produced this attestation.
-    stage @0 :BootStage;
-    # Cryptographic hash of the next stage's expected state.
-    hash @1 :Data;
-    # Algorithm used for the hash.
-    algorithm @2 :TpmAlgorithm;
-    # Timestamp of this attestation.
-    timestamp @3 :T.Timestamp;
-}
-
-# ── Boot Stage Profile (analytics) ────────────────────────────
-
-struct BootStageProfile {
-    # Stage being profiled.
-    stage @0 :BootStage;
-    # Duration of this stage in the current boot.
-    duration @1 :T.Duration;
-    # Historical average duration (rolling window).
-    averageDuration @2 :T.Duration;
-    # Whether this stage exceeded its time budget.
-    exceeded @3 :Bool;
-    # CPU time consumed by this stage.
-    cpuTime @4 :T.Duration;
-    # Memory peak during this stage.
-    memoryPeakBytes @5 :UInt64;
-}
-
-# ── Boot Environment ──────────────────────────────────────────
-
-enum BootEnvironment {
-    bareMetal @0;
-    container @1;
-    vm @2;
-    wasm @3;
-    embedded @4;
-    hypervisor @5;
-    custom @6;
-}
-
-# ── Boot Policy ───────────────────────────────────────────────
-
-struct BootPolicy {
-    # Stages that must complete for a successful boot.
-    required @0 :List(BootStage);
-    # Stages that are optional (failure does not block boot).
-    optional @1 :List(BootStage);
-    # Maximum total boot time before forced escalation.
-    maxBootTime @2 :T.Duration;
-}
-
-# ── Failover Chain ────────────────────────────────────────────
-
-struct FailoverChain {
-    # Primary stage to attempt.
-    primary @0 :BootStage;
-    # Ordered list of fallback stages.
-    fallbacks @1 :List(BootStage);
-    # Maximum retries per stage before falling back.
-    maxRetries @2 :UInt32;
-}
-
-# ── Boot Capability Request ───────────────────────────────────
-
-struct BootCapabilityRequest {
-    # Stage requesting the capability.
-    stage @0 :BootStage;
-    # Capabilities required from the previous stage.
-    required @1 :List(BootCapability);
-    # Capabilities that are nice-to-have.
-    preferred @2 :List(BootCapability);
-}
-
-# ── A/B Partition Boot ────────────────────────────────────────
-
-struct AbPartitionState {
-    # Currently active boot slot ("a" or "b").
-    activeSlot @0 :Text;
-    # Boot attempt count for the active slot.
-    bootAttempts @1 :UInt32;
-    # Maximum boot attempts before fallback.
-    maxBootAttempts @2 :UInt32;
-    # Whether the slot has been marked successful.
-    slotSuccessful @3 :Bool;
-    # Last update timestamp.
-    lastUpdate @4 :T.Timestamp;
-}
-
-# ═══════════════════════════════════════════════════════════════════════
-# Audit-9: Extended boot capabilities
-#
-# Attestation chain verification, firmware update protocol, network boot
-# orchestration, hardware enablement, and capability delegation.
-# ═══════════════════════════════════════════════════════════════════════
-
-# ── Attestation Verification ──────────────────────────────────
-
-struct AttestationVerificationResult {
-    # Whether the full chain is valid.
-    valid @0 :Bool;
-    # Per-item verification results.
-    items @1 :List(AttestationItemResult);
-    # Error if chain verification failed.
-    error @2 :T.Error;
-    # When verification was performed.
-    verifiedAt @3 :T.Timestamp;
-}
-
-struct AttestationItemResult {
-    stage @0 :BootStage;
-    valid @1 :Bool;
-    error @2 :T.Error;
-}
-
-# ── Firmware Update Protocol ──────────────────────────────────
-
-struct FirmwareUpdateRequest {
-    # Target firmware version.
-    targetVersion @0 :Text;
-    # Firmware image data or URI.
-    imageUri @1 :T.Uri;
-    # Expected hash of the firmware image.
-    expectedHash @2 :Data;
-    # Algorithm used for hash verification.
-    hashAlgorithm @3 :TpmAlgorithm;
-    # Whether to verify signature before applying.
-    verifySignature @4 :Bool = true;
-    # Maximum time to wait for the update.
-    timeout @5 :T.Duration;
-}
-
-struct FirmwareUpdateResult {
-    union {
-        success @0 :FirmwareUpdateSuccess;
-        failed @1 :T.Error;
-        custom @2 :Data;
-    }
-}
-
-struct FirmwareUpdateSuccess {
-    # New firmware version after update.
-    version @0 :Text;
-    # When the update completed.
-    completedAt @1 :T.Timestamp;
-    # Whether a restart is required.
-    requiresRestart @2 :Bool;
-}
-
-# ── Network Boot Orchestration ────────────────────────────────
-
-struct NetworkBootConfig {
-    # Ordered list of boot methods to try.
-    methods @0 :List(NetworkBootMethod);
-    # DHCP configuration (if applicable).
-    dhcp @1 :DhcpConfig;
-    # TFTP server configuration.
-    tftp @2 :TftpConfig;
-    # iSCSI configuration (if applicable).
-    iscsi @3 :IscsiConfig;
-    # Maximum retry attempts per method.
-    maxRetries @4 :UInt32;
-    # Timeout per boot method attempt.
-    attemptTimeout @5 :T.Duration;
-    # Failover policy on method failure.
-    failoverPolicy @6 :NetworkBootFailoverPolicy;
-}
-
-struct DhcpConfig {
-    # Interface to use for DHCP.
-    interface @0 :Text;
-    # Requested IP address (optional).
-    requestedIp @1 :Text;
-    # Vendor class identifier.
-    vendorClass @2 :Text;
-}
-
-struct TftpConfig {
-    # TFTP server address.
-    server @0 :Text;
-    # Boot file path on TFTP server.
-    bootFile @1 :Text;
-    # Block size for TFTP transfers.
-    blockSize @2 :UInt32;
-}
-
-struct IscsiConfig {
-    # iSCSI target address.
-    targetAddress @0 :Text;
-    # iSCSI target name.
-    targetName @1 :Text;
-    # iSCSI initiator name.
-    initiatorName @2 :Text;
-    # LUN number.
-    lun @3 :UInt32;
-}
-
-enum NetworkBootFailoverPolicy {
-    # Try next method in sequence.
-    sequential @0;
-    # Try all methods in parallel, use first success.
-    parallel @1;
-    # Stop on first failure.
-    strict @2;
-    custom @3;
-}
-
-# ── Capability Delegation Chain ───────────────────────────────
-
-struct CapabilityDelegationRequest {
-    # Source stage that holds the capability.
-    sourceStage @0 :BootStage;
-    # Target stage to receive the capability.
-    targetStage @1 :BootStage;
-    # Capabilities to delegate.
-    capabilities @2 :List(BootCapability);
-    # Subset of capabilities to delegate (if delegating a subset).
-    subset @3 :List(BootCapability);
-    # Expiry for the delegation.
-    expiry @4 :T.Duration;
-    # Whether the target can further delegate.
-    transitive @5 :Bool;
-}
-
-# ═══════════════════════════════════════════════════════════════════════
-# Boot-Agnostic Additions
-#
-# These additions enable:
-# - Multiple bootloader support
-# - Boot protocol detection (not hardcoded to one protocol)
-# - Kernel selection at boot time (runtime + compile-time)
-# - Binary format typing for cross-language kernel loading
-# ═══════════════════════════════════════════════════════════════════════
-
-# ── Boot Protocol Detection ───────────────────────────────────
-# The kernel detects WHICH protocol delivered the boot, not which
-# specific bootloader binary. This is the agnostic layer.
-
-enum BootProtocolKind {
-    limine @0;
-    multibootV1 @1;
-    multibootV2 @2;
-    uefi @3;
-    deviceTree @4;
-    openBoot @5;
-    custom @6;
-}
-
-struct BootProtocolInfo {
-    kind @0 :BootProtocolKind;
-    version @1 :Text;
-    # Protocol-specific magic value (e.g., 0x2BADB002 for Multiboot1).
-    magicValue @2 :UInt64;
-    # Physical address of the response struct (protocol-specific).
-    responseAddr @3 :UInt64;
-    # Physical address of the request struct (if applicable).
-    requestAddr @4 :UInt64;
-}
-
-# ── Kernel Selection (Boot-Time Polymorphism) ─────────────────
-# Enables runtime kernel selection via boot menu.
-# Kernels show up in boot menu, selectable at runtime.
-
-struct KernelSelection {
-    # The kernel envelope type (from kernel.capnp).
-    envelope @0 :K.KernelType;
-    # Unique identifier for this kernel implementation.
-    implementationId @1 :Text;
-    # Binary format of the kernel (ELF, PE, WASM, etc.).
-    binaryFormat @2 :T.BinaryFormat;
-    # Offset of the entry point from the binary base.
-    entryPointOffset @3 :UInt64;
-    # ABI version this kernel conforms to.
-    abiVersion @4 :T.Version;
-    # Human-readable name for boot menu display.
-    displayName @5 :Text;
-    # Architecture this kernel targets.
-    architecture @6 :Text;
-}
-
-# ── Bootloader Implementation Info ────────────────────────────
-# Identifies which specific bootloader produced this manifest.
-# Used for debugging and bootloader-specific features.
-
-struct BootloaderImplementation {
-    # Bootloader name (e.g., "cyberspace-boot", "helenos-boot").
-    name @0 :Text;
-    # Version string.
-    version @1 :Text;
-    # Source repository URL.
-    sourceRepository @2 :Text;
-    # Git commit hash (20 bytes).
-    commitHash @3 :Data;
-    # Build artifact hash (SHA-256).
-    buildId @4 :Data;
-    # Target triple (e.g., "x86_64-unknown-none").
-    targetTriple @5 :Text;
-}
-
-# ── Boot Origin ───────────────────────────────────────────────
-# How this boot stage was initiated.
-
-enum BootOrigin {
-    firmwareDirect @0;     # Firmware handed control directly to kernel
-    bootloaderLoaded @1;   # Bootloader loaded kernel (current model)
-    chainload @2;          # Bootloader A loaded us via bootloader B
-    networkBoot @3;        # PXE/iPXE/HTTP boot
-    recursiveBoot @4;      # This stage is itself in a chainload
-    custom @5;
-}
-
-# ── Boot Chain (Multi-Stage Handoff) ─────────────────────────
-# Supports multi-stage: firmware -> bootloader -> kernel-1 -> kernel-2
-
-struct BootChainEntry {
-    stage @0 :BootStage;
-    bootloader @1 :BootloaderImplementation;
-    kernel @2 :KernelSelection;
-    # Pointer to this stage's manifest (physical address).
-    manifestAddr @3 :UInt64;
-    # Index of next entry in the chain, or 0xFFFFFFFF if last.
-    nextChainEntry @4 :UInt32;
-}
-
-struct BootChain {
-    entries @0 :List(BootChainEntry);
-    # Index of the current entry in the chain.
-    currentIndex @1 :UInt32;
-}
-
-# ── Handoff Resources (Kernel-Swap Support) ──────────────────
-# When kernel-2 boots after kernel-1 was swapped out, it needs:
-# - Memory map kernel-1 left behind
-# - IO devices kernel-1 was using
-# - Persistent state (filesystem, network)
-# - Capability tokens passed through
-
-struct BootHandoffResources {
-    # Memory ranges released by previous kernel.
-    memoryReleased @0 :List(MemoryRange);
-    # IO devices transferred from previous kernel.
-    ioTransferred @1 :List(HardwareDevice);
-    # Handles to persistent state (filesystem, network).
-    persistentStateHandles @2 :List(UInt64);
-    # Capabilities passed through from previous kernel.
-    capabilitiesPassed @3 :List(BootCapability);
-}
-
-# ── Boot Handoff ──────────────────────────────────────────────
-# The schema takes ownership of every memory handoff.
-# 24 bytes at a well-known address, then everything is capnp.
-
-struct HandoffPointer {
-    # 0x534D4152545F5052 = "SMART_PR" (truncated to fit UInt64).
-    magic        @0 :UInt64;
-    # Virtual address of the BootHandoff capnp message (kernel pre-maps it).
-    handoffAddr  @1 :UInt64;
-    handoffBytes @2 :UInt64;
-}
-
-struct BootHandoff {
-    abiVersion       @0 :T.Version;
-    producer         @1 :BootStage;
-    entryContext     @2 :T.EntryContext;
-    manifest         @3 :BootManifest;
-    serviceEndpoints @4 :List(ServiceEndpoint);
-    channels         @5 :List(ChannelInfo);
-    images           @6 :List(BootImage);
-    # Virtual address of the kernel's handler table. Services write their
-    # dispatch fn pointer here at their channel slot index.
-    handlerTableVaddr @7 :UInt64;
-}
-
+# A module is an opaque region the producer already mapped: address,
+# length, hash. No module blob is ever copied into a message.
 struct Module {
     name @0 :Text;
-    data @1 :Data;
-    hash @2 :Data;
+    vaddr @1 :UInt64;
+    size @2 :UInt64;
+    hash @3 :Data;
+    metadata @4 :T.StringMap;
+}
+
+# ── Kernel selection ───────────────────────────────────────────────────
+# Selection as DATA, not as a string in a build script. Every envelope
+# this boot can hand control to, in menu order, plus which one was chosen
+# and how that choice came about.
+#
+# The honesty pair is `selectedIndex` + `selectedPresent`: a manifest that
+# lists one envelope and selects nothing is telling the truth ("no choice
+# was made"); one that selects index 0 of 1 claims a decision that was
+# never taken. Both are representable, which is the point.
+
+struct KernelSelectionSet {
+    # Every envelope this boot can hand control to, in menu order.
+    available @0 :List(KernelSelection);
+    # Index into `available` of the envelope control was actually passed
+    # to. Meaningful only when `selectedPresent` is true.
+    selectedIndex @1 :UInt32;
+    selectedPresent @2 :Bool;
+    # Index the boot flow would have chosen with no user input. Differs
+    # from selectedIndex whenever a human or supervisor overrode it, and
+    # "the default was overridden" is worth knowing.
+    defaultIndex @3 :UInt32;
+    defaultPresent @4 :Bool;
+    # Why the selection came out as it did, for the boot log. Empty is
+    # not acceptable for an override: record the source, so a boot that
+    # entered an unexpected kernel can be explained afterwards.
+    selectedBy @5 :KernelSelectionSource;
+    metadata @6 :T.StringMap;
+}
+
+enum KernelSelectionSource {
+    # Nothing selected: single-envelope boot, control fell through. The
+    # common case on a normal boot, and it is stated, not implied.
+    fallthrough @0;
+    # The default entry of `available`, applied without user input.
+    defaultEntry @1;
+    # A human chose from the boot menu.
+    interactiveMenu @2;
+    # A supervisor, hypervisor or configuration chose it.
+    externalRequest @3;
+    # Previous boot failed; this was a failover.
+    failover @4;
+    custom @5;
+}
+
+# One selectable kernel. `implementationId` is opaque; the format,
+# architecture and ABI are open tokens / typed versions — a kernel
+# paradigm that does not exist yet needs no ordinal here.
+struct KernelSelection {
+    implementationId @0 :Text;
+    # Open binary-format token ("elf", "pe", "wasm", or a 2046 one).
+    binaryFormat @1 :Text;
+    # ABI version this kernel conforms to.
+    abiVersion @2 :T.Version;
+    # Human-readable name for boot menu display.
+    displayName @3 :Text;
+    # Architecture as an open token ("x86_64", "aarch64", "riscv64", …).
+    architecture @4 :Text;
+    # Open metadata: anything else the boot menu wants to show.
+}
+
+# ── Images ─────────────────────────────────────────────────────────────
+# Declarative image description. `virtualAddress`/`linkAddress` are
+# addresses in the image's OWN address space, assigned by the loader —
+# they are not machine addresses and the protocol performs no arithmetic
+# on them.
+
+struct BootImage {
+    name @0 :Text;
+    # Open binary-format token.
+    format @1 :Text;
+    entryOffset @2 :UInt64;
+    linkAddress @3 :UInt64;
+    stackBytes @4 :UInt64;
+    segments @5 :List(LoadSegment);
+    hash @6 :Data;
+    signature @7 :Data;
+    metadata @8 :T.StringMap;
+}
+
+struct LoadSegment {
+    offset @0 :UInt64;
+    virtualAddress @1 :UInt64;
+    sizeBytes @2 :UInt64;
+    bssBytes @3 :UInt64;
+    perms @4 :List(T.MemoryPerms);
+    align @5 :UInt32;
+}
+
+# ── Channels and endpoints ─────────────────────────────────────────────
+# Shared-memory arenas with doorbells: the zero-copy path. This is the
+# mechanism that replaced the raw handler table.
+
+struct IpcChannel {
+    requestArenaVaddr @0 :UInt64;
+    requestArenaSize @1 :UInt32;
+    replyArenaVaddr @2 :UInt64;
+    replyArenaSize @3 :UInt32;
 }
 
 struct ChannelInfo {
@@ -1126,41 +345,383 @@ struct ChannelInfo {
     replyDoorbellVaddr @5 :UInt64;
 }
 
-struct ServiceEndpoint {
+struct HandoffEndpoint {
     name @0 :Text;
     serviceId @1 :T.ServiceId;
     mappedBase @2 :UInt64;
     doorbell @3 :T.CapabilityHandle;
     # Index into the channels list (0 = kernel, 1..N = services).
     channelSlot @4 :UInt32;
+    metadata @5 :T.StringMap;
 }
 
-struct LoadSegment {
-    offset @0 :UInt64;
-    virtualAddress @1 :UInt64;
-    sizeBytes @2 :UInt64;
-    bssBytes @3 :UInt64;
-    perms @4 :List(T.MemoryPerms);
-    align @5 :UInt32;
+# ── Boot service ───────────────────────────────────────────────────────
+# TWO surfaces, one interface:
+#
+#   * the configuration plane — how a running system reads and changes
+#     what the next boot will do. This is the live variant of the
+#     pre-revamp interface: it reports what the firmware and bootloader
+#     actually handed over, and it never fabricates a value.
+#   * the handoff core — reading back the artifact this boot produced,
+#     and observing stages as they complete.
+#
+# DELETED from the pre-revamp `BootService`, with where each went:
+#   firmwareUpdate / firmwareRollback / configureNetworkBoot — the update
+#   domain (they configure a future boot, not this one).
+#   enableHardwareDevice (deviceId, driver :Text) — hardware bring-up is
+#   hal/device's job; a driver named as free text is an authority-by-name
+#   path with no verification.
+#   delegateCapability — capability delegation is capability.capnp's
+#   `attenuate` + `transfer`; boot had no way to enforce it.
+#   verifyAttestationChain STAYS, capability-gated at acquisition: the
+#   caller already holds this reference, so no token is passed per call.
+
+interface BootService {
+    # ── Configuration plane ──────────────────────────────────────
+    # Get the current boot information (firmware, bootloader, timing, arch).
+    getInfo @0 () -> (info :BootInfo);
+
+    # Get boot parameters (timeout, menu, quiet/debug flags, cmdline).
+    getParameters @1 () -> (params :BootParameters);
+
+    # Set boot parameters (applied on the next boot).
+    setParameters @2 (params :BootParameters) -> T.VoidResult;
+
+    # List boot entries (OS/kernel options).
+    listEntries @3 () -> (entries :List(BootEntry));
+
+    # Get the default boot entry.
+    getDefaultEntry @4 () -> (entry :BootEntry);
+
+    # Set the default boot entry, by opaque id.
+    setDefaultEntry @5 (entryId :T.BootEntryId) -> T.VoidResult;
+
+    # Set the boot entry for the next boot only (one-shot).
+    setNextBootEntry @6 (entryId :T.BootEntryId) -> T.VoidResult;
+
+    # Get boot log, filtered.
+    getBootLog @7 (filter :BootLogFilter) -> (entries :List(BootLogEntry), total :UInt32);
+
+    # Get boot splash configuration.
+    getSplashConfig @8 () -> (config :BootSplashConfig);
+
+    # Set boot splash configuration.
+    setSplashConfig @9 (config :BootSplashConfig) -> T.VoidResult;
+
+    # Enable/disable recovery mode on the next boot.
+    setRecoveryMode @10 (enable :Bool) -> T.VoidResult;
+
+    # Get recovery mode status.
+    getRecoveryMode @11 () -> (enabled :Bool, reason :Text);
+
+    # Get secure boot status.
+    getSecureBoot @12 () -> (status :SecureBootStatus);
+
+    # List secure boot keys.
+    listSecureBootKeys @13 () -> (keys :List(SecureBootKey));
+
+    # Get boot attempt counters (for A/B slot rotation).
+    getBootAttempts @14 () -> (attempts :BootAttempts);
+
+    # Mark the current boot as successful (resets the A/B attempt counter).
+    markBootSuccessful @15 () -> T.VoidResult;
+
+    # Subscribe to boot events. Holding the subscription IS the authority
+    # to pull; there is no subscription id to present.
+    subscribe @16 () -> (subscription :BootSubscription);
+
+    # ── Handoff core ────────────────────────────────────────────
+    # Get the most-recent handoff artifact.
+    handOff @17 () -> (manifest :BootManifest);
+
+    # Get current boot state, including the failures this boot recorded.
+    state @18 () -> (state :BootState);
+
+    # Verify the full attestation chain against a trust root. Authority is
+    # the reference held by the caller (R3).
+    verifyAttestationChain @19 (chain :List(BootChainItem), trustRoot :T.DataHandle)
+                           -> (result :AttestationVerificationResult);
 }
 
-struct BootImage {
-    name @0 :Text;
-    format @1 :T.BinaryFormat;
-    entryOffset @2 :UInt64;
-    linkAddress @3 :UInt64;
-    stackBytes @4 :UInt64;
-    segments @5 :List(LoadSegment);
-    hash @6 :Data;
-    signature @7 :Data;
+# ── Configuration-plane data ───────────────────────────────────────────
+
+struct BootInfo {
+    # Unique boot identifier, derived from the manifest's startedAt
+    # timestamp — stable and unique per physical boot, needs no extra
+    # kernel field.
+    bootId @0 :UInt64;
+    # How we got here, as an open token ("efi", "bios", "coreboot",
+    # "uboot", or a 2046 mechanism). The pre-revamp `BootMethod` enum
+    # named today's five firmware paths.
+    method @1 :Text;
+    # Firmware identity as an open token plus a verbatim version string.
+    firmware @2 :Text;
+    firmwareVersion @3 :Text;
+    # Bootloader name and version, verbatim from the manifest.
+    bootloader @4 :Text;
+    bootloaderVersion @5 :Text;
+    # Kernel command line, from the manifest args.
+    kernelCommandLine @6 :Text;
+    # Firmware start → userspace ready.
+    bootDuration @7 :T.Duration;
+    # Whether this was a cold boot.
+    coldBoot @8 :Bool;
+    # Target architecture, as an open token.
+    architecture @9 :Text;
+    # Whatever else the backend chooses to report.
+    metadata @10 :T.StringMap;
 }
 
-struct BootstrapInfo {
-    channelCount @0 :UInt32;
-    channels @1 :List(ChannelInfo);
-    # Optional HHDM offset for services that need physical-to-virtual
-    # translation. # note recommended: leave empty; kernel pre-maps all
-    # needed regions and provides vaddrs via ChannelInfo. Only populate
-    # when a service has a genuine need not covered by the schema.
-  #  hhdmOffset @2 :UInt64;
+struct BootParameters {
+    # Kernel command line arguments.
+    kernelArgs @0 :List(Text);
+    # How long the menu waits. Zero = do not show a menu. A duration, not
+    # a signed sentinel: "negative means wait forever" is a trap.
+    menuTimeout @1 :T.Duration;
+    # Default entry, by opaque id (zero = none).
+    defaultEntry @2 :T.BootEntryId;
+    # One-shot next entry, by opaque id (zero = none).
+    nextEntry @3 :T.BootEntryId;
+    # Whether graphical boot is used.
+    graphicalBoot @4 :Bool;
+    # Whether verbose/debug boot output is enabled.
+    debugMode @5 :Bool;
+    # Whether quiet boot is enabled.
+    quietMode @6 :Bool;
+    # Open parameters the backend understands and the protocol does not
+    # need to name.
+    custom @7 :T.StringMap;
+}
+
+struct BootEntry {
+    id @0 :T.BootEntryId;
+    title @1 :Text;
+    description @2 :Text;
+    # Opaque reference to the kernel envelope in the manifest's
+    # KernelSelectionSet. The protocol does not interpret it.
+    kernelRef @3 :Text;
+    # Initrd reference, as an open token in the bootloader's own
+    # vocabulary (never a path the protocol resolves).
+    initrdRef @4 :Text;
+    # Kernel command line for this entry.
+    kernelArgs @5 :List(Text);
+    # Architecture, as an open token.
+    architecture @6 :Text;
+    # Whether this entry is bootable.
+    bootable @7 :Bool;
+    # Whether this is a recovery entry.
+    recovery @8 :Bool;
+    # Last boot time / whether the last boot of this entry succeeded.
+    lastBooted @9 :T.Timestamp;
+    lastBootSuccess @10 :Bool;
+    # Open metadata.
+    metadata @11 :T.StringMap;
+}
+
+struct BootLogEntry {
+    timestamp @0 :T.Timestamp;
+    # Which stage the entry occurred in.
+    stage @1 :BootStage;
+    # Severity (shared T.LogLevel).
+    level @2 :T.LogLevel;
+    subsystem @3 :Text;
+    message @4 :Text;
+    duration @5 :T.Duration;
+    metadata @6 :T.StringMap;
+}
+
+struct BootLogFilter {
+    stages @0 :List(BootStage);
+    levels @1 :List(T.LogLevel);
+    subsystems @2 :List(Text);
+    since @3 :T.Timestamp;
+    # Plain substring match. Not a query language.
+    pattern @4 :Text;
+    # Bound on the number of entries returned (zero = backend default,
+    # which MUST still be bounded).
+    limit @5 :UInt32;
+    metadata @6 :T.StringMap;
+}
+
+struct BootSplashConfig {
+    enabled @0 :Bool;
+    theme @1 :Text;
+    # Colours and image references as open tokens in the backend's own
+    # vocabulary (a colour space, a URI, whatever the backend resolves).
+    backgroundColor @2 :Text;
+    logoRef @3 :Text;
+    # Progress-bar style as an open token ("none", "line", "blocks", …).
+    # The pre-revamp `SplashProgressBar` enum froze today's four styles.
+    progressBar @4 :Text;
+    backgroundImageRef @5 :Text;
+    custom @6 :T.StringMap;
+}
+
+# Secure boot status reported verbatim from the manifest's SecureBootState.
+# The TPM version is an OPEN token: the pre-revamp `TpmVersion`
+# {tpm12, tpm20} enum could not name a TPM 3.0, let alone whatever
+# replaces TPMs.
+struct SecureBootStatus {
+    enabled @0 :Bool;
+    # Whether the boot chain was verified.
+    verified @1 :Bool;
+    # Signing key database status text.
+    keyDatabaseStatus @2 :Text;
+    # TPM identity as an open token ("tpm12", "tpm20", …).
+    tpmVersion @3 :Text;
+    # Measured PCR values, if any. Algorithm per measurement is open.
+    pcrMeasurements @4 :List(PcrMeasurement);
+    # Open metadata.
+    metadata @5 :T.StringMap;
+}
+
+struct SecureBootKey {
+    id @0 :T.KeyId;
+    # Key type as an open token ("pk", "kek", "db", "dbx", or a 2046 one).
+    keyType @1 :Text;
+    # Owner of the key.
+    owner @2 :Text;
+    # Fingerprint of the key, for out-of-band identification.
+    fingerprint @3 :T.KeyFingerprint;
+    validFrom @4 :T.Timestamp;
+    validTo @5 :T.Timestamp;
+    metadata @6 :T.StringMap;
+}
+
+# A/B boot attempt counters, reported verbatim from the manifest.
+struct BootAttempts {
+    # Current attempt count for the active slot.
+    current @0 :UInt32;
+    # Maximum attempts before fallback.
+    max @1 :UInt32;
+    # Whether the active slot is marked successful.
+    successful @2 :Bool;
+    # Last successful boot time.
+    lastSuccessful @3 :T.Timestamp;
+    # Which slot is active, as an open token ("a", "b", or a 2046 scheme).
+    activeSlot @4 :Text;
+    metadata @5 :T.StringMap;
+}
+
+# ── Secure boot / attestation data ─────────────────────────────────────
+# The protocol keeps the DATA and refuses to freeze the ALGORITHMS: every
+# algorithm field is an open token, every digest stays opaque bytes.
+
+struct SecureBootState {
+    enabled @0 :Bool;
+    # Whether the boot chain was verified.
+    verified @1 :Bool;
+    # TPM PCR measurements, if available.
+    pcrMeasurements @2 :List(PcrMeasurement);
+    # Signing key database status.
+    keyDatabaseStatus @3 :Text;
+    # TPM identity as an open token.
+    tpmVersion @4 :Text;
+    # Attestation quote, if available (opaque; algorithm is open).
+    attestation @5 :AttestationQuote;
+    # Trust-chain items measured by each stage.
+    chainItems @6 :List(BootChainItem);
+    # Open metadata: what the backend chose to report.
+}
+
+struct PcrMeasurement {
+    index @0 :UInt32;
+    # Open algorithm token ("sha1", "sha256", "sha384", or a post-quantum
+    # digest). The pre-revamp `TpmAlgorithm` enum ended at sha-512.
+    algorithm @1 :Text;
+    digest @2 :Data;
+}
+
+struct AttestationQuote {
+    # Open algorithm token for the quote.
+    algorithm @0 :Text;
+    # The quote itself, zero-copy. Never parsed here.
+    quote @1 :T.DataHandle;
+    # Which PCRs the quote covers: a bitmask, bit i set = PCR i selected.
+    # One word instead of a list, because a selection is a set.
+    pcrSelectionMask @2 :UInt64;
+    timestamp @3 :T.Timestamp;
+    metadata @4 :T.StringMap;
+}
+
+struct BootChainItem {
+    # Stage that produced this attestation.
+    stage @0 :BootStage;
+    # Cryptographic hash of the next stage's expected state.
+    hash @1 :Data;
+    # Open algorithm token.
+    algorithm @2 :Text;
+    timestamp @3 :T.Timestamp;
+}
+
+struct AttestationVerificationResult {
+    # Whether the full chain is valid.
+    valid @0 :Bool;
+    # Per-item verification results.
+    items @1 :List(AttestationItemResult);
+    # Error if chain verification failed.
+    error @2 :T.Error;
+    # When verification was performed.
+    verifiedAt @3 :T.Timestamp;
+    # Open metadata: which trust root, which verifier, what was skipped.
+}
+
+struct AttestationItemResult {
+    stage @0 :BootStage;
+    valid @1 :Bool;
+    error @2 :T.Error;
+}
+
+# ── Boot state and events ──────────────────────────────────────────────
+# A failed stage is REPORTED, not inferred: the producer records a
+# CommFailure in BootState.failures and emits it as a BootEvent, so a
+# consumer learns the boot degraded instead of guessing from a stage that
+# never completed. (This was the pre-revamp gap: `FailoverChain` named
+# fallbacks and nothing said when they engage.)
+
+struct BootState {
+    # Currently active stage.
+    currentStage @0 :BootStage;
+    # All stages that have completed.
+    completed @1 :List(BootStage);
+    # All stages remaining.
+    pending @2 :List(BootStage);
+    # Total boot time so far.
+    totalDuration @3 :T.Duration;
+    # Failures recorded during this boot, in order. Empty means none.
+    failures @4 :List(CommFailure);
+}
+
+struct BootEvent {
+    union {
+        stageStarted @0 :BootManifest;
+        stageFinished @1 :BootManifest;
+        commFailed @2 :CommFailure;
+        diagnosticsReady @3 :List(BootDiagnostic);
+        unknown @4 :T.UnknownEvent;
+    }
+}
+
+struct CommFailure {
+    stage @0 :BootStage;
+    reason @1 :T.Error;
+    retryHint @2 :T.Duration;
+    # Canonical recovery vocabulary (types.capnp), not a local copy.
+    recoveryAction @3 :T.RecoveryAction;
+}
+
+struct BootDiagnostic {
+    stage @0 :BootStage;
+    message @1 :Text;
+    level @2 :T.LogLevel;
+    timestamp @3 :T.Timestamp;
+    # Duration of the operation being diagnosed.
+    duration @4 :T.Duration;
+}
+
+interface BootSubscription {
+    # Bounded pull: the caller states how many events it will take, so a
+    # registration burst cannot flood one message.
+    pull @0 (maxEvents :UInt32) -> (events :List(BootEvent));
+    cancel @1 () -> T.VoidResult;
 }

@@ -1,130 +1,165 @@
 @0xa1b2c3d4e5f60013;
 
-using T = import "types.capnp";
-
 # ═══════════════════════════════════════════════════════════════════════
 # Notification - system notification display, actions, lifecycle.
 #
-# Improvements beyond the original schema:
-#   - NotificationActionId typed ID replaces bare Text.
-#   - T.Duration for expireTimeout (was raw Int32 milliseconds).
-#   - DataHandle for icons/images that may exceed 1KB.
-#   - Subscription cancel method added.
-#   - Pagination on getActive.
-#   - Custom variant on UrgencyLevel.
-#   - actionId in invokeAction uses typed NotificationActionId.
+# WHAT THIS IS
+#   The ONE notification service, and the DND authority. Content, channels,
+#   threading, attestation, scheduling, history and change subscription.
+#   The shell delegates here; it no longer carries a rival notification model
+#   (its copy had no channels, so a shell-posted notification escaped channel
+#   routing entirely).
 #
-# Improvements (audit-7):
-#   - NotificationChannel struct for per-category settings.
-#   - NotificationData: batchId, parentId, aiPriority, encryptedPayload,
-#     attestation, threadId, workflowId, channel.
-#   - NotificationAction.payload for data-carrying actions.
-#   - NotificationFilter for history/snooze queries.
-#   - PreviewContent for rich notification previews.
-#   - Snooze, getHistory, schedule, delegate methods.
-#   - NotificationChannel management (false positive from
-#     notification_channel.capnp): create, configure, monitor channels.
+# WHAT WAS FIXED
+#   - `show` and `schedule` used to return a bare `T.NotificationId`. Sending
+#     can fail — no channel, quota exceeded, invalid attestation — so an app
+#     "posted" a notification that was rejected and held a tombstone id. Both
+#     now return a result union carrying `T.Error` with `retryable`, the
+#     pattern appindex.capnp's `LaunchResult` established.
+#   - Every list answer now carries a total, and the thread getters are
+#     paginated: a notification-centre UI can render "12 of 40" and stop
+#     paging, instead of paging until empty on every open. A chatty group
+#     thread used to return its entire chain.
+#   - `AttestationVerification.error` was `Text`. A consumer could not route
+#     on it; it is now `T.Error`.
+#   - There were THREE priority vocabularies in one file — `UrgencyLevel` for
+#     display, `QueuePriority` for delivery, and an `aiPriority :Float32` in
+#     the send path. There is now one: `UrgencyLevel`. `QueuePriority` and the
+#     queue machinery it served are deleted, and the AI score is a
+#     service-reported value that is ignored on write (its presence in the
+#     send path invited every backend to either run a scorer or invent a
+#     number).
+#
+# WHAT WAS DELETED, AND WHY
+#   - The inter-service notification path (`sendInterServiceNotification` and
+#     its `NotificationSource`/`InterServiceNotification` model): a second way
+#     to emit a notification, with no channels, no actions and no threads, so
+#     a receiver needed two dispatch tables.
+#   - Delivery tracking (`getDeliveryTracking`, `subscribeDeliveryTracking`,
+#     `DeliveryTracking*`) and the priority queue (`getQueueStats`,
+#     `reprioritizeNotification`, `listQueuedNotifications`,
+#     `QueueStats`, `NotificationQueueEntry`): a notification SERVER's
+#     internals exposed as contract, with no consumer protocol behind them.
+#     Delivery observability belongs to a diagnostics service.
+#   - `getAnalytics` and `NotificationAnalytics`: same class.
+#   - `delegate @10 (handlerId :Text)`: routing addressed by free text, with
+#     no way to enumerate handlers, so every implementer hardcoded strings.
+#   - `NotificationChannel.lightColor`: a notification LED is a component
+#     that existed on 2010 phones. A display-only or audio-only device has
+#     none, and the field's semantics ("0 = no light") presumed it.
+#
+# REPLACEMENT/UPDATE SEMANTICS, STATED SO NO BACKEND GUESSES
+#   `show` with an id the app already holds REPLACES that notification
+#   (same id, same position, new content). That is what a progress
+#   notification needs, and it is the rule rather than an implementation
+#   detail. Posting a fresh notification means posting an id the app does not
+#   hold.
+#
+# SNOOZE PERSISTENCE, STATED SO NO BACKEND GUESSES
+#   A snoozed notification is the service's responsibility: it survives a
+#   service restart, and the service re-shows it after the duration elapses.
 # ═══════════════════════════════════════════════════════════════════════
 
+using T = import "types.capnp";
+
 interface Notifications {
-    show @0 (notification :NotificationData) -> (id :T.NotificationId);
+    # Post a notification. Replaces a notification whose id the caller
+    # already holds (see the header).
+    show @0 (notification :NotificationData) -> (result :ShowResult);
     dismiss @1 (id :T.NotificationId) -> T.VoidResult;
     dismissAll @2 () -> T.VoidResult;
 
-    getActive @3 (pagination :T.Pagination) -> (notifications :List(NotificationData));
+    getActive @3 (pagination :T.Pagination)
+              -> (notifications :List(NotificationData), total :UInt64);
     clear @4 (id :T.NotificationId) -> T.VoidResult;
 
     subscribeNotifications @5 () -> (subscription :NotificationsSubscription);
 
-    invokeAction @6 (id :T.NotificationId, actionId :T.NotificationActionId) -> T.VoidResult;
+    invokeAction @6 (id :T.NotificationId, actionId :T.NotificationActionId)
+                 -> T.VoidResult;
 
-    # ── Audit-7 additions ────────────────────────────────────
-
-    # Temporarily dismiss and re-show later.
+    # Temporarily dismiss and re-show later. The service persists the snooze
+    # across its own restarts.
     snooze @7 (id :T.NotificationId, duration :T.Duration) -> T.VoidResult;
 
-    # Notification audit trail — view past notifications.
-    getHistory @8 (filter :NotificationFilter, pagination :T.Pagination) -> (notifications :List(NotificationData));
+    # Notification history — view past notifications.
+    getHistory @8 (filter :NotificationFilter, pagination :T.Pagination)
+               -> (notifications :List(NotificationData), total :UInt64);
 
     # Schedule a future notification.
-    schedule @9 (notification :NotificationData, triggerTime :T.Timestamp) -> (id :T.NotificationId);
+    schedule @9 (notification :NotificationData, triggerTime :T.Timestamp)
+              -> (result :ShowResult);
 
-    # Route notification to a different handler.
-    delegate @10 (id :T.NotificationId, handlerId :Text) -> T.VoidResult;
+    # ── Channel management ────────────────────────────────────
+    # Channels group notifications by category with independent settings.
 
-    # ── Channel management (false positive: notification_channel) ─
-    # Create a notification channel.
-    createChannel @11 (channel :NotificationChannel) -> (channelId :T.ChannelId);
-
-    # Update channel settings.
-    updateChannel @12 (channelId :T.ChannelId, channel :NotificationChannel) -> T.VoidResult;
-
-    # Delete a notification channel.
-    deleteChannel @13 (channelId :T.ChannelId) -> T.VoidResult;
-
-    # List all notification channels.
-    listChannels @14 (pagination :T.Pagination) -> (channels :List(NotificationChannel));
-
-    # Get a specific channel.
-    getChannel @15 (channelId :T.ChannelId) -> (channel :NotificationChannel);
-
-    # Get channel health/metrics.
-    getChannelStats @16 (channelId :T.ChannelId) -> (stats :ChannelStats);
+    createChannel @10 (channel :NotificationChannel) -> (result :ChannelResult);
+    updateChannel @11 (channelId :T.ChannelId, channel :NotificationChannel)
+                   -> T.VoidResult;
+    deleteChannel @12 (channelId :T.ChannelId) -> T.VoidResult;
+    listChannels @13 (pagination :T.Pagination)
+                 -> (channels :List(NotificationChannel), total :UInt64);
+    getChannel @14 (channelId :T.ChannelId) -> (result :ChannelResult);
+    getChannelStats @15 (channelId :T.ChannelId) -> (stats :ChannelStats);
 
     # ── Notification Graphs & Threading ─────────────────────────
 
     # Get the full notification thread (parent + children chain).
-    getNotificationThread @17 (notificationId :T.NotificationId) -> (thread :List(NotificationData));
+    getNotificationThread @16 (notificationId :T.NotificationId,
+                               pagination :T.Pagination)
+                          -> (notifications :List(NotificationData), total :UInt64);
 
     # Get child notifications for a parent.
-    getChildNotifications @18 (parentId :T.NotificationId) -> (children :List(NotificationData));
+    getChildNotifications @17 (parentId :T.NotificationId,
+                               pagination :T.Pagination)
+                          -> (notifications :List(NotificationData), total :UInt64);
 
     # Get all notifications in a thread/conversation.
-    getThreadNotifications @19 (threadId :Text) -> (notifications :List(NotificationData));
-
-    # ── Notification Analytics ───────────────────────────────────
-
-    # Get analytics for a channel or app.
-    getAnalytics @20 (filter :NotificationFilter) -> (analytics :NotificationAnalytics);
+    getThreadNotifications @18 (threadId :Text, pagination :T.Pagination)
+                           -> (notifications :List(NotificationData), total :UInt64);
 
     # ── Attestation Verification ────────────────────────────────
 
-    # Verify the attestation of a notification.
-    verifyAttestation @21 (notificationId :T.NotificationId) -> (result :AttestationVerification);
+    verifyAttestation @19 (notificationId :T.NotificationId)
+                      -> (result :AttestationCheck);
 
-    # ── Inter-Service Notifications (audit-10) ───────────────────
+    # ── Do Not Disturb (this service is THE DND authority) ───────
+    # Channel `bypassDnd` is evaluated against this one switch. The shell
+    # reads and writes it here rather than keeping a second copy.
 
-    # Send a notification between system services.
-    sendInterServiceNotification @22 (notification :InterServiceNotification) -> (id :T.NotificationId);
-
-    # ── Delivery Tracking (audit-10) ─────────────────────────────
-
-    # Get delivery tracking for a notification.
-    getDeliveryTracking @23 (notificationId :T.NotificationId) -> (tracking :DeliveryTracking);
-
-    # Subscribe to delivery state changes.
-    subscribeDeliveryTracking @24 (filter :DeliveryTrackingFilter) -> (subscription :DeliveryTrackingSubscription);
-
-    # ── Priority Queue (audit-10) ────────────────────────────────
-
-    # Get notification priority queue stats.
-    getQueueStats @25 () -> (stats :QueueStats);
-
-    # Reprioritize a notification in the queue.
-    reprioritizeNotification @26 (notificationId :T.NotificationId, priority :QueuePriority) -> T.VoidResult;
-
-    # List notifications in the priority queue.
-    listQueuedNotifications @27 (pagination :T.Pagination) -> (entries :List(NotificationQueueEntry));
+    getDoNotDisturb @20 () -> (enabled :Bool);
+    setDoNotDisturb @21 (enabled :Bool) -> T.VoidResult;
 }
 
 interface NotificationsSubscription {
-    pull @0 () -> (notifications :List(NotificationData));
+    pull @0 (maxEvents :UInt32) -> (notifications :List(NotificationData));
     cancel @1 () -> T.VoidResult;
 }
 
-interface DeliveryTrackingSubscription {
-    pull @0 () -> (trackings :List(DeliveryTracking));
-    cancel @1 () -> T.VoidResult;
+# ── Results ───────────────────────────────────────────────────
+
+struct ShowResult {
+    union {
+        id      @0 :T.NotificationId;
+        error   @1 :T.Error;
+        unknown @2 :Void;
+    }
+}
+
+struct ChannelResult {
+    union {
+        channel @0 :NotificationChannel;
+        error   @1 :T.Error;
+        unknown @2 :Void;
+    }
+}
+
+struct AttestationCheck {
+    union {
+        verified   @0 :AttestationVerification;
+        unverified @1 :T.Error;
+        unknown    @2 :Void;
+    }
 }
 
 # ── Notification Data ────────────────────────────────────────
@@ -132,13 +167,11 @@ interface DeliveryTrackingSubscription {
 struct NotificationData {
     id @0 :T.NotificationId;
     appName @1 :Text;
-    # Application icon — use buffer handle for images >1KB.
+    # Application icon — buffer reference for images >1KB.
     appIcon @2 :T.DataHandle;
     title @3 :Text;
     body @4 :Text;
-    # Notification icon — use buffer handle for images >1KB.
     icon @5 :T.DataHandle;
-    # Inline image attachment — use buffer handle for images >1KB.
     image @6 :T.DataHandle;
     # Sound identifier (typed for cross-backend compatibility).
     sound @7 :T.SoundId;
@@ -151,25 +184,27 @@ struct NotificationData {
     # Whether the notification is transient (auto-dismissed, not persisted).
     transient @13 :Bool;
 
-    # ── Audit-7 additions ────────────────────────────────────
-    # Group related notifications into summaries.
+    # Group related notifications into summaries. Caller-chosen correlation
+    # key, not a service-issued handle.
     batchId @14 :Text;
     # Parent notification for chaining into workflows.
     parentId @15 :T.NotificationId;
-    # AI-assigned priority score (0.0 = low, 1.0 = critical).
-    aiPriority @16 :Float32;
-    # Encrypted notification content for sensitive data.
-    encryptedPayload @17 :T.DataHandle;
+    # Encrypted notification content for sensitive data: an opaque blob the
+    # service stores and never parses.
+    encryptedPayload @16 :T.DataHandle;
     # Signed notification for provenance verification.
-    attestation @18 :Data;
+    attestation @17 :Data;
     # Group notifications by conversation.
-    threadId @19 :Text;
+    threadId @18 :Text;
     # Multi-flow notification workflow identifier.
-    workflowId @20 :Text;
+    workflowId @19 :Text;
     # Channel this notification belongs to.
-    channel @21 :T.ChannelId;
-    # Rich preview content (audit-8: PreviewContent integrated into NotificationData).
-    preview @22 :PreviewContent;
+    channel @20 :T.ChannelId;
+    # Rich preview content.
+    preview @21 :PreviewContent;
+    # Service-reported ranking. IGNORED ON WRITE: the service decides
+    # ordering, and a caller-supplied score is an invitation to fiction.
+    reportedRank @22 :Float32;
 }
 
 # ── Notification Action ──────────────────────────────────────
@@ -177,22 +212,26 @@ struct NotificationData {
 struct NotificationAction {
     id @0 :T.NotificationActionId;
     label @1 :Text;
-    # Action icon — use buffer handle for images >1KB.
+    # Action icon — buffer reference for images >1KB.
     icon @2 :T.DataHandle;
-    # Action payload — actions that carry data (audit-7).
+    # Action payload — actions that carry data.
     payload @3 :T.DataHandle;
 }
 
 # ── Urgency Level ────────────────────────────────────────────
+# The one priority vocabulary in this file.
 
 enum UrgencyLevel {
-    low @0;
-    normal @1;
-    critical @2;
-    custom @3;
+    # Absent means the backend decides; it must never silently mean a
+    # specific paradigm value.
+    any @0;
+    low @1;
+    normal @2;
+    critical @3;
+    custom @4;
 }
 
-# ── Notification Filter (audit-7) ────────────────────────────
+# ── Notification Filter ──────────────────────────────────────
 
 struct NotificationFilter {
     # Filter by app name.
@@ -211,7 +250,7 @@ struct NotificationFilter {
     batchId @6 :Text;
 }
 
-# ── Preview Content (audit-7) ────────────────────────────────
+# ── Preview Content ──────────────────────────────────────────
 
 struct PreviewContent {
     # Whether the notification has expandable preview.
@@ -224,10 +263,7 @@ struct PreviewContent {
     body @3 :Text;
 }
 
-# ── Notification Channel (audit-7 / false positive) ──────────
-# Notification channel management is a feature of notification.capnp,
-# not a separate schema. Channels group notifications by category
-# with independent settings.
+# ── Notification Channel ─────────────────────────────────────
 
 struct NotificationChannel {
     # Unique channel identifier.
@@ -248,13 +284,11 @@ struct NotificationChannel {
     enabled @7 :Bool;
     # Whether notifications on this channel show on lock screen.
     showOnLockScreen @8 :Bool;
-    # Light color for notification LED (0 = no light).
-    lightColor @9 :UInt32;
     # Max notifications to show from this channel before compressing.
-    maxVisible @10 :UInt32;
+    maxVisible @9 :UInt32;
 }
 
-# ── Channel Stats (audit-7) ──────────────────────────────────
+# ── Channel Stats ────────────────────────────────────────────
 
 struct ChannelStats {
     channelId @0 :T.ChannelId;
@@ -270,110 +304,10 @@ struct ChannelStats {
     lastNotificationAt @5 :T.Timestamp;
 }
 
-# ── Notification Analytics (audit-9) ───────────────────────
-
-struct NotificationAnalytics {
-    # Total notifications sent.
-    totalSent @0 :UInt64;
-    # Total notifications delivered.
-    totalDelivered @1 :UInt64;
-    # Delivery rate (delivered/sent).
-    deliveryRate @2 :Float32;
-    # Total notifications opened.
-    totalOpened @3 :UInt64;
-    # Open rate (opened/delivered).
-    openRate @4 :Float32;
-    # Total action completions.
-    totalActionsCompleted @5 :UInt64;
-    # Action completion rate.
-    actionCompletionRate @6 :Float32;
-    # Average time to open (from delivery).
-    avgTimeToOpen @7 :T.Duration;
-    # Average time to dismiss.
-    avgTimeToDismiss @8 :T.Duration;
-    # Time period for these stats.
-    period @9 :T.TimeRange;
-}
-
-# ── Attestation Verification (audit-9) ─────────────────────
+# ── Attestation Verification ─────────────────────────────────
 
 struct AttestationVerification {
     valid @0 :Bool;
     signer @1 :Text;
     timestamp @2 :T.Timestamp;
-    error @3 :Text;
-}
-
-# ─── Inter-Service Notifications (audit-10) ───────────────
-
-struct NotificationSource {
-    sourceId @0 :Text;
-    sourceType @1 :Text;
-    # Whether this source is a system service.
-    isSystemService @2 :Bool;
-}
-
-struct InterServiceNotification {
-    source @0 :NotificationSource;
-    targetService @1 :Text;
-    eventType @2 :Text;
-    payload @3 :T.DataHandle;
-    priority @4 :UrgencyLevel;
-}
-
-# ─── Delivery Tracking (audit-10) ─────────────────────────
-
-enum DeliveryState {
-    pending @0;
-    sent @1;
-    delivered @2;
-    opened @3;
-    dismissed @4;
-    failed @5;
-    custom @6;
-}
-
-struct DeliveryTracking {
-    notificationId @0 :T.NotificationId;
-    state @1 :DeliveryState;
-    sentAt @2 :T.Timestamp;
-    deliveredAt @3 :T.Timestamp;
-    openedAt @4 :T.Timestamp;
-    dismissedAt @5 :T.Timestamp;
-    failureReason @6 :Text;
-    retryCount @7 :UInt32;
-}
-
-struct DeliveryTrackingFilter {
-    notificationId @0 :T.NotificationId;
-    states @1 :List(DeliveryState);
-    since @2 :T.Timestamp;
-    before @3 :T.Timestamp;
-}
-
-# ─── Priority Queue (audit-10) ─────────────────────────────
-
-enum QueuePriority {
-    low @0;
-    normal @1;
-    high @2;
-    critical @3;
-    custom @4;
-}
-
-struct NotificationQueueEntry {
-    notificationId @0 :T.NotificationId;
-    priority @1 :QueuePriority;
-    enqueuedAt @2 :T.Timestamp;
-    # Estimated processing time.
-    estimatedProcessingAt @3 :T.Timestamp;
-}
-
-struct QueueStats {
-    totalPending @0 :UInt32;
-    totalProcessing @1 :UInt32;
-    totalCompleted @2 :UInt64;
-    totalFailed @3 :UInt64;
-    avgWaitTimeMs @4 :Float32;
-    oldestPendingAge @5 :T.Duration;
 }

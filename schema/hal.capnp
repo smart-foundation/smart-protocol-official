@@ -1,92 +1,134 @@
 @0xa1b2c3d4e5f6003c;
 
 # ═══════════════════════════════════════════════════════════════════════
-# HAL - hardware abstraction primitives
-#
-# Smart-protocol is confirmed hybrid: it spans from user-facing schemas
-# down to primitives needed by driver-apps. HAL is the layer where
-# apps that ARE drivers (firmware, sandboxed kernel, embedded controllers)
-# negotiate hardware access with the kernel.
+# HAL — hardware abstraction primitives for driver-apps.
 #
 # HAL describes what hardware-access a driver may ask for, NOT how those
 # requests are implemented. Backends implement interrupts however they
-# want (line, message, polled, msi). The protocol only cares about the
+# want (line, message, polled, msi); the protocol only commits to the
 # affordances a driver gets:
-#   - mapping memory regions
-#   - subscribing to interrupt lines
-#   - DMA channels
-#   - power control of devices
-# Each is backend-agnostic; a smart-protokol driver moves between
-# architectures naturally.
 #
-# Improvements (audit-3):
-#   - HalService.map returns T.MappedRegionId instead of bare UInt64 (Rule 2).
-#   - HalService.unmap takes T.MappedRegionId instead of (base, length) pair.
+#   - claiming authority over a device class
+#   - mapping memory regions
+#   - subscribing to interrupt lines and receiving FIRINGS
+#   - DMA channels and shared buffers
+#   - power control of devices
+#   - discovering the bus topology and describing the hardware
+#
+# Each is backend-agnostic; a driver moves between architectures
+# naturally.
+#
+# ── WHAT WAS DELETED, AND WHY ──────────────────────────────────────────
+#
+#   * The "Hardware Foundation" block: `allocPhysicalPage`,
+#     `freePhysicalPage`, `createAddressSpace`, `destroyAddressSpace`,
+#     `mapVirtual`, `unmapVirtual`, `switchAddressSpace`, `mapRawMmio`,
+#     `registerIrq`, `enableIrq`/`disableIrq`, `allocMsi`/`allocMsix`/
+#     `programMsi`, `registerWatchdog`, `getX86PortIo` + `interface
+#     X86PortIo`. Page tables and interrupt dispatch are KEEPS OUT
+#     (DESIGN_PRINCIPLES.md:65 and :68); a kernel without page tables —
+#     single-address-space, capability-paged, CHERI-style — cannot
+#     implement `mapVirtual` at all, and every non-x86 backend had to
+#     stub six port-I/O methods that cannot exist. Raw MMIO and physical
+#     pages are exposed as `T.MappedRegionId` handles instead: the driver
+#     never sees an address it must not compute with.
+#   * `parseAcpi` + `HardwareDescFormat { deviceTree, acpi, smbios,
+#     devicetreeOverlay }` — firmware-table names in a required enum,
+#     returning full ACPI tables inline. Replaced by `describeHardware`,
+#     which returns an OPEN format token and the bytes as a T.DataHandle.
+#   * The duplicate primitives: `MemFlag` (T.PageFlags), `IrqLevel`
+#     (T.InterruptLevel), `HalCapability` (T.CapabilityType), `PowerState`
+#     (T.PowerSleepState), `DeviceResource` (T.DeviceResource) — five
+#     name/semantic collisions across the two most-imported files in the
+#     tree.
+#   * `PciDeviceInfo` + `enumeratePci` — a PCI enumeration struct. Bus
+#     discovery is `describeBus`/`probe` over `BusTopology` and
+#     `DeviceDescriptor`, which are transport-neutral; config-space
+#     access is kept as a bounded window into a device the driver already
+#     holds.
+#   * `DmaBufInfo.fd :UInt32` — a POSIX file descriptor in a required
+#     position. Replaced by a T.BufferId handle.
+#   * `UserlandDriverInfo` + `UserlandCapability`, `CloudHalInfo` +
+#     `CloudAuth`, `VirtualHalInfo`, `AiAcceleratorInfo` +
+#     `AiAcceleratorType`/`AiPrecision`, `IommuInfo` + `IommuType`,
+#     `SerialBusInfo` + `SerialBusType` — six unreachable type families
+#     naming today's vendors, accelerators and IOMMU generations. HalDeviceInfo
+#     (class/vendor/model/capabilities) and `describeHardware` cover the
+#     general case; a 2046 accelerator needs no ordinal.
+#   * `waitIrq` / `subscribeIrq` / `waitIrqHandle` / `unsubscribeIrq` /
+#     `ackIrqHandle` — THREE interrupt paths, none of which delivered
+#     events: every IRQ cost a blocking RPC or a poll. One mechanism
+#     remains, and it delivers firings as a subscription.
+#   * raw `UInt8`/`UInt64` codes and addresses: `respawnPolicy`,
+#     `registerDevice(policy)`, `getRespawnContext(state)`, `mapMmio`,
+#     `allocDmaBuf`, `IrqRequest.mode`, `DmaAddrRequest.direction`.
+#
+# Authority is the interface reference: `claim` returns evidence of what
+# the driver may touch, and holding that reference (or the HalService
+# reference for unclaimed affordances) is the authority. There is no
+# per-method token (R3).
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
-using import "capability.capnp".Capability;
 
+# What the driver asks to map. `base` is zero to let the backend choose.
 struct MemoryAccess {
     # Physical or bus address (backend-decided; zero = backend picks).
-    # On systems with an IOMMU, this may be a DMA address rather than
-    # a true physical address. The backend documents its interpretation.
+    # On systems with an IOMMU this may be a DMA address rather than a
+    # true physical address. The backend documents its interpretation.
     base @0 :UInt64;
     length @1 :UInt64;
-    flags @2 :List(MemFlag);
+    # Typed page attributes (canonical).
+    flags @2 :T.PageFlags;
     # Backend may map this with cache disabled, write-through, etc.
-    cacheMode @3 :CacheMode;
+    cacheMode @3 :MapCacheMode;
 }
 
-enum MemFlag {
-    read @0;
-    write @1;
-    execute @2;
-    prefetchable @3;
+enum MapCacheMode {
+    unknown @0;
+    defaultCached @1;
+    writeBack @2;
+    writeThrough @3;
     uncacheable @4;
-    writeCombined @5;
-    writeThrough @6;
-    io @7;
-    guarded @8;
-    shared @9;
-    custom @10;
+    custom @5;
 }
 
-enum CacheMode {
-    defaultCached @0;
-    writeBack @1;
-    writeThrough @2;
-    uncacheable @3;
-    custom @4;
-}
-
+# How a driver wants an interrupt line to behave. The trigger
+# (`level`) is a physical property of the line and is typed
+# (T.InterruptLevel); everything else is intent.
 struct IrqRequest {
     vector @0 :UInt32;
-    level @1 :IrqLevel;
-    handler @2 :HandlerRef;
-    # If true, ack to backend after handler completes.
+    # Physical trigger: edge, level, or message-signalled. Closed by
+    # hardware, not by fashion.
+    level @1 :T.InterruptLevel;
+    # Optional reference to the process:task that handles the firing.
+    handler @2 :T.ProcessId;
+    # If true, ack to the backend after the handler completes.
     needingAck @3 :Bool = true;
-}
-
-enum IrqLevel {
-    edge @0;
-    level @1;
-    message @2;
-    custom @3;
-}
-
-struct HandlerRef {
-    # Optional reference to a process:task which handles.
-    task @0 :T.ProcessId;
+    # Open parameters the backend understands.
+    parameters @4 :T.StringMap;
 }
 
 struct IrqTicket {
     vector @0 :UInt32;
-    level @1 :IrqLevel;
+    level @1 :T.InterruptLevel;
     # Time the interrupt was claimed.
     lastFiredAt @2 :T.Timestamp;
     # Total count of firings observed.
     count @3 :UInt64;
+    # Open metadata.
+}
+
+# One delivery of an interrupt. The subscription yields these; a driver
+# no longer blocks in a wait or polls a vector.
+struct IrqFiring {
+    vector @0 :UInt32;
+    # Monotonic time of the firing, so ordering survives clock adjustment.
+    at @1 :T.MonotonicTimestamp;
+    # Running count of firings on this vector, for gap detection.
+    count @2 :UInt64;
+    # Whether the firing was acknowledged by the handler.
+    acknowledged @3 :Bool;
 }
 
 struct DmaChannel {
@@ -102,34 +144,24 @@ struct DmaChannel {
 }
 
 enum DmaDirection {
-    deviceToHost @0;
-    hostToDevice @1;
-    both @2;
-    custom @3;
+    unknown @0;
+    deviceToHost @1;
+    hostToDevice @2;
+    both @3;
+    custom @4;
 }
 
-
-
-struct DevicePowerState {
-    state @0 :PowerState;
+struct HalDevicePowerState {
+    state @0 :T.PowerSleepState;
     # Power consumed in milliwatts (zero if unknown).
     milliwatts @1 :UInt32;
-    # Time the device becomes ready from this state (backend-decided unit;
-    # typically nanoseconds on hardware with known resume latencies).
+    # Time the device becomes ready from this state (backend-decided
+    # unit; typically nanoseconds on hardware with known resume
+    # latencies).
     resumeLatency @2 :T.Duration;
 }
 
-enum PowerState {
-    on @0;
-    active @1;
-    idle @2;
-    standby @3;
-    sleep @4;
-    deepSleep @5;
-    off @6;
-    custom @7;
-}
-
+# What a driver was granted. Handles, not addresses.
 struct HalAuthority {
     # Memory access the driver may claim.
     memory @0 :List(MemoryAccess);
@@ -139,447 +171,62 @@ struct HalAuthority {
     channels @2 :List(DmaChannel);
     # Authority over power state transitions of which devices.
     powerTargets @3 :List(T.HalDeviceId);
+    # Open metadata.
 }
 
-# ── Audit-5: PCI Device Info ─────────────────────────────────
-# Raw PCI configuration space snapshot from bus enumeration.
-
-struct PciDeviceInfo {
-    bus @0 :UInt8;
-    device @1 :UInt8;
-    function @2 :UInt8;
-    vendorId @3 :UInt16;
-    deviceId @4 :UInt16;
-    class @5 :UInt8;
-    subclass @6 :UInt8;
-    progIf @7 :UInt8;
-    revision @8 :UInt8;
-    headerType @9 :UInt8;
-    bar @10 :List(UInt32);
-    interruptLine @11 :UInt8;
-    interruptPin @12 :UInt8;
-    capabilitiesOffset @13 :UInt8;
-    isMultifunction @14 :Bool;
-}
-
-# ── Audit-5: Device Descriptor ───────────────────────────────
-# Low-level hardware descriptor produced by bus enumeration.
+# ── Device and bus description ──────────────────────────────────────────
 
 struct DeviceDescriptor {
     id @0 :T.HalDeviceId;
     name @1 :Text;
+    # Open class token ("pci", "usb", "platform", "i2c", or a 2046 one).
     class @2 :Text;
-    vendor @3 :UInt16;
-    product @4 :UInt16;
+    vendor @3 :Text;
+    model @4 :Text;
     revision @5 :UInt8;
-    busType @6 :UInt8;
-    capabilities @7 :List(UInt8);
-    resources @8 :List(DeviceResource);
-    driver @9 :DriverInfo;
-    interruptModes @10 :List(UInt8);
+    # Open bus token, matching BusTopology's vocabulary.
+    busType @6 :Text;
+    # Typed resource list (canonical).
+    resources @7 :List(T.DeviceResource);
+    # Typed capability list (canonical).
+    capabilities @8 :List(T.CapabilityType);
+    # Interrupt levels this device can use, as typed values.
+    interruptModes @9 :List(T.InterruptLevel);
+    # Open metadata: anything else enumeration produced.
 }
-
-# ── Audit-5: Device Resource ─────────────────────────────────
-# Hardware resource assigned to a device.
-
-struct DeviceResource {
-    type @0 :UInt8;
-    address @1 :UInt64;
-    size @2 :UInt64;
-    flags @3 :UInt32;
-}
-
-# ── Audit-5: Driver Info ─────────────────────────────────────
-# Information about the driver bound to a device.
-
-struct DriverInfo {
-    name @0 :Text;
-    version @1 :UInt32;
-    vendor @2 :Text;
-    supportsHotSwap @3 :Bool;
-    respawnPolicy @4 :UInt8;
-}
-
-interface HalService {
-    # Request HAL authority for a driver-cap class.
-    claim @0 (request :ClaimRequest) -> (authority :HalAuthority);
-    # Map a memory region the authority covers.
-    map @1 (region :MemoryAccess) -> (regionId :T.MappedRegionId);
-    # Unmap a memory region previously mapped.
-    unmap @2 (regionId :T.MappedRegionId) -> (result :T.VoidResult);
-    # Subscribe to an IRQ vector.
-    subscribe @3 (request :IrqRequest) -> (ticket :IrqTicket);
-    # Unsubscribe.
-    unsubscribe @4 (vector :UInt32) -> (result :T.VoidResult);
-    # Wait for an IRQ firing.
-    waitIrq @5 (vector :UInt32, timeout :T.Duration) -> (result :T.BoolResult);
-    # Acknowledge an IRQ (manual ack; auto-ack otherwise).
-    ackIrq @6 (vector :UInt32) -> (result :T.VoidResult);
-
-    # Power state control.
-    setPower @7 (deviceId :T.HalDeviceId, state :DevicePowerState) -> (result :T.VoidResult);
-    getPower @8 (deviceId :T.HalDeviceId) -> (state :DevicePowerState);
-
-    # DMA allocation.
-    allocDma @9 (request :DmaAllocRequest) -> (channel :DmaChannel);
-    freeDma @10 (channelId :T.DmaChannelId) -> (result :T.VoidResult);
-
-    # Audit-7: query currently mapped regions.
-    listRegions @11 (page :T.Pagination) -> (regions :List(MappedRegionInfo), total :UInt32);
-
-    # Audit-7: query device capabilities and limits.
-    getDeviceInfo @12 (deviceId :T.HalDeviceId) -> (info :HalDeviceInfo);
-
-    # Audit-7: query interrupt metadata.
-    getInterruptInfo @13 (vector :UInt32) -> (info :InterruptInfo);
-
-    # Audit-7: share a mapped region with another process.
-    shareRegion @14 (regionId :T.MappedRegionId, targetPid :T.ProcessId) -> (result :T.VoidResult);
-
-    # Audit-7: DMA-BUF sharing for cross-device buffer access.
-    shareBuffer @15 (request :DmaBufShareRequest) -> (info :DmaBufInfo);
-    unshareBuffer @16 (fd :UInt32) -> T.VoidResult;
-
-    # Audit-9: PCIe configuration space read/write methods.
-    readPcieConfigSpace @17 (request :PcieConfigSpace) -> (data :T.DataHandle);
-    writePcieConfigSpace @18 (request :PcieConfigSpace, data :T.DataHandle) -> T.VoidResult;
-
-    # Audit-5: Hardware Discovery
-    discoverBus @19 () -> (topology :BusTopology);
-    enumeratePci @20 () -> (devices :List(PciDeviceInfo));
-    parseAcpi @21 (tableSig :UInt32) -> (data :Data);
-    probeDevice @22 (deviceId :T.HalDeviceId) -> (descriptor :DeviceDescriptor);
-
-    # Audit-5: Device Management
-    claimDevice @23 (deviceId :T.HalDeviceId, driver :Text) -> (authority :HalAuthority);
-    releaseDevice @24 (deviceId :T.HalDeviceId) -> (result :T.VoidResult);
-    listDevices @25 () -> (devices :List(DeviceDescriptor));
-
-    # Audit-5: MMIO
-    mapMmio @26 (deviceId :T.HalDeviceId, offset :UInt64, size :UInt64) -> (virt :UInt64, handle :UInt64);
-    unmapMmio @27 (handle :UInt64) -> (result :T.VoidResult);
-
-    # Audit-5: DMA
-    allocDmaBuf @28 (size :UInt64, align :UInt32) -> (phys :UInt64, virt :UInt64, handle :UInt64);
-    freeDmaBuf @29 (handle :UInt64) -> (result :T.VoidResult);
-    syncDmaForDevice @30 (handle :UInt64) -> (result :T.VoidResult);
-    syncDmaForCpu @31 (handle :UInt64) -> (result :T.VoidResult);
-
-    # Audit-5: Interrupts
-    subscribeIrq @32 (deviceId :T.HalDeviceId, mode :UInt8) -> (vector :UInt8, handle :UInt64);
-    unsubscribeIrq @33 (handle :UInt64) -> (result :T.VoidResult);
-    waitIrqHandle @34 (handle :UInt64, timeoutNs :UInt64) -> (fired :Bool);
-    ackIrqHandle @35 (handle :UInt64) -> (result :T.VoidResult);
-
-    # Audit-5: Respawn
-    registerDevice @36 (deviceId :T.HalDeviceId, policy :UInt8) -> (handle :UInt64);
-    reportFailure @37 (deviceId :T.HalDeviceId, report :Data) -> (result :T.VoidResult);
-    getRespawnContext @38 (deviceId :T.HalDeviceId) -> (state :UInt8, attempts :UInt32, fallbackActive :Bool);
-    setFallbackActive @39 (deviceId :T.HalDeviceId, active :Bool) -> (result :T.VoidResult);
-
-    # ── Hardware Foundation (low-level physical/raw access) ──────────────────
-    # These methods provide direct hardware access for backends that manage
-    # physical memory, I/O ports, and interrupt controllers. The higher-level
-    # methods above (claim, map, subscribe) are preferred for driver-apps;
-    # these are for backends and the kernel's own TCB implementation.
-
-    # Physical page management
-    allocPhysicalPage @40 () -> (phys :UInt64);
-    freePhysicalPage @41 (phys :UInt64) -> (result :T.VoidResult);
-
-    # Raw MMIO mapping (phys-based, not device-bound)
-    mapRawMmio @42 (phys :UInt64, size :UInt64, flags :UInt32) -> (virt :UInt64, handle :UInt64);
-    unmapRawMmio @43 (handle :UInt64) -> (result :T.VoidResult);
-
-    # Page table management
-    createAddressSpace @44 (levels :UInt8, mode :UInt8) -> (asid :UInt64);
-    destroyAddressSpace @45 (asid :UInt64) -> (result :T.VoidResult);
-    mapVirtual @46 (asid :UInt64, virt :UInt64, phys :UInt64, flags :UInt32) -> (result :T.VoidResult);
-    unmapVirtual @47 (asid :UInt64, virt :UInt64) -> (result :T.VoidResult);
-    switchAddressSpace @48 (asid :UInt64) -> (result :T.VoidResult);
-
-    # Page table management
-    registerIrq @49 (vector :UInt8, mode :UInt8) -> (handle :UInt64);
-    unregisterIrq @50 (handle :UInt64) -> (result :T.VoidResult);
-    enableIrq @51 (vector :UInt8) -> (result :T.VoidResult);
-    disableIrq @52 (vector :UInt8) -> (result :T.VoidResult);
-
-    # MSI/MSI-X for PCIe devices
-    allocMsi @53 (deviceId :UInt64, count :UInt8) -> (vectors :List(UInt8), handle :UInt64);
-    allocMsix @54 (deviceId :UInt64, count :UInt16) -> (vectors :List(UInt8), handle :UInt64);
-    freeMsi @55 (handle :UInt64) -> (result :T.VoidResult);
-    programMsi @56 (handle :UInt64, affinity :UInt32) -> (result :T.VoidResult);
-
-    # Watchdog management
-    registerWatchdog @57 (timeoutNs :UInt64) -> (handle :UInt64);
-    unregisterWatchdog @58 (handle :UInt64) -> (result :T.VoidResult);
-    petWatchdog @59 (handle :UInt64) -> (result :T.VoidResult);
-
-    # x86 Port I/O (optional, x86-only). Returns None-equivalent on non-x86.
-    getX86PortIo @60 () -> (service :X86PortIo);
-}
-
-struct ClaimRequest {
-    label @0 :Text;
-    proof @1 :Data;
-    expectedResources @2 :HalAuthority;
-}
-
-struct DmaAllocRequest {
-    direction @0 :DmaDirection;
-    width @1 :UInt32;
-    maxBurst @2 :UInt32;
-    scatterGather @3 :Bool;
-    label @4 :Text;
-}
-
-# ═══════════════════════════════════════════════════════════════════════
-# Audit-7: Extended HAL capabilities
-#
-# Userland drivers, cloud hardware, virtual HAL, AI accelerators,
-# device tree/ACPI, and DMA-BUF sharing. These extend the
-# kernel-managed hardware model to support diverse hardware
-# abstraction needs.
-# ═══════════════════════════════════════════════════════════════════════
-
-# ── Userland HAL ──────────────────────────────────────────────
-
-struct UserlandDriverInfo {
-    name @0 :Text;
-    # Protocol identifier (e.g., "FUSE", "user-space-i2c", "user-space-gpio").
-    protocol @1 :Text;
-    pid @2 :T.ProcessId;
-    capabilities @3 :List(UserlandCapability);
-    # Whether the driver requires elevated privileges.
-    privileged @4 :Bool;
-}
-
-enum UserlandCapability {
-    filesystem @0;
-    network @1;
-    device @2;
-    ipc @3;
-    custom @4;
-}
-
-# ── Cloud HAL ─────────────────────────────────────────────────
-
-struct CloudHalInfo {
-    # Cloud provider identifier (e.g., "aws", "azure", "gcp").
-    provider @0 :Text;
-    region @1 :Text;
-    # Service type (e.g., "nitro", "shielded-vm", "confidential-computing").
-    service @2 :Text;
-    # API endpoint URL.
-    endpoint @3 :Text;
-    authMethod @4 :CloudAuth;
-    # Whether hardware attestation is available.
-    attestation @5 :Bool;
-}
-
-enum CloudAuth {
-    none @0;
-    iam @1;
-    token @2;
-    certificate @3;
-    custom @4;
-}
-
-# ── Virtual HAL (Paravirtualized) ─────────────────────────────
-
-struct VirtualHalInfo {
-    # Hypervisor identifier (e.g., "kvm", "xen", "hyper-v", "vmware").
-    hypervisor @0 :Text;
-    # Whether virtio transport is used.
-    virtio @1 :Bool;
-    # virtio device IDs.
-    deviceIds @2 :List(Text);
-    # Transport type (e.g., "pci", "mmio", "ccw").
-    transport @3 :Text;
-    # Whether memory balloon is supported.
-    balloon @4 :Bool;
-    # Whether VM snapshot is supported.
-    snapshot @5 :Bool;
-}
-
-# ── AI Accelerator HAL ────────────────────────────────────────
-
-struct AiAcceleratorInfo {
-    type @0 :AiAcceleratorType;
-    vendor @1 :Text;
-    model @2 :Text;
-    memoryBytes @3 :UInt64;
-    computeUnits @4 :UInt32;
-    # Supported precision formats.
-    precision @5 :List(AiPrecision);
-    # Supported ML frameworks (e.g., "tensorflow", "pytorch", "onnx").
-    frameworks @6 :List(Text);
-}
-
-enum AiAcceleratorType {
-    tpu @0;
-    npu @1;
-    gpu @2;
-    fpga @3;
-    dsp @4;
-    custom @5;
-}
-
-enum AiPrecision {
-    fp32 @0;
-    fp16 @1;
-    bf16 @2;
-    int8 @3;
-    int4 @4;
-    binary @5;
-    custom @6;
-}
-
-# ── Device Tree / ACPI Query ──────────────────────────────────
-
-struct HardwareDescription {
-    format @0 :HardwareDescFormat;
-    # Device tree blob or ACPI table data.
-    data @1 :T.DataHandle;
-    # Overlay/dtso for runtime modifications.
-    overlay @2 :T.DataHandle;
-}
-
-enum HardwareDescFormat {
-    deviceTree @0;
-    acpi @1;
-    smbios @2;
-    devicetreeOverlay @3;
-    custom @4;
-}
-
-# ── DMA-BUF Sharing ──────────────────────────────────────────
-
-struct DmaBufInfo {
-    # DMA-BUF file descriptor.
-    fd @0 :UInt32;
-    sizeBytes @1 :UInt64;
-    format @2 :T.PixelFormat;
-    width @3 :UInt32;
-    height @4 :UInt32;
-    # Buffer modifier (tiling, compression).
-    modifier @5 :UInt64;
-    # Sync file for implicit sync.
-    syncFile @6 :Data;
-}
-
-struct DmaBufShareRequest {
-    sizeBytes @0 :UInt64;
-    format @1 :T.PixelFormat;
-    width @2 :UInt32;
-    height @3 :UInt32;
-    modifier @4 :UInt64;
-    # Processes that should have access to this buffer.
-    shareWith @5 :List(T.ProcessId);
-}
-
-# ── Mapped Region Info ────────────────────────────────────────
-
-struct MappedRegionInfo {
-    regionId @0 :T.MappedRegionId;
-    base @1 :UInt64;
-    length @2 :UInt64;
-    flags @3 :List(MemFlag);
-    cacheMode @4 :CacheMode;
-    # Process that owns this mapping.
-    owner @5 :T.ProcessId;
-}
-
-# ── HAL Capability ──────────────────────────────────────────────
-
-enum HalCapability {
-    dma @0;
-    irq @1;
-    mmio @2;
-    portIo @3;
-    busMaster @4;
-    custom @5;
-}
-
-# ── Device Info ───────────────────────────────────────────────
 
 struct HalDeviceInfo {
     deviceId @0 :T.HalDeviceId;
-    # Device class (e.g., "pci", "usb", "platform").
+    # Open class token.
     class @1 :Text;
     vendor @2 :Text;
     model @3 :Text;
-    # Device capabilities.
-    capabilities @4 :List(HalCapability);
+    # Typed capability list (canonical).
+    capabilities @4 :List(T.CapabilityType);
     # Maximum mapped regions.
     maxRegions @5 :UInt32;
     # Maximum DMA channels.
     maxDmaChannels @6 :UInt32;
 }
 
-# ── Interrupt Info ────────────────────────────────────────────
+# ── Hardware description ────────────────────────────────────────────────
+# The firmware table / device tree, as an OPEN format token and a
+# zero-copy handle. The pre-revamp enum named four table formats; a
+# boot ROM with none of them had to answer with a lie.
 
-struct InterruptInfo {
-    vector @0 :UInt32;
-    level @1 :IrqLevel;
-    count @2 :UInt64;
-    lastFiredAt @3 :T.Timestamp;
-    enabled @4 :Bool;
-    owner @5 :T.ProcessId;
+struct HardwareDescription {
+    # Open format token ("devicetree", "acpi", "smbios", or a 2046 one).
+    format @0 :Text;
+    # The table bytes, zero-copy.
+    data @1 :T.DataHandle;
+    # Overlay / runtime-modification data, if any.
+    overlay @2 :T.DataHandle;
+    # Signature identifying this specific description (OEM id, DT root
+    # compatible string, …), open and backend-declared.
+    signature @3 :Text;
 }
 
-# ── IOMMU/SMMU Support (audit-8 What's Still Missing) ──
-struct IommuInfo {
-    deviceId @0 :T.HalDeviceId;
-    type @1 :IommuType;
-    supportsTranslation @2 :Bool;
-    supportsIsolation @3 :Bool;
-    supportsPassthrough @4 :Bool;
-    iovaBitWidth @5 :UInt8;
-    maxIova @6 :UInt64;
-}
-
-enum IommuType {
-    smmu @0;
-    intelIommu @1;
-    amdVi @2;
-    armSmmu @3;
-    virtioIommu @4;
-    custom @5;
-}
-
-struct PcieConfigSpace {
-    bus @0 :UInt8;
-    device @1 :UInt8;
-    function @2 :UInt8;
-    offset @3 :UInt16;
-    size @4 :UInt16;
-}
-
-# ── Serial Bus Access (SPI/I2C for embedded devices) ──
-struct SerialBusInfo {
-    busId @0 :UInt32;
-    type @1 :SerialBusType;
-    chipSelect @2 :UInt8;
-    maxFrequencyHz @3 :UInt32;
-    mode @4 :UInt8;
-}
-
-enum SerialBusType {
-    spi @0;
-    i2c @1;
-    i3c @2;
-    mipiCsi @3;
-    custom @4;
-}
-
-# ═══════════════════════════════════════════════════════════════════════
-# v0.0.2 additions — Bus Discovery & Topology
-#
-# Drivers and the kernel share an abstract Bus interface. The
-# implementation walks the bus topology however it wants; the
-# protocol only commits to the affordances.
-# ═══════════════════════════════════════════════════════════════════════
+# ── Bus topology ────────────────────────────────────────────────────────
 
 struct BusTopology {
     # Identifier assigned by the kernel/HAL implementation.
@@ -592,52 +239,66 @@ struct BusTopology {
 
 struct BusNode {
     address @0 :T.BusAddress;
-    # Devices attached at this address (drivers manage the
-    # attach lifecycle via device.capnp's DeviceService).
+    # Devices attached at this address (drivers manage the attach
+    # lifecycle via device.capnp's DeviceService).
     attachedDevices @1 :List(T.HalDeviceId);
     parent @2 :T.BusAddress;
+    # Open bus token for this node.
+    busType @3 :Text;
 }
 
 interface BusDiscoveryService {
-    # Probe the bus tree. Implementation decides how — walking ACPI,
-    # PCIe enumeration, device-tree blob, virtio config space, ...
-    probe @0 () -> (topology :BusTopology);
-    # Subscribe to topology changes (hotplug, device removal).
+    # Probe the bus tree. Implementation decides how — walking a device
+    # tree, PCIe enumeration, virtio config space, …
+    probe @0 (bounds :BusProbeBounds) -> (topology :BusTopology);
+    # Subscribe to topology changes (hotplug, device removal). Holding
+    # the subscription IS the authority to pull.
     subscribeTopology @1 () -> (subscription :BusTopologySubscription);
     # Resolve a bus address to a device id (if attached).
     resolveAddress @2 (address :T.BusAddress) -> (device :T.HalDeviceId);
 }
 
+struct BusProbeBounds {
+    # Maximum nodes to return (zero = backend default, itself bounded).
+    maxNodes @0 :UInt32;
+    # Maximum depth to walk.
+    maxDepth @1 :UInt16;
+    # True when the walk hit a bound, so a consumer knows the topology is
+    # partial rather than complete.
+    truncated @2 :Bool;
+}
+
 interface BusTopologySubscription {
-    pull @0 () -> (events :List(BusTopologyEvent));
+    # Bounded pull.
+    pull @0 (maxEvents :UInt32) -> (events :List(BusTopologyEvent));
     cancel @1 () -> T.VoidResult;
 }
 
 struct BusTopologyEvent {
-    at @0 :UInt64;
+    at @0 :T.MonotonicTimestamp;
     union {
         deviceAttached @1 :BusAttachEvent;
         deviceDetached @2 :T.BusAddress;
         busRescanned @3 :T.BusAddress;
-        custom @4 :Void;
+        unknown @4 :T.UnknownEvent;
     }
 }
 
 struct BusAttachEvent {
     address @0 :T.BusAddress;
     device @1 :T.HalDeviceId;
-    # Hardware class (network, display, storage, ...).
+    # Open hardware class token (network, display, storage, …).
     hardwareClass @2 :Text;
 }
 
-# ── Per-Address DMA Helpers ──────────────────────────────────
+# ── Per-address DMA helpers ─────────────────────────────────────────────
 # Some backends require DMA-address negotiation per bus address.
 
 struct DmaAddrRequest {
     device @0 :T.HalDeviceId;
     bus @1 :T.BusAddress;
     lengthBytes @2 :UInt64;
-    direction @3 :UInt8;
+    direction @3 :DmaDirection;
     # Driver may hint; backend overrides with physical it can map.
     preferredAddress @4 :UInt64;
 }
@@ -649,16 +310,193 @@ interface DmaMapService {
     syncForCpu @3 (handle :T.DmaHandle) -> (result :T.VoidResult);
 }
 
-# ── x86 Port I/O (optional, x86-only) ────────────────────────
-# Architecture-specific. Only present on x86/x86_64 systems.
-# Not part of the arch-agnostic HalService core.
+# ── DMA-BUF sharing ─────────────────────────────────────────────────────
 
-interface X86PortIo {
-    inb @0 (port :UInt16) -> (val :UInt8);
-    outb @1 (port :UInt16, val :UInt8) -> (result :T.VoidResult);
-    inw @2 (port :UInt16) -> (val :UInt16);
-    outw @3 (port :UInt16, val :UInt16) -> (result :T.VoidResult);
-    inl @4 (port :UInt16) -> (val :UInt32);
-    outl @5 (port :UInt16, val :UInt32) -> (result :T.VoidResult);
+struct DmaBufInfo {
+    # Buffer handle, NOT a POSIX file descriptor.
+    bufferId @0 :T.BufferId;
+    sizeBytes @1 :UInt64;
+    format @2 :T.PixelFormat;
+    width @3 :UInt32;
+    height @4 :UInt32;
+    # Buffer modifier (tiling, compression), backend-declared.
+    modifier @5 :UInt64;
+    # Sync file for implicit sync, zero-copy.
+    syncFile @6 :T.DataHandle;
+    # Processes that currently share this buffer.
+    sharedWith @7 :List(T.ProcessId);
+    metadata @8 :T.StringMap;
 }
 
+struct DmaBufShareRequest {
+    sizeBytes @0 :UInt64;
+    format @1 :T.PixelFormat;
+    width @2 :UInt32;
+    height @3 :UInt32;
+    modifier @4 :UInt64;
+    # Processes that should have access to this buffer.
+    shareWith @5 :List(T.ProcessId);
+    label @6 :Text;
+}
+
+struct MappedRegionInfo {
+    regionId @0 :T.MappedRegionId;
+    base @1 :UInt64;
+    length @2 :UInt64;
+    flags @3 :T.PageFlags;
+    cacheMode @4 :MapCacheMode;
+    # Process that owns this mapping.
+    owner @5 :T.ProcessId;
+    # What the mapping is for, as an open token ("mmio", "dma", "shared").
+    purpose @6 :Text;
+}
+
+# ── Config space ────────────────────────────────────────────────────────
+# A bounded window into a device's own configuration space. The driver
+# already holds authority over the device; the window is bounded so a
+# mistake cannot dump an entire bus.
+
+struct PcieConfigSpace {
+    deviceId @0 :T.HalDeviceId;
+    offset @1 :UInt16;
+    size @2 :UInt16;
+}
+
+# ── Device respawn ──────────────────────────────────────────────────────
+# Typed policy and typed failure reports; the pre-revamp UInt8 codes are
+# gone (T.RestartPolicy / T.EntityState / T.FailureReport).
+
+struct DeviceRegistration {
+    deviceId @0 :T.HalDeviceId;
+    policy @1 :T.RestartPolicy;
+    label @2 :Text;
+    metadata @3 :T.StringMap;
+}
+
+# ── The HAL contract ────────────────────────────────────────────────────
+# The root of the hardware-affordance domain: handed to a driver by the
+# host, so it is deliberately not returned by any method. The
+# sub-services (bus discovery, DMA mapping) ARE returned by accessors
+# below, so every interface here is reachable.
+
+interface HalService {
+    # Request HAL authority for a driver-cap class.
+    claim @0 (request :ClaimRequest) -> (authority :HalAuthority);
+
+    # Map a memory region the authority covers.
+    map @1 (region :MemoryAccess) -> (regionId :T.MappedRegionId);
+    # Unmap a memory region previously mapped.
+    unmap @2 (regionId :T.MappedRegionId) -> (result :T.VoidResult);
+
+    # ── Interrupts: ONE mechanism, and it delivers ─────────────
+    # Subscribe to an interrupt line; the returned subscription yields
+    # firings. No blocking wait, no per-vector poll.
+    subscribeIrq @3 (request :IrqRequest) -> (subscription :IrqSubscription);
+    # Acknowledge a firing (manual ack; auto-ack otherwise).
+    ackIrq @4 (vector :UInt32) -> (result :T.VoidResult);
+    # Interrupt metadata for a vector.
+    getInterruptInfo @5 (vector :UInt32) -> (info :InterruptInfo);
+
+    # Power state control.
+    setPower @6 (deviceId :T.HalDeviceId, state :HalDevicePowerState) -> (result :T.VoidResult);
+    getPower @7 (deviceId :T.HalDeviceId) -> (state :HalDevicePowerState);
+
+    # DMA allocation.
+    allocDma @8 (request :DmaAllocRequest) -> (channel :DmaChannel);
+    freeDma @9 (channelId :T.DmaChannelId) -> (result :T.VoidResult);
+
+    # Query currently mapped regions.
+    listRegions @10 (page :T.Pagination) -> (regions :List(MappedRegionInfo), total :UInt32);
+
+    # Query device capabilities and limits.
+    getDeviceInfo @11 (deviceId :T.HalDeviceId) -> (info :HalDeviceInfo);
+
+    # Share a mapped region with another process.
+    shareRegion @12 (regionId :T.MappedRegionId, targetPid :T.ProcessId) -> (result :T.VoidResult);
+
+    # DMA-BUF sharing for cross-device buffer access.
+    shareBuffer @13 (request :DmaBufShareRequest) -> (info :DmaBufInfo);
+    unshareBuffer @14 (bufferId :T.BufferId) -> T.VoidResult;
+
+    # Map device MMIO. Returns a HANDLE: the driver never receives a raw
+    # address it must compute with.
+    mapMmio @15 (deviceId :T.HalDeviceId, offset :UInt64, size :UInt64) -> (regionId :T.MappedRegionId);
+    unmapMmio @16 (regionId :T.MappedRegionId) -> (result :T.VoidResult);
+
+    # Allocate a DMA buffer, returning the channel (with its handle).
+    allocDmaBuf @17 (size :UInt64, align :UInt32, direction :DmaDirection)
+                -> (channel :DmaChannel, info :DmaBufInfo);
+    freeDmaBuf @18 (channelId :T.DmaChannelId) -> (result :T.VoidResult);
+    syncDmaForDevice @19 (channelId :T.DmaChannelId) -> (result :T.VoidResult);
+    syncDmaForCpu @20 (channelId :T.DmaChannelId) -> (result :T.VoidResult);
+
+    # Config space, as a bounded window.
+    readConfigSpace @21 (window :PcieConfigSpace) -> (data :T.DataHandle);
+    writeConfigSpace @22 (window :PcieConfigSpace, data :T.DataHandle) -> T.VoidResult;
+
+    # ── Discovery ──────────────────────────────────────────────
+    # The bus discovery contract, as a reachable sub-service.
+    describeBus @23 () -> (service :BusDiscoveryService);
+    # The per-address DMA contract, as a reachable sub-service.
+    describeDma @24 () -> (service :DmaMapService);
+    # Hardware description: an OPEN format token plus the bytes,
+    # zero-copy.
+    describeHardware @25 () -> (description :HardwareDescription);
+
+    # Probe one device and describe it.
+    probeDevice @26 (deviceId :T.HalDeviceId) -> (descriptor :DeviceDescriptor);
+    # Bounded device listing.
+    listDevices @27 (filter :HalDeviceFilter, page :T.Pagination)
+               -> (devices :List(DeviceDescriptor), total :UInt64);
+
+    # ── Device lifecycle ───────────────────────────────────────
+    claimDevice @28 (deviceId :T.HalDeviceId, registration :DeviceRegistration)
+               -> (authority :HalAuthority);
+    releaseDevice @29 (deviceId :T.HalDeviceId) -> (result :T.VoidResult);
+    reportFailure @30 (deviceId :T.HalDeviceId, report :T.FailureReport) -> (result :T.VoidResult);
+    getRespawnContext @31 (deviceId :T.HalDeviceId)
+                     -> (state :T.EntityState, attempts :UInt32, fallbackActive :Bool);
+}
+
+interface IrqSubscription {
+    # Bounded pull: the caller states how many firings it will take.
+    pull @0 (maxFirings :UInt32) -> (firings :List(IrqFiring), total :UInt64);
+    cancel @1 () -> T.VoidResult;
+}
+
+struct ClaimRequest {
+    label @0 :Text;
+    # Opaque proof the backend asks for (a signed statement, a manifest
+    # reference, …). What it must contain is backend-defined and stated
+    # in the backend's own documentation; the protocol does not parse it.
+    proof @1 :Data;
+    expectedResources @2 :HalAuthority;
+    metadata @3 :T.StringMap;
+}
+
+struct DmaAllocRequest {
+    direction @0 :DmaDirection;
+    width @1 :UInt32;
+    maxBurst @2 :UInt32;
+    scatterGather @3 :Bool;
+    label @4 :Text;
+}
+
+struct InterruptInfo {
+    vector @0 :UInt32;
+    level @1 :T.InterruptLevel;
+    count @2 :UInt64;
+    lastFiredAt @3 :T.Timestamp;
+    enabled @4 :Bool;
+    owner @5 :T.ProcessId;
+}
+
+struct HalDeviceFilter {
+    # Open class token (empty = all).
+    class @0 :Text;
+    # Restrict to devices attached at this bus address.
+    bus @1 :T.BusAddress;
+    # Require these capabilities.
+    capabilities @2 :List(T.CapabilityType);
+    metadata @3 :T.StringMap;
+}

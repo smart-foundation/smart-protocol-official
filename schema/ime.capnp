@@ -1,117 +1,204 @@
 @0xa1b2c3d4e5f60032;
 
+# ══════════════════════════════════════════════════════════════════════
+# IME — input method editing: text contexts, composition, input methods.
+#
+# WHAT THIS IS
+#   The ONE text-input contract in the protocol. textinput.capnp was merged
+#   into this file and deleted: the two files had drifted into incompatible
+#   twins (`ContextRequest`, `SurroundingText`, `InputMethodInfo` and
+#   `InputMethodState` existed in both with different fields), so a client
+#   written against one got silently wrong data on the other.
+#
+#   This file keeps the ImeSession-based design and absorbs textinput's better
+#   halves: per-surface contexts, per-context enable/disable/reset, a
+#   `T.DataHandle` commit for document-sized pastes, the language stack, the
+#   dictation/stroke/suggestion pipelines, and interactive input requests
+#   (a password prompt is an IME concern).
+#
+# WHO CONSUMES IT
+#   Apps that accept text (create a context, receive commits), the shell and
+#   on-screen keyboards (drive composition), automation.
+#
+# WHAT IS DELIBERATELY OPEN
+#   Every vocabulary that a future input modality would have to extend is an
+#   open token, not an enum: modality, content type, purpose and keyboard
+#   type. A modality invented in 2046 — gaze dictation, mid-air haptics, a
+#   direct neural channel — is representable today, with no schema change
+#   and no ordinal. The previous draft froze `InputModality`
+#   {keyboard, voice, handwriting, gesture, neural, spatial, hybrid} and then
+#   put it in a REQUIRED position (`switchInputMethodForContext`), so the one
+#   file that promises "any future input modality" could not express one.
+#
+# WHAT IS DELIBERATELY OPAQUE
+#   Context identity (`T.ImeContextId`), method identity (`T.InputMethodId`),
+#   stroke payloads (`T.DataHandle`), session and input-request handles
+#   (server-issued).
+#
+# HOW IT RELATES TO OTHER SERVICES
+#   compositor.capnp publishes the service-session handshake, the key-action
+#   vocabulary and the unknown-event envelope; this file imports them rather
+#   than declaring rivals.
+# ══════════════════════════════════════════════════════════════════════
+
 using T = import "types.capnp";
+using C = import "compositor.capnp";
 
 # ══════════════════════════════════════════════════════════════════════
-# IME - input method editor session
+# SESSION
 #
-# Manages the lifecycle of an IME session: context creation, input
-# method switching, virtual keyboard control, text commit/preedit,
-# and event subscriptions. Backend-agnostic — works with on-screen
-# keyboards, physical keyboards, handwriting recognition, voice input,
-# or any future input modality.
+# `handshake` takes the shared `compositor.SessionRequest`, so every
+# session-based service in the protocol is entered through the same door.
 #
-# Improvements (audit-3):
-#   - InputMethodState.currentMethod documented: zero-value ID means "none" (Rule 2).
-#   - destroyContext, enable, disable, reset now return T.VoidResult (Rule 5).
-#
-# Improvements (audit-6):
-#   - TextInputEvent unknown variant renamed to custom for naming consistency (Rule 8).
+# Ordinal note: Cap'n Proto requires sequential interface ordinals, so
+# absorbing textinput renumbered this interface. The prior draft's @0–@21
+# mapped as: handshake @0, createContext @1, destroyContext @2, updateContext
+# @3, enable @4, disable @5, reset @6, listInputMethods @7, switchInputMethod
+# @8, getInputMethodState @9, showVirtualKeyboard @10, hideVirtualKeyboard
+# @11, commitText @12, setPreedit @13, confirmPreedit @14, cancelPreedit @15,
+# subscribe @16, listModalities @17, getVoiceInfo @18, getHandwritingInfo @19,
+# getPredictionInfo @20, switchInputMethodForContext @21. Everything from @22
+# on is absorbed from the deleted textinput.capnp.
 # ══════════════════════════════════════════════════════════════════════
 
-interface Session {
-
-    struct HandshakeRequest {
-        applicationId @0 :T.AppId;
-        version       @1 :T.Version;
-        metadata      @2 :List(T.Meta);
-    }
+interface ImeSession {
 
     struct HandshakeResponse {
-        sessionId @0 :T.SessionId;
-        inputMethods @1 :List(InputMethodInfo);
-        result    @2 :HandshakeResult;
+        sessionId     @0 :T.SessionId;
+        agreedVersion @1 :T.Version;
+        granted       @2 :List(C.GrantedCapability);
+        denied        @3 :List(C.DeniedCapability);
+        service       @4 :C.ServiceInfo;
+        result        @5 :C.HandshakeResult;
+        # Ungated discovery: the methods that exist are published before any
+        # capability is held, so a caller can learn what it could switch to.
+        inputMethods  @6 :List(InputMethodInfo);
     }
 
-    enum HandshakeResult {
-        accepted @0;
-        rejected @1;
-        custom @2;
-    }
-
-    handshake @0 (request :HandshakeRequest)
+    handshake @0 (request :C.SessionRequest)
                -> (response :HandshakeResponse);
 
     # -- Context --
 
-    createContext  @1 (request :ContextRequest) -> (id :T.ImeContextId);
-    destroyContext @2 (id :T.ImeContextId) -> T.VoidResult;
-    updateContext  @3 (id :T.ImeContextId, update :ContextUpdate) -> ();
+    createContext  @1 (surface :T.SurfaceId, request :ContextRequest)
+                    -> (result :ContextResult);
+    destroyContext @2 (id :T.ImeContextId) -> (result :T.VoidResult);
+    updateContext  @3 (id :T.ImeContextId, update :ContextUpdate)
+                    -> (result :T.VoidResult);
 
-    # -- Enable / Disable --
+    # -- Enable / Disable / Reset (per context) --
 
-    enable         @4 (id :T.ImeContextId) -> T.VoidResult;
-    disable        @5 () -> T.VoidResult;
-    reset          @6 () -> T.VoidResult;
+    enable  @4 (id :T.ImeContextId) -> (result :T.VoidResult);
+    disable @5 (id :T.ImeContextId) -> (result :T.VoidResult);
+    reset   @6 (id :T.ImeContextId) -> (result :T.VoidResult);
 
     # -- Input Method --
 
-    listInputMethods    @7 () -> (methods :List(InputMethodInfo));
+    listInputMethods    @7 (pagination :T.Pagination)
+                         -> (methods :List(InputMethodInfo), total :UInt64);
     switchInputMethod   @8 (id :T.InputMethodId) -> (result :T.VoidResult);
-    getInputMethodState @9 () -> (state :InputMethodState);
+    getInputMethodState @9 (id :T.ImeContextId) -> (state :InputMethodState);
+    switchInputMethodForContext @10 (id :T.ImeContextId,
+                                     method :T.InputMethodId,
+                                     overrideModality :Text)
+                                 -> (result :T.VoidResult);
 
     # -- Virtual Keyboard --
 
-    showVirtualKeyboard @10 (type :KeyboardType) -> (result :T.VoidResult);
-    hideVirtualKeyboard @11 () -> (result :T.VoidResult);
+    showVirtualKeyboard @11 (id :T.ImeContextId, type :Text)
+                         -> (result :T.VoidResult);
+    hideVirtualKeyboard @12 (id :T.ImeContextId) -> (result :T.VoidResult);
 
     # -- Direct Actions --
 
-    commitText     @12 (text :Text) -> ();
-    setPreedit     @13 (text :Text, cursorOffset :UInt32) -> ();
-    confirmPreedit @14 () -> ();
-    cancelPreedit  @15 () -> ();
+    commitText     @13 (id :T.ImeContextId, text :Text)
+                    -> (result :T.VoidResult);
+    # Large commits (pasting a document) travel as a buffer reference.
+    commitTextHandle @14 (id :T.ImeContextId, text :T.DataHandle,
+                          encoding :Text)
+                      -> (result :T.VoidResult);
+    setPreedit     @15 (id :T.ImeContextId, text :Text, cursorOffset :UInt32)
+                    -> (result :T.VoidResult);
+    confirmPreedit @16 (id :T.ImeContextId) -> (result :T.VoidResult);
+    cancelPreedit  @17 (id :T.ImeContextId) -> (result :T.VoidResult);
 
     # -- Events --
 
-    subscribe      @16 (filter :TextInputEventFilter)
-                    -> (stream :TextInputEventStream);
+    subscribe @18 (filter :TextInputEventFilter)
+               -> (stream :TextInputEventStream);
 
-    # -- Audit-7: Input modality support --
+    # -- Modalities --
 
-    # Enumerate available input modalities (keyboard, voice, handwriting, etc.).
-    listModalities  @17 () -> (modalities :List(InputModalityInfo));
+    listModalities @19 () -> (modalities :List(InputModalityInfo));
+    # One open method instead of one per modality: a backend that has no
+    # voice engine no longer needs a stub for a method it cannot answer, and
+    # a modality the schema has never heard of publishes its parameters
+    # through `parameters` with no new field.
+    getModalityInfo @20 (modality :Text) -> (info :ModalityInfo);
 
-    # Query voice input capabilities for the current IME.
-    getVoiceInfo    @18 () -> (info :VoiceInputInfo);
+    # -- Languages --
 
-    # Query handwriting recognition capabilities.
-    getHandwritingInfo @19 () -> (info :HandwritingInfo);
+    listLanguages @21 (pagination :T.Pagination)
+                   -> (languages :List(T.Language), total :UInt64);
 
-    # Query predictive input capabilities.
-    getPredictionInfo @20 () -> (info :PredictionInfo);
+    # -- Dictation (absorbed from textinput.capnp) --
 
-    # Audit-10: per-context modality override for switchInputMethod.
-    switchInputMethodForContext @21 (ctx :T.ImeContextId, id :T.InputMethodId, overrideModality :InputModality) -> (result :T.VoidResult);
+    startDictation  @22 (id :T.ImeContextId, request :DictationRequest)
+                     -> (result :DictationResult);
+    commitDictation @23 (session :DictationSession) -> (result :T.VoidResult);
+    cancelDictation @24 (session :DictationSession) -> (result :T.VoidResult);
+
+    # -- Handwriting (absorbed from textinput.capnp) --
+
+    submitStroke     @25 (id :T.ImeContextId, stroke :Stroke)
+                     -> (result :RecognitionResult);
+    recognizeGesture @26 (id :T.ImeContextId, strokes :List(Stroke))
+                     -> (result :RecognitionResult);
+
+    # -- Predictive text (absorbed from textinput.capnp) --
+
+    getSuggestions @27 (id :T.ImeContextId, pagination :T.Pagination)
+                    -> (suggestions :List(TextSuggestion), total :UInt64);
+    addUserWord    @28 (word :Text) -> (result :T.VoidResult);
+    removeUserWord @29 (word :Text) -> (result :T.VoidResult);
+
+    # -- Interactive input during composition (absorbed from textinput.capnp) --
+
+    requestInput @30 (id :T.ImeContextId, request :ImeInputRequest)
+                  -> (handle :ImeInputHandle);
+    respondInput @31 (handle :ImeInputHandle, response :ImeInputResponse)
+                 -> (result :T.VoidResult);
+    cancelInput  @32 (handle :ImeInputHandle) -> (result :T.VoidResult);
 }
 
 # ── Context ───────────────────────────────────────────────────
 
+struct ContextResult {
+    union {
+        context @0 :T.ImeContextId;
+        error   @1 :T.Error;
+        unknown @2 :Void;
+    }
+}
+
 struct ContextRequest {
-    contentType    @0 :ContentType;
-    purpose        @1 :TextPurpose;
-    multiline      @2 :Bool;
-    maxLength      @3 :UInt32;
-    surrounding    @4 :Text;
-    cursorPosition @5 :UInt32;
-    metadata       @6 :List(T.Meta);
+    # Open tokens: today's spellings are published as conformance constants
+    # at the end of this file; an unrecognised one is ignored, not rejected.
+    contentType @0 :Text;
+    purpose     @1 :Text;
+    multiline   @2 :Bool;
+    maxLength   @3 :UInt32;
+    surrounding @4 :SurroundingText;
+    metadata    @5 :List(T.Meta);
 }
 
 struct ContextUpdate {
     union {
         surrounding @0 :SurroundingText;
-        contentType @1 :ContentType;
-        purpose     @2 :TextPurpose;
+        contentType @1 :Text;
+        purpose     @2 :Text;
+        custom      @3 :T.StringMap;
+        unknown     @4 :Void;
     }
 }
 
@@ -120,50 +207,9 @@ struct SurroundingText {
     cursorPosition @1 :UInt32;
     selectStart    @2 :UInt32;
     selectEnd      @3 :UInt32;
-}
-
-enum ContentType {
-    plainText @0;
-    password  @1;
-    number    @2;
-    email     @3;
-    phone     @4;
-    url       @5;
-    search    @6;
-    date      @7;
-    time      @8;
-    dateTime  @9;
-    filename  @10;
-    custom    @11;
-    # Audit-7: additional content types for IME behavior.
-    code      @12;
-    math      @13;
-    emoji     @14;
-    markup    @15;
-    searchQuery @16;
-}
-
-enum TextPurpose {
-    normal   @0;
-    alpha    @1;
-    digits   @2;
-    number   @3;
-    phone    @4;
-    url      @5;
-    email    @6;
-    password @7;
-    terminal @8;
-    custom   @9;
-}
-
-enum KeyboardType {
-    systemDefault @0;
-    full     @1;
-    compact  @2;
-    numeric  @3;
-    phone    @4;
-    terminal @5;
-    custom   @6;
+    # Pagination for large surrounding-text contexts.
+    offset @4 :UInt64;
+    limit  @5 :UInt64;
 }
 
 # ── Input Method ──────────────────────────────────────────────
@@ -171,61 +217,102 @@ enum KeyboardType {
 struct InputMethodInfo {
     id        @0 :T.InputMethodId;
     name      @1 :Text;
-    languages @2 :List(Text);
-    active    @3 :Bool;
-    builtin   @4 :Bool;
-    # Audit-9: input modality for this method (keyboard, voice, etc.).
-    modality  @5 :InputModality;
+    icon      @2 :T.DataHandle;
+    languages @3 :List(T.Language);
+    active    @4 :Bool;
+    enabled   @5 :Bool;
+    builtin   @6 :Bool;
+    # Open token — see the conformance constants at the end of this file.
+    modality  @7 :Text;
 }
 
 struct InputMethodState {
-    active        @0 :Bool;
-    # The currently active input method. A zero-value ID (id == 0)
-    # means no method has been selected yet. When `active` is false,
-    # this field is irrelevant.
-    currentMethod @1 :T.InputMethodId;
+    active    @0 :Bool;
+    # Explicit, not a sentinel: a zero-value ID used to mean "no method",
+    # which collided with a legal ID 0.
+    currentMethod @1 :CurrentMethod;
     composing     @2 :Bool;
     preeditText   @3 :Text;
     preeditCursor @4 :UInt32;
+    languageStack @5 :List(T.Language);
+    activeLanguage @6 :T.Language;
+}
+
+struct CurrentMethod {
+    union {
+        none    @0 :Void;
+        method  @1 :T.InputMethodId;
+        unknown @2 :Void;
+    }
+}
+
+# ── Modalities ────────────────────────────────────────────────
+
+struct InputModalityInfo {
+    modality    @0 :Text;
+    name        @1 :Text;
+    languages   @2 :List(T.Language);
+    available   @3 :Bool;
+    capabilities @4 :List(Text);
+}
+
+# One open descriptor replaces the per-modality info museum (voice,
+# handwriting, prediction, spatial keyboard each had their own struct and
+# their own method). Everything a modality needs to declare is an open key,
+# so a modality invented tomorrow needs no ordinal.
+struct ModalityInfo {
+    modality    @0 :Text;
+    name        @1 :Text;
+    languages   @2 :List(T.Language);
+    available   @3 :Bool;
+    capabilities @4 :List(Text);
+    parameters  @5 :T.StringMap;
 }
 
 # ── Events ────────────────────────────────────────────────────
 
 interface TextInputEventStream {
-    next   @0 () -> (event :TextInputEvent);
+    pull   @0 (maxEvents :UInt32) -> (events :List(TextInputEvent));
     cancel @1 () -> T.VoidResult;
 }
 
 struct TextInputEventFilter {
     contextIds @0 :List(T.ImeContextId);
+    # `other` is a filterable kind, so a consumer can ask for "every event
+    # kind this schema was frozen before".
     kinds      @1 :List(TextInputEventKind);
 }
 
 enum TextInputEventKind {
     commit                @0;
     preedit               @1;
-    key                   @2;
+    keyEvent              @2;
     inputMethodChanged    @3;
     virtualKeyboardShown  @4;
     virtualKeyboardHidden @5;
-    custom                @6;
+    voiceInput            @6;
+    handwriting           @7;
+    neuralInput           @8;
+    prediction            @9;
+    spatialKey            @10;
+    other                 @11;
+    custom                @12;
 }
 
 struct TextInputEvent {
     union {
         commit               @0 :CommitEvent;
         preedit              @1 :PreeditEvent;
-        keyEvent             @2 :KeyEvent;
+        keyEvent             @2 :ImeKeyEvent;
         inputMethodChanged   @3 :InputMethodInfo;
-        virtualKeyboardShown @4 :KeyboardType;
+        virtualKeyboardShown @4 :Text;
         virtualKeyboardHidden @5 :Void;
-        # Audit-9: voice input event (from VoiceInputEvent).
         voiceInput           @6 :VoiceInputEvent;
-        # Audit-9: handwriting recognition event.
         handwriting          @7 :HandwritingEvent;
-        # Audit-9: neural (BCI) input event.
         neuralInput          @8 :NeuralInputEvent;
-        custom               @9 :UnknownTextInputEvent;
+        prediction           @9 :PredictionEvent;
+        spatialKey           @10 :SpatialKeyEvent;
+        unknown              @11 :T.UnknownEvent;
     }
 }
 
@@ -242,232 +329,191 @@ struct PreeditEvent {
     selectEnd      @4 :UInt32;
 }
 
-struct KeyEvent {
+struct ImeKeyEvent {
+    # The logical key. `name` is an open token; neither it nor `codepoint`
+    # asserts a keyboard layout or a key-numbering scheme.
     key       @0 :Text;
     codepoint @1 :UInt32;
-    action    @2 :KeyAction;
+    transition @2 :C.KeyTransition;
     modifiers @3 :T.ModifierState;
+    metadata @4 :T.StringMap;
 }
 
-enum KeyAction {
-    pressed  @0;
-    released @1;
-    custom   @2;
-}
-
-struct UnknownTextInputEvent {
-    typeId  @0 :UInt64;
-    payload @1 :Data;
-}
-
-# ═══════════════════════════════════════════════════════════════════════
-# Audit-7: Extended input modality support for IME
-#
-# Voice input, handwriting recognition, predictive input, AR/spatial
-# keyboard, and brain-computer interface. These structs describe
-# capabilities for each input modality beyond keyboard.
-# ═══════════════════════════════════════════════════════════════════════
-
-# ── Input Modality ────────────────────────────────────────────
-
-enum InputModality {
-    keyboard @0;
-    voice @1;
-    handwriting @2;
-    gesture @3;
-    neural @4;            # Brain-computer interface
-    spatial @5;           # AR/spatial keyboard
-    hybrid @6;            # Combination of modalities
-    custom @7;
-}
-
-struct InputModalityInfo {
-    modality @0 :InputModality;
-    name @1 :Text;
-    # Languages supported by this modality.
-    languages @2 :List(Text);
-    # Whether this modality is currently available.
-    available @3 :Bool;
-    # Capabilities of this modality.
-    capabilities @4 :List(IMECapability);
-}
-
-# ── Voice Input ───────────────────────────────────────────────
-
-struct VoiceInputInfo {
-    # BCP 47 language tag for voice recognition.
-    language @0 :Text;
-    # Whether continuous dictation is supported.
-    continuous @1 :Bool;
-    # Whether offline recognition is available.
-    offline @2 :Bool;
-    # Optional wake word that activates listening.
-    wakeWord @3 :Text;
-    noiseSuppression @4 :Bool;
-    autoPunctuation @5 :Bool;
-    # Maximum recording duration before auto-commit.
-    maxDuration @6 :T.Duration;
-}
+# ── Voice, handwriting, neural, prediction, spatial ───────────
 
 struct VoiceInputEvent {
-    state @0 :VoiceInputState;
-    # Recognized text (empty for partial results).
-    text @1 :Text;
-    # Recognition confidence (0.0-1.0).
-    confidence @2 :Float32;
-    # Whether this is a partial (interim) result.
-    partial @3 :Bool;
-    # Alternative recognitions ranked by confidence.
+    state        @0 :Text;
+    text         @1 :Text;
+    confidence   @2 :Float32;
+    partial      @3 :Bool;
     alternatives @4 :List(Text);
 }
 
-enum VoiceInputState {
-    idle @0;
-    listening @1;
-    processing @2;
-    error @3;
-    custom @4;
-}
-
-# ── Handwriting Recognition ───────────────────────────────────
-
-struct HandwritingInfo {
-    # Languages supported for handwriting recognition.
-    languages @0 :List(Text);
-    # Whether multi-stroke recognition is supported.
-    strokes @1 :Bool;
-    # Whether continuous handwriting (sentence-level) is supported.
-    continuous @2 :Bool;
-    # Whether gesture shortcuts (delete, space) are recognized.
-    gestures @3 :Bool;
-    recognition @4 :HandwritingRecognition;
-}
-
-enum HandwritingRecognition {
-    online @0;          # Real-time stroke recognition
-    offline @1;         # Image-based recognition
-    hybrid @2;          # Both online and offline
-    custom @3;
-}
-
 struct HandwritingEvent {
-    strokes @0 :List(Stroke);
-    recognized @1 :Text;
+    strokes      @0 :List(Stroke);
+    recognized   @1 :Text;
     alternatives @2 :List(Text);
-    confidence @3 :Float32;
+    confidence   @3 :Float32;
 }
 
-struct Stroke {
-    points @0 :List(T.Vec2);
-    pressure @1 :List(Float32);
-    timestamp @2 :T.Timestamp;
-}
-
-# ── Predictive Input / AI Suggestions ─────────────────────────
-
-struct PredictionInfo {
-    # Model name or version identifier.
-    model @0 :Text;
-    # Whether inference runs on-device.
-    offline @1 :Bool;
-    # Whether the model personalizes from user input.
-    personalization @2 :Bool;
-    # Number of words of context used for prediction.
-    contextWindow @3 :UInt32;
-    maxSuggestions @4 :UInt32;
+struct NeuralInputEvent {
+    command    @0 :Text;
+    confidence @1 :Float32;
+    timestamp  @2 :T.Timestamp;
 }
 
 struct PredictionEvent {
     suggestions @0 :List(Text);
     completions @1 :List(Text);
     corrections @2 :List(Text);
-    emojis @3 :List(Text);
-    timestamp @4 :T.Timestamp;
-}
-
-# ── AR/Spatial Keyboard ───────────────────────────────────────
-
-struct SpatialKeyboardInfo {
-    tracking @0 :SpatialTracking;
-    handedness @1 :Handedness;
-    # Relative key size multiplier (1.0 = default).
-    keySize @2 :Float32;
-    feedback @3 :SpatialFeedback;
-}
-
-enum SpatialTracking {
-    hand @0;            # Hand tracking
-    eye @1;             # Eye tracking
-    head @2;            # Head tracking
-    hybrid @3;          # Combination
-    custom @4;
-}
-
-enum Handedness {
-    left @0;
-    right @1;
-    both @2;
-    custom @3;
-}
-
-enum SpatialFeedback {
-    visual @0;
-    haptic @1;
-    audio @2;
-    none @3;
-    custom @4;
+    emojis      @3 :List(Text);
+    timestamp   @4 :T.Timestamp;
 }
 
 struct SpatialKeyEvent {
-    # Finger position in 3D space.
-    finger @0 :T.Vec3;
-    # Detected key character or label.
-    key @1 :Text;
+    finger     @0 :T.Vec3;
+    key        @1 :Text;
     confidence @2 :Float32;
-    timestamp @3 :T.Timestamp;
+    timestamp  @3 :T.Timestamp;
 }
 
-# ── Brain-Computer Interface ──────────────────────────────────
-
-struct NeuralInputInfo {
-    type @0 :NeuralInputType;
-    # Number of EEG/EMG channels.
-    channels @1 :UInt32;
-    # Sampling rate in Hz.
-    samplingRate @2 :UInt32;
-    # ADC resolution in bits.
-    resolution @3 :UInt32;
-    latency @4 :T.Duration;
+# A stroke's point and pressure arrays travel as BUFFER REFERENCES. A stylus
+# generates hundreds of points per second; an inline list is a copy per
+# stroke, forever. Both arrays are `pointCount` entries long, so the payload
+# is decodable without any side channel.
+struct Stroke {
+    points     @0 :T.DataHandle;
+    pressure   @1 :T.DataHandle;
+    pointCount @2 :UInt32;
+    timestamp  @3 :T.Timestamp;
 }
 
-enum NeuralInputType {
-    eeg @0;             # Electroencephalography
-    emg @1;             # Electromyography
-    fnirs @2;           # Functional near-infrared spectroscopy
-    custom @3;
+struct DictationRequest {
+    language          @0 :Text;
+    offline           @1 :Bool;
+    noiseSuppression  @2 :Bool;
+    maxDuration       @3 :T.Duration;
+    metadata @4 :T.StringMap;
 }
 
-struct NeuralInputEvent {
-    # Decoded command string from neural signal processing.
-    command @0 :Text;
-    confidence @1 :Float32;
-    timestamp @2 :T.Timestamp;
+struct DictationSession {
+    sessionId @0 :UInt64;
+    contextId @1 :T.ImeContextId;
+    state     @2 :Text;
+    metadata @3 :T.StringMap;
 }
 
-# ── IME Capability Enumeration ────────────────────────────────
-
-# Typed capability flags for IME input methods.
-enum IMECapability {
-    keyboard @0;
-    voice @1;
-    handwriting @2;
-    gesture @3;
-    neural @4;
-    spatial @5;
-    prediction @6;
-    completion @7;
-    correction @8;
-    emoji @9;
-    other @10;
-    custom @11;
+struct DictationResult {
+    union {
+        session @0 :DictationSession;
+        error   @1 :T.Error;
+        unknown @2 :Void;
+    }
 }
+
+struct RecognitionResult {
+    text         @0 :Text;
+    alternatives @1 :List(Text);
+    confidence   @2 :Float32;
+    metadata @3 :T.StringMap;
+}
+
+struct TextSuggestion {
+    text  @0 :Text;
+    score @1 :Float32;
+    source @2 :Text;
+    metadata @3 :T.StringMap;
+}
+
+# ── Interactive input during composition ──────────────────────
+
+struct ImeInputRequest {
+    type     @0 :Text;
+    message  @1 :Text;
+    required @2 :Bool;
+    timeout  @3 :T.Duration;
+    metadata @4 :T.StringMap;
+}
+
+struct ImeInputHandle {
+    id        @0 :UInt64;
+    contextId @1 :T.ImeContextId;
+}
+
+struct ImeInputResponse {
+    union {
+        text       @0 :Text;
+        confirmed  @1 :Bool;
+        cancelled  @2 :Void;
+        custom     @3 :T.StringMap;
+        unknown    @4 :Void;
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Published so today's tools have a discoverable spelling. They are Text and
+# deliberately NOT enums: an enum here would be an eternal commitment to
+# today's list of input modalities, content types and keyboard layouts.
+# An unrecognised value MUST be ignored, never rejected.
+# ══════════════════════════════════════════════════════════════════════
+
+const modalityKeyboard    :Text = "keyboard";
+const modalityVoice       :Text = "voice";
+const modalityHandwriting :Text = "handwriting";
+const modalityGesture     :Text = "gesture";
+const modalityNeural      :Text = "neural";
+const modalitySpatial     :Text = "spatial";
+const modalityHybrid      :Text = "hybrid";
+
+const contentPlainText :Text = "plainText";
+const contentPassword  :Text = "password";
+const contentNumber    :Text = "number";
+const contentEmail     :Text = "email";
+const contentPhone     :Text = "phone";
+const contentUrl       :Text = "url";
+const contentSearch    :Text = "search";
+const contentDate      :Text = "date";
+const contentTime      :Text = "time";
+const contentDateTime  :Text = "dateTime";
+const contentFilename  :Text = "filename";
+const contentCode      :Text = "code";
+const contentMath      :Text = "math";
+const contentEmoji     :Text = "emoji";
+const contentMarkup    :Text = "markup";
+
+const purposeNormal      :Text = "normal";
+const purposeAlpha       :Text = "alpha";
+const purposeDigits      :Text = "digits";
+const purposeNumber      :Text = "number";
+const purposePhone       :Text = "phone";
+const purposeUrl         :Text = "url";
+const purposeEmail       :Text = "email";
+const purposePassword    :Text = "password";
+const purposeTerminal    :Text = "terminal";
+const purposeTitle       :Text = "title";
+const purposeLabel       :Text = "label";
+const purposeDescription :Text = "description";
+
+const keyboardSystemDefault :Text = "systemDefault";
+const keyboardFull          :Text = "full";
+const keyboardCompact       :Text = "compact";
+const keyboardNumeric       :Text = "numeric";
+const keyboardSplit         :Text = "split";
+const keyboardProjected     :Text = "projected";
+
+const encodingUtf8  :Text = "utf8";
+const encodingUtf16 :Text = "utf16";
+const encodingUtf32 :Text = "utf32";
+
+const inputText     :Text = "text";
+const inputPassword :Text = "password";
+const inputConfirm  :Text = "confirm";
+const inputChoice   :Text = "choice";
+const inputPath     :Text = "path";
+const inputNumber   :Text = "number";
+
+const suggestionModel  :Text = "model";
+const suggestionUser   :Text = "user";
+const suggestionHistory :Text = "history";

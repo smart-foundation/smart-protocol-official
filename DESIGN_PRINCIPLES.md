@@ -1,6 +1,8 @@
 # smart-protocol Design Principles
 
 > Version 1.0 · Established 2026-07-01
+> Amended 2026-10-10 — pre-release carve-out for schema evolution, the
+> authority-reference precedent, and the validator's tree-wide gate (E1–E14).
 > Purpose: Governs all schema design, evolution, and review for smart-protocol.
 
 ---
@@ -175,7 +177,7 @@ Before adding anything to smart-protocol, answer these:
 | Type | Current Form | Issue | Fix |
 |------|-------------|-------|-----|
 | **FilePermissions** | `struct { owner @0 :UInt8; group @1 :UInt8; other @2 :UInt8; }` | POSIX-specific. Capability-based systems don't have owner/group/other. | Replace with `Data` (opaque capability tokens) or a `List(Permission)` enum (read, write, execute, administer). |
-| **ProcessState** | `enum { running, sleeping, waiting, stopped, zombie, defunct }` | POSIX-specific. A capability-based kernel has no "zombie" state. An actor system has no "sleeping" state. | Keep the enum but rename states to be universal: `active`, `blocked`, `suspended`, `terminated`. Remove POSIX-isms. |
+| **ProcessState** | `enum { running, sleeping, waiting, stopped, zombie, defunct }` | POSIX-specific. A capability-based kernel has no "zombie" state. An actor system has no "sleeping" state. | Keep the enum but rename states to be universal: `active`, `blocked`, `suspended`, `terminated`. Remove POSIX-isms. **DONE 2026-10-10:** one canonical `T.ExecutionState` in types.capnp, shared by kernel.capnp, process.capnp and the lifecycle schemas. |
 | **UserInfo.id** | `@0 :UInt32` | Too small for distributed systems. Unix uid is 32-bit. | Use `UInt64` or opaque type. |
 | **DiskUsage** | `struct { total, used, free, percentUsed, mountPoint, filesystem }` | `mountPoint` and `filesystem` are implementation details. | Keep total/used/free. Move mountPoint/filesystem to a separate `MountInfo` query. |
 | **LogSource** | `struct { file, line, function }` | Implementation-specific (assumes compiled languages). | Make opaque: `source @0 :Data` (backend-decided format). |
@@ -264,6 +266,49 @@ BufferId                                          AudioFormat
 
 ## 4. Schema Template
 
+### The gate: scripts/validate.py
+
+Every rule in this document that can be checked mechanically is checked, and the
+check is the gate. `scripts/validate.py` parses the schemas with a real parser
+(it strips comments first, so a phrase in prose is not a violation) and enforces:
+
+| Rule | What it enforces |
+|------|------------------|
+| E1 | `ai.capnp` declares zero enums. |
+| E2 | `ai.capnp` has no bulk lists — payload is `T.DataHandle`. |
+| E3 | `Capability` appears only on `interface AI` accessors. |
+| E4 | Every interface is reachable. |
+| E5 | Every stream's `pull` returns a structural terminator. |
+| E6 | Every union has an `unknown`/`custom` variant, EXCEPT a union whose non-success arm is `T.Error` — the error model this document defines below is itself the extension point, so a further arm would be noise. The three terminal result unions are named. |
+| E7 | Every struct has an open extension point (value structs exempt). |
+| E8 | Every enum's `@0` is a neutral sentinel (not applied where a default is harmless — see audit-verification O4). |
+| E9 | No platform, vendor or POSIX noun in a required position (R5). |
+| E10 | No bulk payload outside `T.DataHandle` (R2). |
+| E11 | Authority is the reference — no per-method token, no authority-by-string (R3). |
+| E12 | One canonical home per type name (R6). |
+| E13 | Interface method ordinals are sequential and declared in order. |
+| E14 | Every interface is reachable and no declared type is unreferenced (R8). |
+
+E1–E5 are ERROR for `ai.capnp` and REPORT elsewhere; E6–E14 are REPORT for the
+other schemas, so the tree stays green while other waves land. The target is zero
+in every rule, for every schema. A schema that adds a finding must justify it in
+its own header.
+
+Two rule E5/E7 scoping decisions are doctrine, not oversight: event subscriptions
+are terminated by `cancel` (a terminator field would contradict the protocol's own
+subscription convention), and value structs — `AckHandle`, `TimeBox`, `Rect`,
+`Timestamp` — are complete by construction, so forcing an extension point onto
+them would bloat every message for no gain.
+
+Two further scoping decisions, both doctrine: **reachability (E14)** counts an
+interface taken as a *parameter* as reachable — a provider-registered callback
+(`registerAuthMethod(handler :AuthHandler)`) is reachable because the caller
+supplies an implementation and the peer calls it; and **one canonical home (E12)**
+is satisfied by ELIMINATION, not by exemption — the 2026-10-10 integration pass
+resolved every same-name-different-file type by giving one side the canonical
+name and having the other side import it (or, where the two shapes were
+materially different, by disambiguating both names), so the rule has zero
+findings with no sanctioned-exception list to maintain.
 ### Canonical Schema Structure
 
 Every smart-protocol schema should follow this structure:
@@ -333,13 +378,17 @@ interface <ServiceName> {
 
 1. **Ordinal stability:** Once a method is published, its ordinal number is permanent. Never reuse or reorder ordinals.
 
+   **PRE-RELEASE CARVE-OUT (added 2026-10-10).** "Published" means released to someone outside this repository. Nothing external consumes these schemas yet, so no ordinal is yet a promise: until the first external release, ordinals, types and interfaces may be renumbered, reordered and deleted outright, and DELETE is preferred over deprecate-and-keep. The revamp exercised this across the foundation/kernel batch. From first release onward, rules 1–4 bind in full, and breaking a published schema requires a new schema ID.
+
 2. **Additive changes:** New methods, new types, new enum variants, new fields in structs → increment **minor** version.
 
 3. **Breaking changes:** Removing methods, changing signatures, changing field types → increment **major** version (requires new schema ID).
 
-4. **Deprecation:** Mark old methods with a comment `# Deprecated: use newMethod instead. Ordinal preserved for wire compatibility.` Never delete them.
+4. **Deprecation:** Mark old methods with a comment `# Deprecated: use newMethod instead. Ordinal preserved for wire compatibility.` Never delete them. (Pre-release: delete — see the carve-out. A deprecated variant that survives this wave becomes the next schema's example.)
 
 5. **Forward compatibility:** Every union type should have a `unknown` or `custom` variant with opaque `Data` payload. This allows backends to extend without breaking consumers.
+
+   Scoped: the terminator binds EVENT and SPECIFICATION unions, where a producer must forward a kind it did not foresee. `T.VoidResult`/`T.BoolResult` (their non-success arm is `T.Error`) and `T.DataHandle` (closed by construction) are exempt.
 
    ```capnp
    struct CompositorEvent {
@@ -392,9 +441,26 @@ interface MyService {
 - Capability verification is a backend concern; the protocol only specifies the contract.
 
 **Why not a per-method parameter?** It duplicates authority the reference already carries,
-leaving two authority paths that must agree forever. The older per-method rule was never
-implemented — 5 methods repo-wide, all inside `capability.capnp` itself. `schema/ai.capnp`
-implements the reference model (validator rule E3).
+leaving two authority paths that must agree forever. `schema/ai.capnp`
+implements the reference model (validator rule E3), and it is the precedent that
+governs every service method in the protocol.
+
+**The precedent, stated precisely (this paragraph supersedes the older "the per-method
+`Capability` pattern survives" reading of this section):** a `Capability` parameter is
+legal in exactly two places —
+
+1. on a root accessor that RETURNS a service, where taking the capability is how the
+   caller is granted the reference (`AI.models @2 (authority :Capability) ->
+   (service :ModelService)`); and
+2. inside `capability.capnp` itself, on the five methods that act ON the capability the
+   parameter names (`attenuate @2`, `transfer @3`, `revoke @4`, `revokeControlled @8`,
+   `evaluateCondition @11`). There the parameter is the object under manipulation, not an
+   authority token.
+
+Everywhere else a per-method authority parameter is a second authority path and is a
+defect. The revamp deleted all of them: free-text `authority` headers, `requiredCaps :
+List(Text)`, role strings, ACLs, per-command capability parameters and permission
+enums. `scripts/validate.py` rule E11 enforces the two-Place shape tree-wide.
 
 **Do NOT** define permission strings, boolean flags, or role-based access control in the protocol. The capability system IS the access control mechanism.
 
@@ -448,7 +514,7 @@ For each design principle, validate by swapping component implementations. If th
 
 | Swap | Protocol Still Works? | Evidence |
 |------|----------------------|----------|
-| **Linux kernel → seL4 microkernel** | ✅ Yes | `kernel.capnp` defines spawn, signal, memory regions. seL4 has capabilities natively but can expose the same interface. `TaskState` (newBorn, ready, running, waiting, stopped, terminated, zombie) maps to seL4's thread states. Memory regions map to seL4's untyped memory. |
+| **Linux kernel → seL4 microkernel** | ✅ Yes *(corrected 2026-10-10)* | `kernel.capnp` defines spawn, signal, memory regions, and seL4 has capabilities natively but exposes the same interface. The earlier claim that `TaskState` (newBorn, ready, running, waiting, stopped, terminated, zombie) "maps to seL4's thread states" was FALSE — seL4 has no zombie state, which is why the schema carried it: the enum was POSIX vocabulary. The canonical `T.ExecutionState` (active/blocked/suspended/terminated) is the set that actually swaps. Memory regions map to seL4's untyped memory. |
 | **PipeWire → custom Rust audio server** | ✅ Yes | `audio.capnp` defines devices, streams, volume. A custom server exposes the same concepts. PipeWire's graph model is internal; the protocol sees endpoints and streams. |
 | **ext4 → distributed filesystem (Ceph, GlusterFS)** | ✅ Yes | `files.capnp` defines open/read/write/stat. The filesystem type is opaque in `DiskUsage.filesystem`. Inodes are implementation-specific. The protocol sees paths and content. |
 | **X11 → Wayland → custom compositor** | ✅ Yes | `compositor.capnp` defines surfaces, commits, input events. The backend's display protocol (X11, Wayland, custom) is internal. The Session interface is the contract. |
@@ -500,26 +566,27 @@ For each design principle, validate by swapping component implementations. If th
 | Schema | Why |
 |--------|-----|
 | `capability.capnp` | Opaque id, textual targets, backend-agnostic operations. Perfect. |
-| `boot.capnp` | Stage-transitioning artifacts, no implementation assumptions. |
-| `kernel.capnp` | Documents what apps observe, explicitly notes internal machinery is excluded. |
+| `boot.capnp` | *(Amended 2026-10-10)* The pre-revamp body was the tree's largest collection of frozen technology — 24 hardware enums, ACPI/SMBIOS/DMI/UART structs, an `hhdmOffset` and a raw handler table. It has been rewritten to a trivial loader contract: one well-known pointer, a declarative manifest, open tokens. Exemplary again, and this time it is true. |
+| `kernel.capnp` | *(Amended 2026-10-10)* The body contradicted its own header: scheduler introspection, CLONE_* fork flags, live kernel swapping, six unreachable interfaces. All deleted. The header's claim now matches the file. |
 | `init.capnp` | Observable lifecycle, no dependency resolution algorithm specified. |
 | `tunnel.capnp` | Universal channel, transport-agnostic. |
 | `manifest.capnp` | Self-description, timeless. |
-| `abi.capnp` | Versioning and compatibility negotiation. |
-| `hal.capnp` | Describes affordances, not implementations. |
+| `abi.capnp` | Versioning and compatibility negotiation. *(Amended 2026-10-10)* The registry/endorsement apparatus and the duplicate `BootCapability` enum are deleted; the negotiation core remains and was always the model. |
+| `hal.capnp` | Describes affordances, not implementations. *(Amended 2026-10-10)* The page-table/x86-port-I/O block, the POSIX fd, the duplicate primitives and the three IRQ paths are gone. |
 | `device.capnp` | Backend-decided device tree. |
 | `database.capnp` | Clean key-value contract, no storage engine assumptions. |
+| `logging.capnp` | *(Amended 2026-10-10)* The canonical log contract. The 2026-07-01 release-blocker (`LogFormat`, `LogOutput`, structured `LogSource`) is executed; the observability-platform layer is deleted. |
 
 ### Schemas That Need Fixes
 
 | Schema | Issue | Priority |
 |--------|-------|----------|
-| `logging.capnp` | Over-specifies format and output targets | 🔴 High |
+| `logging.capnp` | Over-specifies format and output targets | 🔴 High — **DONE 2026-10-10:** `LogFormat`/`LogOutput` deleted, `LogSource` opaque. |
 | `files.capnp` | POSIX-specific permissions and metadata | 🔴 High |
 | `textinput.capnp` | Duplicates `ime.capnp` | 🔴 High |
 | `filesystem.capnp` | Duplicates `files.capnp` | 🔴 High |
 | `surface.capnp` | Duplicates compositor surface management | 🔴 High |
-| `process.capnp` | POSIX-specific process states | 🟡 Medium |
+| `process.capnp` | POSIX-specific process states | 🟡 Medium — **DONE 2026-10-10** (see `T.ExecutionState`). |
 | `session.capnp` | Unix-specific UserInfo | 🟢 Low |
 | `windowmanager.capnp` | Window.pid uses UInt32 | 🟡 Medium |
 
@@ -546,7 +613,7 @@ For each design principle, validate by swapping component implementations. If th
 | `speech.capnp` | Clean contract. |
 | `web.capnp` | Clean contract. Missing DNS resolution is a gap. |
 | `app.capnp` | Clean contract. |
-| `system.capnp` | Clean contract. Capabilities bitmap is extensible. |
+| `system.capnp` | *(Amended 2026-10-10)* Clean contract. The "capabilities bitmap is extensible" claim was wrong: it was 47 fixed booleans naming today's schema catalog, already missing `ai`, `tunnel` and `sandbox`. It is now an open token set. |
 | `manifest.capnp` | Clean contract. |
 | `abi.capnp` | Clean contract. |
 | `tunnel.capnp` | Clean contract. |
@@ -562,9 +629,9 @@ For each design principle, validate by swapping component implementations. If th
 1. **Deprecate `textinput.capnp`** — consolidate into `ime.capnp`.
 2. **Deprecate `filesystem.capnp`** — merge mount/unmount into `files.capnp`.
 3. **Deprecate `surface.capnp`** — merge into compositor Session.
-4. **Fix `logging.capnp`** — remove `LogFormat` and `LogOutput` enums, make `LogSource` opaque.
+4. **Fix `logging.capnp`** — remove `LogFormat` and `LogOutput` enums, make `LogSource` opaque. **DONE 2026-10-10.**
 5. **Fix `files.capnp` `FilePermissions`** — replace POSIX model with universal permissions.
-6. **Fix `process.capnp` `ProcessState`** — rename to universal states.
+6. **Fix `process.capnp` `ProcessState`** — rename to universal states. **DONE 2026-10-10.**
 
 ### Short-term (Before v1.1)
 

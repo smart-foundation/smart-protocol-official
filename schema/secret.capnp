@@ -1,55 +1,112 @@
 @0xa1b2c3d4e5f60028;
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
 
 # ══════════════════════════════════════════════════════════════════════
 # Secret — secret/credential storage with namespace isolation.
 #
-# Improvements beyond the original schema:
-#   - listSecrets now uses T.Pagination for bounded results.
-#   - ChangesSubscription has cancel method.
-#   - SecretChangeType has custom variant for forward compatibility.
-#   - SecretEntry timestamps use T.Timestamp (already correct).
-#   - namespace uses T.SecretNamespaceId (audit-3, replaces bare Text).
-#   - key uses T.SecretKeyId (audit-3, replaces bare Text).
-#   - ChangesSubscription.pull accepts T.Pagination (audit-4).
+# ── THE WHOLE SURFACE WAS UNGATED ─────────────────────────────────────
+#
+# The previous version exposed every operation to any holder of the
+# reference: `getSecret` returned any secret's value, `injectSecret`
+# wrote a secret into an arbitrary process, `splitSecret`/
+# `reconstructSecret` reconstructed any secret from shards,
+# `clearNamespace` wiped a namespace, and `syncExport`-grade bulk export
+# was a free-text device string away. A compromised reference was total
+# compromise, and there was no attenuation or revocation path available
+# through this schema at all.
+#
+# The surface is now obtained once, through an accessor that takes a
+# Capability whose `target` names the namespace it governs. Holding the
+# returned reference IS the authority over that namespace; no method
+# below takes an authority token. That is the ai.capnp pattern, and it is
+# what makes attenuation and revocation (capability.capnp's `attenuate`,
+# `revoke`, `revokeControlled`) actually reachable for secrets.
+#
+# Template discovery stays ungated: a template describes the SHAPE of a
+# secret, never its value, and a caller must be able to learn what a
+# secret store expects before it holds any authority.
+#
+# ── ONE CRYPTO CONTRACT ───────────────────────────────────────────────
+#
+# This file carried its own KDF (`deriveKey` + a `DeriveKeyRequest` with
+# the same name and different fields as crypto.capnp's), its own key
+# wrapping (`wrapSecret`/`unwrapSecret`) and its own constant-time
+# comparison (`compareSecrets`) — three duplicates of crypto.capnp, with
+# two different parameter sets and two different algorithm types. A
+# backend therefore had to implement KDF and wrapping twice, and two
+# backends could derive different keys from the same inputs. All three
+# now delegate to crypto.capnp, which is the canonical crypto vocabulary
+# home and whose open tokens this file's algorithms share.
+#
+# ── VALUES ARE HANDLES ────────────────────────────────────────────────
+#
+# Every secret value path was inline `Data`, so a private key, a
+# certificate bundle, a provisioning token or an exported vault was
+# copied on every read — and `SecretOverlay.overrides` carried secret
+# VALUES in a T.StringMap, i.e. as greppable Text, trivially logged by
+# any debugging path that dumps a map. Values are T.DataHandle now,
+# which keeps small secrets inline and only large ones in a buffer.
 # ══════════════════════════════════════════════════════════════════════
 
+# ── Root: ungated discovery, gated store ──────────────────────────────
+
 interface Secret {
+    # Gated once, at acquisition. `target` names the namespace (or the
+    # whole store); `operations` narrows what the holder may do.
+    store @0 (authority :Capability) -> (service :SecretStore);
+
+    # Ungated: what shapes this store can hold. A template is metadata
+    # about a secret's structure, never the secret.
+    listSecretTemplates @1 () -> (templates :List(SecretTemplate));
+}
+
+interface SecretStore {
     listSecrets @0 (namespace :T.SecretNamespaceId, pagination :T.Pagination)
                 -> (secrets :List(SecretEntry), total :UInt32);
-    getSecret   @1 (key :T.SecretKeyId, namespace :T.SecretNamespaceId) -> (value :Data);
+    # T.DataHandle: small secrets stay inline, a key or certificate
+    # bundle becomes a buffer reference instead of a copy. The result is
+    # an outcome union so a missing key is distinguishable from an empty
+    # value — previously both were an empty Data field.
+    getSecret   @1 (key :T.SecretKeyId, namespace :T.SecretNamespaceId)
+                -> (result :SecretValueResult);
     hasSecret   @2 (key :T.SecretKeyId, namespace :T.SecretNamespaceId) -> (exists :Bool);
 
     # Batch existence check: verify multiple secrets exist without fetching values.
-    hasSecrets @7 (keys :List(T.SecretKeyId), namespace :T.SecretNamespaceId)
+    hasSecrets @3 (keys :List(T.SecretKeyId), namespace :T.SecretNamespaceId)
                -> (results :List(Bool));
 
-    setSecret      @3 (key :T.SecretKeyId, value :Data, namespace :T.SecretNamespaceId, metadata :T.StringMap)
+    setSecret      @4 (key :T.SecretKeyId, value :T.DataHandle, namespace :T.SecretNamespaceId, metadata :T.StringMap)
                    -> T.VoidResult;
-    deleteSecret   @4 (key :T.SecretKeyId, namespace :T.SecretNamespaceId) -> T.VoidResult;
-    clearNamespace @5 (namespace :T.SecretNamespaceId) -> T.VoidResult;
+    deleteSecret   @5 (key :T.SecretKeyId, namespace :T.SecretNamespaceId) -> T.VoidResult;
+    clearNamespace @6 (namespace :T.SecretNamespaceId) -> T.VoidResult;
 
-    subscribeChanges @6 (namespace :T.SecretNamespaceId) -> (subscription :ChangesSubscription);
+    subscribeChanges @7 (namespace :T.SecretNamespaceId) -> (subscription :SecretChangeSubscription);
 
-    # Audit-8: Get secret version history.
-    getVersions @8 (key :T.SecretKeyId, namespace :T.SecretNamespaceId)
-        -> (versions :List(SecretVersion));
+    # Audit-8: Get secret version history. Paginated: the previous
+    # unbounded return put a 10 000-rotation history in one message.
+    getVersions @8 (key :T.SecretKeyId, namespace :T.SecretNamespaceId, pagination :T.Pagination)
+        -> (versions :List(SecretVersion), total :UInt32);
 
     # Audit-8: Get a specific secret version.
     getVersion @9 (key :T.SecretKeyId, namespace :T.SecretNamespaceId, version :UInt32)
-        -> (value :Data);
+        -> (result :SecretValueResult);
 
-    # Audit-8: Rollback to a previous secret version.
+    # Audit-8: Rollback to a previous secret version. Declared behaviour,
+    # because "roll back to a version of a different size/format" was
+    # undefined: the backend MUST refuse with T.Error(invalidArgument)
+    # when the target version's size or format differs from the current
+    # one, and MUST leave the current version intact when it refuses.
     rollbackVersion @10 (key :T.SecretKeyId, namespace :T.SecretNamespaceId, version :UInt32)
         -> T.VoidResult;
 
     # Audit-8: Get rotation policy for a secret.
     getRotationPolicy @11 (key :T.SecretKeyId, namespace :T.SecretNamespaceId)
-        -> (policy :RotationPolicy);
+        -> (policy :SecretRotationPolicy);
 
     # Audit-8: Set rotation policy for a secret.
-    setRotationPolicy @12 (key :T.SecretKeyId, namespace :T.SecretNamespaceId, policy :RotationPolicy)
+    setRotationPolicy @12 (key :T.SecretKeyId, namespace :T.SecretNamespaceId, policy :SecretRotationPolicy)
         -> T.VoidResult;
 
     # Audit-8: Apply secret overlay (environment-specific overrides).
@@ -64,58 +121,56 @@ interface Secret {
     exportAccessAudit @15 (namespace :T.SecretNamespaceId, format :Text)
         -> (data :T.DataHandle);
 
-    # Audit-8: Derive a key from a password using KDF.
-    deriveKey @16 (request :DeriveKeyRequest) -> (derivedKey :Data);
-
-    # Audit-8: Split a secret using Shamir's Secret Sharing.
-    splitSecret @17 (key :T.SecretKeyId, namespace :T.SecretNamespaceId,
+    # Audit-8: Split a secret using Shamir's Secret Sharing. The three
+    # failure modes of `reconstructSecret` (too few shards, shards from
+    # different secrets, wrong shards) were previously undefined; each
+    # is now a declared error rather than a per-backend guess.
+    splitSecret @16 (key :T.SecretKeyId, namespace :T.SecretNamespaceId,
         totalShards :UInt32, requiredShards :UInt32)
-        -> (shards :List(Data));
+        -> (shards :List(T.DataHandle));
 
     # Audit-8: Reconstruct a secret from shards.
-    reconstructSecret @18 (shards :List(Data)) -> (secret :Data);
+    reconstructSecret @17 (shards :List(T.DataHandle)) -> (result :SecretValueResult);
 
-    # Audit-8: Inject a secret into a process (env var or file).
-    injectSecret @19 (key :T.SecretKeyId, namespace :T.SecretNamespaceId,
+    # Audit-8: Inject a secret into a process. `method` is an open token
+    # describing what the backend did, NOT a mechanism name: the previous
+    # examples ("env", "file", "memfd") told implementers to expect
+    # Linux's memfd_create, and a backend with no memfd (a capability
+    # kernel, WASI, a BSD) had no declared alternative spelling.
+    #
+    # Declared lifetime: the injected copy is a SNAPSHOT taken at call
+    # time. It is not revoked when the secret is, and the caller cannot
+    # observe it afterwards. A backend that can revoke injected copies
+    # reports that capability in `custom`.
+    injectSecret @18 (key :T.SecretKeyId, namespace :T.SecretNamespaceId,
         injection :SecretInjection) -> T.VoidResult;
 
     # Audit-8: Get HSM backing status for a secret.
-    getHsmBacking @20 (key :T.SecretKeyId, namespace :T.SecretNamespaceId)
+    getHsmBacking @19 (key :T.SecretKeyId, namespace :T.SecretNamespaceId)
         -> (backing :HsmBacking);
 
-    # Audit-9: Secret Templates — structured secret schemas.
-
-    # List available secret templates.
-    listSecretTemplates @21 () -> (templates :List(SecretTemplate));
-
-    # Create a secret from a template (generates structured fields).
-    createFromTemplate @22 (templateId :Text, namespace :T.SecretNamespaceId, fields :T.StringMap)
+    # Audit-9: Create a secret from a template (generates structured fields).
+    createFromTemplate @20 (templateId :Text, namespace :T.SecretNamespaceId, fields :T.StringMap)
         -> (key :T.SecretKeyId);
 
-    # Audit-9: Secret Generation — generate random passwords/API keys/certificates.
-
-    # Generate a random secret from a template.
-    generateSecret @23 (request :SecretGenerateRequest) -> (value :Data, metadata :T.StringMap);
-
-    # Audit-9: Secret Comparison — constant-time comparison to prevent timing attacks.
-
-    # Constant-time comparison of two secret values.
-    compareSecrets @24 (secret1 :Data, secret2 :Data) -> (equal :Bool);
-
-    # Audit-9: Secret Wrapping — encrypt a secret with a wrapping key.
-
-    # Wrap (encrypt) a secret with a wrapping key.
-    wrapSecret @25 (key :T.SecretKeyId, namespace :T.SecretNamespaceId, wrappingKeyId :T.SecretKeyId)
-        -> (wrapped :Data);
-
-    # Unwrap (decrypt) a wrapped secret.
-    unwrapSecret @26 (wrapped :Data, wrappingKeyId :T.SecretKeyId, namespace :T.SecretNamespaceId)
-        -> (secret :Data);
+    # Audit-9: Generate a random secret from a template.
+    generateSecret @21 (request :SecretGenerateRequest) -> (value :T.DataHandle, metadata :T.StringMap);
 }
 
-interface ChangesSubscription {
+interface SecretChangeSubscription {
     pull   @0 (pagination :T.Pagination) -> (changes :List(SecretChange), total :UInt32);
     cancel @1 () -> T.VoidResult;
+}
+
+# A secret value read back from the store. The union exists so a caller
+# can tell "no such secret" from "an empty secret" — the previous bare
+# `Data` return could not, and `hasSecret` existed only because of that.
+struct SecretValueResult {
+    union {
+        value @0 :T.DataHandle;
+        error @1 :T.Error;
+        custom @2 :Data;
+    }
 }
 
 struct SecretEntry {
@@ -145,21 +200,22 @@ enum SecretChangeType {
 # ── Audit-8: Secret Version ───────────────────────────────────────────
 
 struct SecretVersion {
-    # Version number (1 = original, incremented on rotation).
     version @0 :UInt32;
-    # When this version was created.
     createdAt @1 :T.Timestamp;
-    # When this version expires (0 = no expiration).
     expiresAt @2 :T.Timestamp;
-    # Whether this is the current active version.
     active @3 :Bool;
-    # Hash of the secret value for integrity checking.
     hash @4 :Data;
 }
 
 # ── Audit-8: Rotation Policy ──────────────────────────────────────────
-
-struct RotationPolicy {
+# Named SecretRotationPolicy, not RotationPolicy: key_management.capnp
+# declares a `RotationPolicy` with a different field set
+# (rotateAfterOperations/gracePeriod vs interval/maxAge), and two
+# same-named types with different shapes in one protocol is an import
+# hazard. The field sets differ because they govern different things —
+# a key's lifecycle versus a secret's — so the honest fix is two clear
+# names, not one merged shape.
+struct SecretRotationPolicy {
     # Rotate after this duration (0 = no time-based rotation).
     interval @0 :T.Duration;
     # Whether to rotate immediately on compromise.
@@ -168,138 +224,112 @@ struct RotationPolicy {
     maxAge @2 :T.Duration;
     # Notify before expiration (0 = no notification).
     notifyBefore @3 :T.Duration;
+    # Whether the previous version remains readable during the grace
+    # window after rotation. Declared because it was previously
+    # unstated: a backend that kept it and one that dropped it produced
+    # different readers after every rotation.
+    keepPreviousVersion @4 :Bool;
+    custom @5 :T.StringMap;
 }
 
 # ── Audit-8: Secret Overlay ───────────────────────────────────────────
 
 struct SecretOverlay {
-    # Environment identifier (e.g., "dev", "staging", "production").
+    # Environment identifier (open token, e.g. "dev", "staging").
     environmentId @0 :Text;
-    # Priority (higher = overrides lower).
     priority @1 :UInt32;
-    # Merge strategy (e.g., "replace", "merge", "append").
+    # Merge strategy (open token, e.g. "replace", "merge", "append").
     mergeStrategy @2 :Text;
-    # Key-value overrides for this environment.
-    overrides @3 :T.StringMap;
+    # Overrides carry VALUES as handles, not as T.StringMap Text: a
+    # secret value typed as Text was copied into the message, greppable,
+    # and trivially captured by any debug path that dumps a map.
+    overrides @3 :List(SecretOverride);
+}
+
+struct SecretOverride {
+    key @0 :T.SecretKeyId;
+    value @1 :T.DataHandle;
+    expiresAt @2 :T.Timestamp;
+    metadata @3 :T.StringMap;
 }
 
 # ── Audit-8: Access Audit Entry ───────────────────────────────────────
 
 struct AccessAuditEntry {
-    # When the access occurred.
     timestamp @0 :T.Timestamp;
-    # Key that was accessed.
     keyId @1 :T.SecretKeyId;
-    # Namespace of the accessed key.
     namespace @2 :T.SecretNamespaceId;
-    # Action performed (e.g., "read", "write", "delete").
+    # Action performed, as an open token ("read", "write", "delete").
     action @3 :Text;
-    # Who performed the access.
-    actor @4 :Text;
-    # Source IP address.
-    sourceIp @5 :Text;
+    # Who performed the access. Typed, so "who read this secret" is
+    # correlatable with T.UserId/T.AppId elsewhere instead of being a
+    # free-form string two backends spell differently.
+    actor @4 :T.UserId;
+    # Source address, when the access came from off-device.
+    sourceAddress @5 :Text;
+    custom @6 :T.StringMap;
 }
 
 # ── Audit-8: HSM Backing ──────────────────────────────────────────────
 
 struct HsmBacking {
-    # Whether HSM backing is available.
     supported @0 :Bool;
-    # HSM provider type (e.g., "PKCS#11", "TPM", "Secure Enclave").
+    # What kind of backing this is, as the BACKEND describes it. The
+    # previous examples ("PKCS#11", "TPM", "Secure Enclave") told
+    # implementers to expect a PKCS#11-shaped HSM; a non-PKCS#11 enclave
+    # had no declared spelling. R5 names PKCS#* explicitly for this
+    # reason.
     providerType @1 :Text;
-    # HSM key identifier.
     keyId @2 :Text;
-    # Algorithm used in HSM.
+    # Algorithm, as an open token shared with crypto.capnp.
     algorithm @3 :Text;
 }
 
 # ── Audit-8: Secret Injection ─────────────────────────────────────────
 
 struct SecretInjection {
-    # Target process ID.
     processId @0 :T.ProcessId;
-    # Injection method (e.g., "env", "file", "memfd").
+    # What the backend did, as an open token — NOT a mechanism name.
     method @1 :Text;
     # Target path (for file injection) or env var name.
     path @2 :Text;
 }
 
-# ── Audit-8: Key Derivation Request ───────────────────────────────────
-
-struct DeriveKeyRequest {
-    # KDF algorithm (e.g., "PBKDF2", "scrypt", "Argon2", "HKDF").
-    algorithm @0 :Text;
-    # Password or base key material.
-    password @1 :Data;
-    # Salt for the KDF.
-    salt @2 :Data;
-    # Number of iterations (for iterative KDFs).
-    iterations @3 :UInt32;
-    # Desired key length in bytes.
-    keyLength @4 :UInt32;
-}
-
-# ── Audit-8: Secret Compliance Policy (false positive: secret_compliance.capnp) ─
-
-struct SecretCompliancePolicy {
-    # Minimum secret length in bytes.
-    minLength @0 :UInt32;
-    # Maximum secret length in bytes (0 = unlimited).
-    maxLength @1 :UInt32;
-    # Required character classes (e.g., "upper", "lower", "digit", "special").
-    requiredClasses @2 :List(Text);
-    # Maximum age before forced rotation.
-    maxAge @3 :T.Duration;
-    # Whether HSM backing is required.
-    requireHsm @4 :Bool;
-    # Whether audit logging is required.
-    requireAudit @5 :Bool;
-}
-
 # ── Audit-9: Secret Template ───────────────────────────────────────────
-# Structured secret schemas (password = username+password, API key = key+secret+endpoint).
 struct SecretTemplate {
-    # Template identifier.
     templateId @0 :Text;
-    # Human-readable template name.
     name @1 :Text;
-    # Description of what this template generates.
     description @2 :Text;
-    # Field definitions for this template.
     fields @3 :List(SecretTemplateField);
-    # Default generation parameters.
     defaults @4 :SecretGenerateRequest;
 }
 
 struct SecretTemplateField {
-    # Field name (e.g., "username", "password", "endpoint").
     name @0 :Text;
-    # Field type (e.g., "text", "password", "url", "email").
+    # Open token, e.g. "text", "password", "url", "email".
     type @1 :Text;
-    # Whether this field is required.
     required @2 :Bool;
-    # Default value (if any).
-    defaultValue @3 :Text;
-    # Validation pattern (regex, if applicable).
-    validationPattern @4 :Text;
-    # Whether this field should be masked in UI.
+    defaultValue @3 :T.DataHandle;
+    # Validation pattern, as a T.Regex so it is self-describing rather
+    # than a bare Text whose dialect every backend guesses.
+    validationPattern @4 :T.Regex;
     sensitive @5 :Bool;
 }
 
 # ── Audit-9: Secret Generation Request ─────────────────────────────────
 struct SecretGenerateRequest {
-    # Generation algorithm (e.g., "random", "diceware", "xkcd", "uuid", "certificate").
+    # Generation algorithm, open token: "random", "diceware", "uuid", ...
     algorithm @0 :Text;
     # Desired length in characters/bits (interpretation depends on algorithm).
     length @1 :UInt32;
-    # Character set to use (for random generation).
     characterSet @2 :Text;
-    # Number of words (for diceware/xkcd).
     wordCount @3 :UInt32;
-    # Word list to use (for diceware/xkcd).
     wordList @4 :Text;
-    # Certificate subject (for certificate generation).
     certificateSubject @5 :Text;
-    # Certificate validity duration.
     certificateValidity @6 :T.Duration;
+    # Certificate generation goes through crypto.capnp's certificate
+    # operations; the previous local path duplicated them with no typed
+    # result.
+    certificateAlgorithm @7 :Text;
+    parameters @8 :T.StringMap;
 }

@@ -4,43 +4,70 @@
 # Contacts — address book management. Backend-agnostic: works with
 # system contact stores, vCard databases, LDAP, or IPC services.
 #
-# Improvements:
-#   - All IDs use typed T.ContactId / T.GroupId (not raw Text).
-#   - Sub-entry IDs use dedicated T.EmailEntryId, T.PhoneEntryId,
-#     T.AddressEntryId (not T.ContactId — semantically distinct).
-#   - listContacts/searchContacts/getStarred accept T.Pagination
-#     for bounded results.
-#   - listGroups accepts T.Pagination for bounded results (Rule 9).
-#   - ContactFilter.groups enables multi-group filtering (OR semantics).
-#   - Contact.photo uses T.DataHandle for large contact photos.
-#   - Contact.groups uses List(T.GroupId) (typed references).
-#   - ContactFilter.group uses T.GroupId.
-#   - ContactFilter.starred uses T.BoolFilter (any/yes/no).
-#   - Contact.birthday uses T.Date (date-only, not full timestamp).
-#   - ContactsSubscription has cancel method for explicit teardown.
-#   - All enums have custom variants for forward compatibility.
+# The zero-cost posture of this file is exemplary and is kept: photos,
+# import and export are all T.DataHandle; sub-entry ids use the promoted
+# T.EmailEntryId/T.PhoneEntryId/T.AddressEntryId; birthdays use T.Date;
+# every list method is paginated.
 #
-# Improvements (audit-7):
-#   - ContactType enum for entity classification (person, org, team, etc.).
-#   - OrganizationName struct for non-person contacts.
-#   - Contact.type, Contact.organization for multi-entity support.
-#   - DynamicGroup + GroupRule for rule-based smart groups.
-#   - PresenceStatus + ContactPresence for real-time availability.
-#   - ContactsService.getPresence/subscribePresence for presence.
-#   - ContactMergeRequest + mergeContacts/findDuplicates for dedup.
-#   - SocialProfile for social media links.
-#   - ContactRelation + getRelations for contact graph.
-#   - Contact.tags, Contact.customFields for extensibility.
-#   - FreeBusyInfo + getFreeBusy for calendar availability.
-#   - exportContacts/importContacts for format negotiation.
-#   - ContactPhotoMetadata + Contact.photoMetadata for preview.
-#   - getContactHistory for change log.
-#   - batchUpdate/batchDelete/getContactByField/getRecentContacts/getSuggestions.
-#   - ContactConsent + ConsentScope for GDPR/privacy compliance
-#     (false positive from contact_privacy.capnp).
+# ── THE SHARE HOLE ────────────────────────────────────────────────────
+#
+# `shareContact` copied a person's data to an arbitrary user id with no
+# capability, no consent check and no authority — in a file that also
+# defines its own consent machinery. Any holder of the reference could
+# leak any contact to any user. The privacy-critical surface (share,
+# presence, history, relations, identity linking, bulk mutation and
+# consent) now sits behind one accessor that takes a Capability, and
+# `shareContact` additionally requires a consent record covering the
+# `sharing` scope for the target contact: a backend MUST refuse with
+# T.Error(permissionDenied) when no such record exists. The file's
+# privacy machinery is now binding instead of decorative.
+#
+# ── VOCABULARIES THAT GROW ARE OPEN ───────────────────────────────────
+#
+# ContactType, EmailType, PhoneType, AddressType, RelationType,
+# SearchMode, ContactRankingType and ConsentScope were closed enums.
+# PhoneType already contained `pager` — a dead technology frozen as a
+# permanent ordinal with nothing replacing it — and ConsentScope could
+# not express a 2046 jurisdiction's "profiling", "automated decision" or
+# "cross-border transfer", so `recordConsent` could not record a lawful
+# refusal. All eight are open tokens with published spellings.
+#
+# SearchMode also collided by NAME with content.capnp's SearchMode at
+# divergent values (prefix/fuzzy/exact/semantic vs
+# fullText/prefix/fuzzy/semantic); both are open tokens sharing one
+# published vocabulary now.
+#
+# ── ONE AVAILABILITY CONTRACT ─────────────────────────────────────────
+#
+# `getFreeBusy` duplicated calendar.capnp's `queryFreeBusy` with a
+# different request shape and a different result type, and its local
+# FreeBusyStatus was value-identical to calendar's misnamed
+# FreeBusyPrivacy — three names for one concept. The duplicate is
+# deleted; calendar.queryFreeBusy is the canonical availability
+# contract.
+#
+# ── ONE PAGINATION MODEL ──────────────────────────────────────────────
+#
+# ContactsSubscription and PresenceSubscription had unbounded pulls
+# with a `cancel` but no terminator. Both gain a `pullPage` (the pattern
+# runtime_search.capnp:531 and calendar.capnp:116 already use); the
+# unbounded `pull` is documented as deprecated rather than silently
+# changed.
+#
+# Improvements (audit-7/9), unchanged:
+#   - All IDs typed (T.ContactId / T.GroupId), sub-entry ids dedicated.
+#   - listContacts/searchContacts/getStarred/accept T.Pagination.
+#   - Contact.photo uses T.DataHandle; Contact.groups uses List(T.GroupId).
+#   - ContactFilter.groups enables multi-group filtering (OR semantics).
+#   - ContactFilter.starred uses T.BoolFilter.
+#   - Contact.birthday uses T.Date.
+#   - ContactConsent for GDPR/privacy compliance.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
+
+# ── Root: ungated address-book surface ────────────────────────────────
 
 interface Contacts {
     listContacts @0 (filter :ContactFilter, pagination :T.Pagination) -> (contacts :List(Contact));
@@ -60,101 +87,86 @@ interface Contacts {
 
     subscribeContacts @11 () -> (subscription :ContactsSubscription);
 
-    # ── Presence (audit-7) ───────────────────────────────────
-    # Query real-time availability for one or more contacts.
-    getPresence @12 (contactIds :List(T.ContactId)) -> (presences :List(ContactPresence));
-
-    # Subscribe to presence changes (real-time updates).
-    subscribePresence @13 () -> (subscription :PresenceSubscription);
-
-    # ── Merge / Dedup (audit-7) ──────────────────────────────
-    # Execute a merge of duplicate contacts.
+    # ── Merge / Dedup ──────────────────────────────────────
+    findDuplicates @12 (pagination :T.Pagination) -> (duplicates :List(DuplicateCandidate));
+    mergePreview @13 (request :ContactMergeRequest) -> (merged :Contact);
     mergeContacts @14 (request :ContactMergeRequest) -> T.VoidResult;
 
-    # Find potential duplicate contacts (paginated).
-    findDuplicates @15 (pagination :T.Pagination) -> (duplicates :List(DuplicateCandidate));
+    # ── Lookup ─────────────────────────────────────────────
+    getContactByField @15 (fieldType :ContactFieldType, fieldValue :Text) -> (contact :Contact);
+    getRecentContacts @16 (pagination :T.Pagination) -> (contacts :List(Contact));
+    # Smart contact suggestions. `context` is an open token (see
+    # conformance consts); previously a bare Text whose vocabulary was
+    # undeclared, so two backends produced unrelated results for the
+    # same call.
+    getSuggestions @17 (context :Text, pagination :T.Pagination) -> (contacts :List(Contact));
 
-    # Preview a merge without executing it.
-    mergePreview @16 (request :ContactMergeRequest) -> (merged :Contact);
+    # ── Accessibility / Ranking ────────────────────────────
+    getAccessibilityMetadata @18 (contactId :T.ContactId) -> (metadata :ContactAccessibilityMetadata);
+    searchContactsRanked @19 (query :Text, pagination :T.Pagination) -> (results :List(RankedContactResult));
+    getContactRanking @20 (rankingType :Text, pagination :T.Pagination) -> (results :List(RankedContactResult));
 
-    # ── Relationships (audit-7) ──────────────────────────────
+    # ── Gated once, at acquisition ──────────────────────────────────
+    # Presence, history, relationships, identity linking, bulk mutation,
+    # sharing and consent are personal-data operations. Holding
+    # `service` IS the authority; no method inside takes an authority
+    # token.
+    privacy @21 (authority :Capability) -> (service :ContactPrivacy);
+}
+
+# ── Privileged surface: obtained with a Capability ──────────────────────
+
+interface ContactPrivacy {
+    # Query real-time availability for one or more contacts.
+    getPresence @0 (contactIds :List(T.ContactId)) -> (presences :List(ContactPresence));
+
+    # Subscribe to presence changes.
+    subscribePresence @1 () -> (subscription :PresenceSubscription);
+
     # Query relationships for a contact.
-    getRelations @17 (contactId :T.ContactId) -> (relations :List(ContactRelation));
+    getRelations @2 (contactId :T.ContactId) -> (relations :List(ContactRelation));
 
-    # ── Free/Busy (audit-7) ──────────────────────────────────
-    # Query calendar availability for contacts (respects privacy).
-    getFreeBusy @18 (contactIds :List(T.ContactId), range :TimeRange) -> (infos :List(FreeBusyInfo));
-
-    # ── Import/Export (audit-7) ───────────────────────────────
-    # Export contacts in specified format (vCard, JSON, CSV).
-    exportContacts @19 (format :Text, contactIds :List(T.ContactId)) -> (data :T.DataHandle);
-
-    # Import contacts from specified format.
-    importContacts @20 (format :Text, data :T.DataHandle) -> (imported :UInt32, warnings :List(T.Warning));
-
-    # ── History (audit-7) ────────────────────────────────────
     # Full change history for a contact (edit log, merge history).
-    getContactHistory @21 (contactId :T.ContactId, pagination :T.Pagination) -> (entries :List(ContactHistoryEntry));
+    getContactHistory @3 (contactId :T.ContactId, pagination :T.Pagination)
+        -> (entries :List(ContactHistoryEntry));
 
-    # ── Sharing (audit-7) ────────────────────────────────────
-    # Encrypted contact sharing between devices/users.
-    shareContact @22 (contactId :T.ContactId, targetUserId :T.UserId) -> T.VoidResult;
+    # Share a contact with another user. Requires a ContactConsent
+    # record covering the `sharing` scope for this contact; the backend
+    # MUST refuse with T.Error(permissionDenied) when none exists.
+    # Previously ungated and unconsented, so any holder of the
+    # reference could leak any contact to any user id.
+    shareContact @4 (contactId :T.ContactId, targetUserId :T.UserId) -> T.VoidResult;
 
-    # ── Batch Operations (audit-7) ───────────────────────────
-    # Update multiple contacts in a single operation.
-    batchUpdate @23 (updates :List(BatchContactUpdate)) -> T.VoidResult;
+    # Bulk operations on another party's data.
+    batchUpdate @5 (updates :List(BatchContactUpdate)) -> T.VoidResult;
+    batchDelete @6 (contactIds :List(T.ContactId)) -> T.VoidResult;
 
-    # Delete multiple contacts in a single operation.
-    batchDelete @24 (contactIds :List(T.ContactId)) -> T.VoidResult;
+    # Consent lifecycle.
+    recordConsent @7 (contactId :T.ContactId, consent :ContactConsent) -> T.VoidResult;
+    revokeConsent @8 (contactId :T.ContactId, consentScope :Text) -> T.VoidResult;
+    getConsentStatus @9 (contactId :T.ContactId) -> (consents :List(ContactConsent));
 
-    # ── Lookup (audit-7) ─────────────────────────────────────
-    # Look up a contact by email, phone, or handle (reverse lookup).
-    getContactByField @25 (fieldType :ContactFieldType, fieldValue :Text) -> (contact :Contact);
-
-    # Recently contacted / most-contacted list (paginated).
-    getRecentContacts @26 (pagination :T.Pagination) -> (contacts :List(Contact));
-
-    # Smart contact suggestions based on context.
-    getSuggestions @27 (context :Text, pagination :T.Pagination) -> (contacts :List(Contact));
-
-    # ── Consent / Privacy (false positive: contact_privacy) ───
-    # Record consent for storing/processing this contact.
-    recordConsent @28 (contactId :T.ContactId, consent :ContactConsent) -> T.VoidResult;
-
-    # Revoke previously granted consent.
-    revokeConsent @29 (contactId :T.ContactId, consentScope :ConsentScope) -> T.VoidResult;
-
-    # Query consent status for a contact.
-    getConsentStatus @30 (contactId :T.ContactId) -> (consents :List(ContactConsent));
-
-    # ── Audit-9: Accessibility / Ranking / Linking ───────────────
-
-    # Get accessibility metadata for a contact (pronunciation, reading order).
-    getAccessibilityMetadata @31 (contactId :T.ContactId) -> (metadata :ContactAccessibilityMetadata);
-
-    # Search contacts with relevance ranking.
-    searchContactsRanked @32 (query :Text, pagination :T.Pagination) -> (results :List(RankedContactResult));
-
-    # Get contact scoring/ranking (most contacted, VIP, etc.).
-    getContactRanking @33 (rankingType :ContactRankingType, pagination :T.Pagination) -> (results :List(RankedContactResult));
-
-    # Link contacts across providers (same person, different accounts).
-    linkContacts @34 (primaryId :T.ContactId, linkedIds :List(T.ContactId)) -> T.VoidResult;
-
-    # Get linked identities for a contact.
-    getLinkedIdentities @35 (contactId :T.ContactId) -> (links :List(ContactIdentityLink));
+    # Cross-provider identity correlation.
+    linkContacts @10 (primaryId :T.ContactId, linkedIds :List(T.ContactId)) -> T.VoidResult;
+    getLinkedIdentities @11 (contactId :T.ContactId) -> (links :List(ContactIdentityLink));
 }
 
 interface ContactsSubscription {
+    # DEPRECATED: use pullPage. An unbounded pull on a long-lived
+    # subscription exhausts consumer memory.
     pull @0 () -> (contacts :List(Contact));
-
     # Explicitly cancel this subscription and release resources.
     cancel @1 () -> T.VoidResult;
+    # Bounded pull for large histories.
+    pullPage @2 (pagination :T.Pagination) -> (contacts :List(Contact), total :UInt64);
 }
 
 interface PresenceSubscription {
+    # DEPRECATED: use pullPage.
     pull @0 () -> (presences :List(ContactPresence));
     cancel @1 () -> T.VoidResult;
+    # Bounded pull for large histories.
+    pullPage @2 (pagination :T.Pagination) -> (presences :List(ContactPresence), total :UInt64);
 }
 
 # ── Contact ───────────────────────────────────────────────────
@@ -165,48 +177,43 @@ struct Contact {
     emails @2 :List(EmailEntry);
     phones @3 :List(PhoneEntry);
     addresses @4 :List(AddressEntry);
-    # Inline for small photos; use buffer reference for large/high-res photos.
     photo @5 :T.DataHandle;
     starred @6 :Bool;
     groups @7 :List(T.GroupId);
     note @8 :Text;
-    # Date-only birthday (no time-of-day precision).
     birthday @9 :T.Date;
     created @10 :T.Timestamp;
     modified @11 :T.Timestamp;
     metadata @12 :T.StringMap;
 
     # ── Audit-7 additions ────────────────────────────────────
-    # Entity type (person, organization, team, etc.)
-    type @13 :ContactType;
-    # Organization name (for non-person contacts).
+    # Entity type, as an open token.
+    type @13 :Text;
     organization @14 :OrganizationName;
-    # Social media profile links.
     socialProfiles @15 :List(SocialProfile);
-    # User-defined tags beyond groups.
     tags @16 :List(Text);
-    # Structured extensible custom fields.
     customFields @17 :List(CustomField);
-    # Photo metadata for preview/display decisions.
     photoMetadata @18 :ContactPhotoMetadata;
     # IANA timezone name (e.g., "America/New_York").
     timezone @19 :Text;
-    # Contact lifecycle (active, stale, archived).
     lifecycleStatus @20 :ContactLifecycleStatus;
-    # Consent records for GDPR/privacy compliance.
     consent @21 :List(ContactConsent);
+
+    # Optimistic-concurrency guard. Previously absent, so two writers
+    # silently overwrote each other and last-write-wins versus merge was
+    # decided per backend.
+    version @22 :UInt64;
 }
 
-# ── Entity Type (audit-7) ─────────────────────────────────────
-
-enum ContactType {
-    person @0;
-    organization @1;
-    team @2;
-    service @3;
-    bot @4;
-    other @5;
-    custom @6;
+# Lifecycle is closed by the lifecycle itself, not by a technology
+# snapshot. `stale` has no declared threshold because staleness is a
+# backend policy; a consumer reads `modified` to apply its own.
+enum ContactLifecycleStatus {
+    unspecified @0;   # Sentinel: an unset status is not "active"
+    active @1;
+    stale @2;
+    archived @3;
+    custom @4;
 }
 
 struct OrganizationName {
@@ -214,15 +221,6 @@ struct OrganizationName {
     department @1 :Text;
     role @2 :Text;
     industry @3 :Text;
-}
-
-# ── Lifecycle (audit-7) ───────────────────────────────────────
-
-enum ContactLifecycleStatus {
-    active @0;
-    stale @1;
-    archived @2;
-    custom @3;
 }
 
 # ── Names ─────────────────────────────────────────────────────
@@ -239,46 +237,29 @@ struct PersonName {
 # ── Email ─────────────────────────────────────────────────────
 
 struct EmailEntry {
-    # Dedicated sub-entry ID (not T.ContactId — this is an email within a contact).
     id @0 :T.EmailEntryId;
-    type @1 :EmailType;
+    # Open token; see the email-type conformance consts below.
+    type @1 :Text;
     value @2 :Text;
     primary @3 :Bool;
-}
-
-enum EmailType {
-    home @0;
-    work @1;
-    other @2;
-    custom @3;
 }
 
 # ── Phone ─────────────────────────────────────────────────────
 
 struct PhoneEntry {
-    # Dedicated sub-entry ID (not T.ContactId — this is a phone within a contact).
     id @0 :T.PhoneEntryId;
-    type @1 :PhoneType;
+    # Open token; see the phone-type conformance consts below.
+    type @1 :Text;
     value @2 :Text;
     primary @3 :Bool;
-}
-
-enum PhoneType {
-    mobile @0;
-    home @1;
-    work @2;
-    fax @3;
-    pager @4;
-    other @5;
-    custom @6;
 }
 
 # ── Address ───────────────────────────────────────────────────
 
 struct AddressEntry {
-    # Dedicated sub-entry ID (not T.ContactId — this is an address within a contact).
     id @0 :T.AddressEntryId;
-    type @1 :AddressType;
+    # Open token; see the address-type conformance consts below.
+    type @1 :Text;
     street @2 :Text;
     city @3 :Text;
     region @4 :Text;
@@ -287,24 +268,14 @@ struct AddressEntry {
     primary @7 :Bool;
 }
 
-enum AddressType {
-    home @0;
-    work @1;
-    other @2;
-    custom @3;
-}
-
 # ── Groups ────────────────────────────────────────────────────
 
 struct ContactGroup {
     id @0 :T.GroupId;
     name @1 :Text;
     contactCount @2 :UInt32;
-    # Rule-based filter criteria for dynamic/smart groups (audit-7).
     rules @3 :List(GroupRule);
-    # Human-readable description of the group (audit-7).
     description @4 :Text;
-    # Whether this is a rule-based dynamic group (audit-7).
     isDynamic @5 :Bool;
 }
 
@@ -312,20 +283,21 @@ struct GroupRule {
     # Contact field name to match against (e.g., "type", "tags", "emails.value").
     field @0 :Text;
     operator @1 :GroupRuleOperator;
-    # Value to compare against (interpretation depends on operator).
     value @2 :Text;
 }
 
+# Closed by the matching semantics, not by a technology snapshot.
 enum GroupRuleOperator {
-    equals @0;
-    contains @1;
-    startsWith @2;
-    regex @3;
-    inList @4;
-    custom @5;
+    unspecified @0;   # Sentinel: an unset operator is not "equals"
+    equals @1;
+    contains @2;
+    startsWith @3;
+    regex @4;
+    inList @5;
+    custom @6;
 }
 
-# ── Presence (audit-7) ────────────────────────────────────────
+# ── Presence ──────────────────────────────────────────────────
 
 enum PresenceStatus {
     unknown @0;
@@ -340,150 +312,98 @@ enum PresenceStatus {
 struct ContactPresence {
     contactId @0 :T.ContactId;
     status @1 :PresenceStatus;
-    # When this presence was last observed.
     lastSeen @2 :T.Timestamp;
     # Device or service reporting this presence (e.g., "phone", "desktop").
     device @3 :Text;
 }
 
-# ── Social Profile (audit-7) ──────────────────────────────────
+# ── Social Profile ───────────────────────────────────────────
 
 struct SocialProfile {
-    # Platform name (e.g., "github", "linkedin", "twitter", "mastodon").
     platform @0 :Text;
-    # Handle or username on the platform.
     handle @1 :Text;
-    # Profile URL.
     url @2 :T.Uri;
-    # Whether this profile is verified.
     verified @3 :Bool;
 }
 
-# ── Contact Graph (audit-7) ───────────────────────────────────
+# ── Contact Graph ────────────────────────────────────────────
 
 struct ContactRelation {
-    # The contact this relation points to.
     targetId @0 :T.ContactId;
-    relation @1 :RelationType;
-    # Human-readable label (e.g., "manager", "spouse").
+    # Open token; see the relation-type conformance consts below.
+    relation @1 :Text;
     label @2 :Text;
-    # Relationship strength for analytics (0.0 = weak, 1.0 = strong).
     strength @3 :Float32;
 }
 
-enum RelationType {
-    worksWith @0;
-    manages @1;
-    relatedTo @2;
-    reportsTo @3;
-    other @4;
-    custom @5;
-}
-
-# ── Custom Fields (audit-7) ───────────────────────────────────
+# ── Custom Fields ────────────────────────────────────────────
 
 struct CustomField {
-    # Field key (e.g., "favorite_color", "assistant_name").
     key @0 :Text;
-    # Typed value using existing T.MetaValue union.
     value @1 :T.MetaValue;
 }
 
-# ── Free/Busy (audit-7) ───────────────────────────────────────
-
-struct FreeBusyInfo {
-    contactId @0 :T.ContactId;
-    status @1 :FreeBusyStatus;
-    start @2 :T.Timestamp;
-    end @3 :T.Timestamp;
-    # Privacy level for this availability entry.
-    privacy @4 :FreeBusyPrivacy;
-}
-
-enum FreeBusyStatus {
-    free @0;
-    busy @1;
-    tentative @2;
-    outOfOffice @3;
-    custom @4;
-}
-
-enum FreeBusyPrivacy {
-    public @0;
-    contactsOnly @1;
-    private @2;
-    custom @3;
-}
-
-# ── Photo Metadata (audit-7) ──────────────────────────────────
+# ── Photo Metadata ───────────────────────────────────────────
 
 struct ContactPhotoMetadata {
     width @0 :UInt32;
     height @1 :UInt32;
     # MIME type (e.g., "image/jpeg", "image/png").
-    format @2 :Text;
+    format @2 :T.MimeType;
     sizeBytes @3 :UInt64;
 }
 
-# ── Merge / Dedup (audit-7) ───────────────────────────────────
+# ── Merge / Dedup ────────────────────────────────────────────
 
 struct ContactMergeRequest {
-    # The contact to keep as primary.
     primaryId @0 :T.ContactId;
-    # Contacts to merge into primary.
     duplicateIds @1 :List(T.ContactId);
-    # Strategy for resolving conflicts during merge.
-    strategy @2 :MergeStrategy;
+    strategy @2 :ContactMergeStrategy;
 }
 
-enum MergeStrategy {
-    keepPrimary @0;
-    keepNewest @1;
-    mergeAll @2;
-    custom @3;
+# Closed by the merge semantics.
+enum ContactMergeStrategy {
+    unspecified @0;   # Sentinel: an unset strategy is not "keepPrimary"
+    keepPrimary @1;
+    keepNewest @2;
+    mergeAll @3;
+    custom @4;
 }
 
 struct DuplicateCandidate {
-    # One of the potential duplicate contacts.
     contactId @0 :T.ContactId;
-    # Similarity score (0.0 = no match, 1.0 = identical).
     score @1 :Float32;
-    # The other contact this one may duplicate.
     duplicateOf @2 :T.ContactId;
-    # Which fields matched (e.g., "email", "phone", "name").
+    # Which fields matched, as open tokens (see the field-type consts).
     matchedFields @3 :List(Text);
 }
 
-# ── Batch Operations (audit-7) ────────────────────────────────
+# ── Batch Operations ─────────────────────────────────────────
 
 struct BatchContactUpdate {
     contactId @0 :T.ContactId;
     contact @1 :Contact;
 }
 
-# ── Field Lookup (audit-7) ────────────────────────────────────
+# ── Field Lookup ─────────────────────────────────────────────
 
 enum ContactFieldType {
-    email @0;
-    phone @1;
-    handle @2;
-    custom @3;
+    unspecified @0;   # Sentinel: an unset field type is not "email"
+    email @1;
+    phone @2;
+    handle @3;
+    custom @4;
 }
 
-# ── History (audit-7) ─────────────────────────────────────────
+# ── History ──────────────────────────────────────────────────
 
 struct ContactHistoryEntry {
-    # Timestamp of the change.
     timestamp @0 :T.Timestamp;
-    # Type of action performed.
     action @1 :ContactHistoryAction;
-    # Which field was changed (e.g., "name", "email", "phone").
+    # Which field was changed, as an open token.
     field @2 :Text;
-    # Previous value (empty for creation).
     oldValue @3 :Text;
-    # New value (empty for deletion).
     newValue @4 :Text;
-    # User or system that performed the change.
     actor @5 :T.UserId;
 }
 
@@ -496,122 +416,119 @@ enum ContactHistoryAction {
     custom @5;
 }
 
-# ── Time Range (for free/busy queries) ────────────────────────
-
-struct TimeRange {
-    start @0 :T.Timestamp;
-    end @1 :T.Timestamp;
-}
-
-# ── Filter ────────────────────────────────────────────────────
+# ── Filter ───────────────────────────────────────────────────
 
 struct ContactFilter {
     query @0 :Text;
     group @1 :T.GroupId;
     # Filter by multiple groups (OR semantics — contacts in any listed group match).
     groups @2 :List(T.GroupId);
-    # T.BoolFilter: any/yes/no — more expressive than bare Bool.
     starred @3 :T.BoolFilter;
 
-    # ── Audit-7 additions ────────────────────────────────────
-    # Filter by entity type (person, organization, etc.)
-    type @4 :ContactType;
-    # Filter by user-defined tags.
+    type @4 :Text;
     tags @5 :List(Text);
-    # Only contacts with presence data.
     hasPresence @6 :Bool;
-    # Only contacts seen after this timestamp.
     lastSeenAfter @7 :T.Timestamp;
-    # Search strategy hint (prefix, fuzzy, exact, semantic).
-    searchMode @8 :SearchMode;
+    # Search strategy hint, as an open token (see the search-mode consts).
+    searchMode @8 :Text;
+    parameters @9 :T.StringMap;
 }
 
-enum SearchMode {
-    prefix @0;
-    fuzzy @1;
-    exact @2;
-    semantic @3;
-    custom @4;
-}
-
-# ── Consent / Privacy (false positive: contact_privacy) ───────
-# Contact consent tracking for GDPR/privacy compliance.
-# Right-to-erasure, data retention, and consent lifecycle
-# management are features of contacts.capnp, not a new schema.
-
-# ── Accessibility Metadata (audit-9) ────────────────────────
+# ── Accessibility Metadata ──────────────────────────────────
 struct ContactAccessibilityMetadata {
-    # Pronunciation hint for the contact name (IPA or phonetic).
     pronunciationHint @0 :Text;
-    # Preferred reading order for screen readers (e.g., "given-family", "family-given").
     readingOrder @1 :Text;
-    # Whether the name should be spelled out character-by-character.
     spellOut @2 :Bool;
-    # Screen reader voice hint (e.g., "formal", "casual").
     voiceHint @3 :Text;
-    # Alternative text for the contact photo.
     photoAltText @4 :Text;
 }
 
-# ── Contact Ranking (audit-9) ───────────────────────────────
-
-enum ContactRankingType {
-    mostContacted @0;
-    recentlyContacted @1;
-    vip @2;
-    frequent @3;
-    recent @4;
-    custom @5;
-}
+# ── Contact Ranking ──────────────────────────────────────────
 
 struct RankedContactResult {
-    # The contact.
     contact @0 :Contact;
-    # Ranking score (higher = more relevant).
     score @1 :Float32;
-    # Rank position (1-based).
     rank @2 :UInt32;
-    # Ranking metric value (e.g., message count, last contact time).
     metricValue @3 :Float32;
-    # Human-readable ranking label (e.g., "Most contacted", "VIP").
     label @4 :Text;
 }
 
-# ── Cross-Provider Identity Linking (audit-9) ───────────────
-
+# ── Cross-Provider Identity Linking ─────────────────────────
 struct ContactIdentityLink {
-    # The linked contact ID.
     linkedContactId @0 :T.ContactId;
-    # Provider type (e.g., "email", "phone", "social", "enterprise").
+    # Provider type, as an open token (e.g., "email", "phone", "social").
     provider @1 :Text;
-    # Provider-specific identifier.
     providerId @2 :Text;
-    # Confidence score for the link (0.0 = uncertain, 1.0 = confirmed).
     confidence @3 :Float32;
-    # Whether this link was user-confirmed.
     confirmed @4 :Bool;
-    # When the link was established.
     linkedAt @5 :T.Timestamp;
 }
 
 struct ContactConsent {
-    # When consent was granted.
     consentedAt @0 :T.Timestamp;
-    # What the consent covers.
-    scope @1 :ConsentScope;
-    # When consent expires (zero = no expiration).
+    # What the consent covers, as an open token (see the consent-scope
+    # consts). Open because a 2046 jurisdiction needs "profiling",
+    # "automatedDecision" or "crossBorderTransfer" and a closed list
+    # cannot record a lawful refusal.
+    scope @1 :Text;
     expiresAt @2 :T.Timestamp;
-    # When consent was revoked (zero = still active).
     revokedAt @3 :T.Timestamp;
-    # User or system that recorded this consent.
     recordedBy @4 :T.UserId;
 }
 
-enum ConsentScope {
-    storage @0;
-    sharing @1;
-    analytics @2;
-    marketing @3;
-    all @4;
-    custom @5;
-}
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Today's spellings for the open tokens above. Nothing requires them; an
+# unrecognized token MUST be ignored rather than rejected, so a 2046
+# entity kind, relation, ranking basis or consent scope becomes nameable
+# the day a backend ships it.
+# ══════════════════════════════════════════════════════════════════════
+
+const contactTypePerson       :Text = "person";
+const contactTypeOrganization :Text = "organization";
+const contactTypeTeam         :Text = "team";
+const contactTypeService      :Text = "service";
+const contactTypeBot          :Text = "bot";
+
+const emailTypeHome  :Text = "home";
+const emailTypeWork  :Text = "work";
+const emailTypeOther :Text = "other";
+
+const phoneTypeMobile :Text = "mobile";
+const phoneTypeHome   :Text = "home";
+const phoneTypeWork   :Text = "work";
+const phoneTypeFax    :Text = "fax";
+const phoneTypeOther  :Text = "other";
+
+const addressTypeHome  :Text = "home";
+const addressTypeWork  :Text = "work";
+const addressTypeOther :Text = "other";
+
+const relationWorksWith :Text = "works-with";
+const relationManages   :Text = "manages";
+const relationRelatedTo :Text = "related-to";
+const relationReportsTo :Text = "reports-to";
+const relationOther     :Text = "other";
+
+const searchModePrefix    :Text = "prefix";
+const searchModeFuzzy     :Text = "fuzzy";
+const searchModeExact     :Text = "exact";
+const searchModeSemantic  :Text = "semantic";
+const searchModeFullText  :Text = "full-text";
+
+const rankingMostContacted      :Text = "most-contacted";
+const rankingRecentlyContacted  :Text = "recently-contacted";
+const rankingVip                :Text = "vip";
+const rankingFrequent           :Text = "frequent";
+const rankingRecent             :Text = "recent";
+
+const consentStorage   :Text = "storage";
+const consentSharing   :Text = "sharing";
+const consentAnalytics :Text = "analytics";
+const consentMarketing :Text = "marketing";
+const consentAll       :Text = "all";
+
+const suggestionContextCompose :Text = "compose";
+const suggestionContextShare   :Text = "share";
+const suggestionContextSearch  :Text = "search";

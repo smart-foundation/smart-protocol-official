@@ -12,22 +12,36 @@
 #   - KeyEvent.repeat (key held reporting).
 #   - MouseEvent.motion (drag, hover without button press).
 #   - MouseButton.scrollLeft/scrollRight (horizontal wheel).
-#   - InputEvent.paste (bracketed paste).
-#   - InputEvent.bell (terminal bell).
-#   - TextStyle.hyperlink (terminal hyperlinks).
+#   - ConsoleInputEvent.paste (bracketed paste).
+#   - ConsoleInputEvent.bell (terminal bell).
+#   - ConsoleTextStyle.hyperlink (terminal hyperlinks).
 #   - CursorStyle enum + cursor style control.
+#
+# 2026-10-10 integration pass — four names disambiguated, because a
+# terminal's own concepts were sharing names with three other domains and
+# a consumer importing both had to qualify by hand:
+#   - AccessibilityRole -> ConsoleRole (accessibility.capnp owns the
+#     WAI-ARIA role vocabulary; a terminal ELEMENT role is not an AT role).
+#   - OutputMode -> ConsoleOutputMode (compositor's OutputMode is a display
+#     mode — width, height, refresh rate; a console's is an output CHANNEL
+#     — text, styled text, speech, braille).
+#   - TextStyle -> ConsoleTextStyle (theme.capnp owns the font scale; a
+#     terminal's is cell attributes).
+#   - ThemeSubscription -> ConsoleThemeSubscription (theme.capnp owns the
+#     token snapshot stream).
 #   - subscribeCursor for tracking (not just "after-the-fact").
 #   - TerminalCapabilities for TERMCAP-style capability query.
 #   - InputSubscription and CursorSubscription have cancel methods.
 #   - All enums have other/custom variants for forward compatibility.
-#   - InputEvent union has custom variant for forward compatibility.
+#   - ConsoleInputEvent union has custom variant for forward compatibility.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
 
 # ── Input ───────────────────────────────────────────────────────────────
 
-struct InputEvent {
+struct ConsoleInputEvent {
     timestamp @0 :T.Timestamp;
     union {
         key @1 :KeyEvent;
@@ -37,11 +51,15 @@ struct InputEvent {
         bell @5 :Void;
         focus @6 :FocusChangeEvent;
         # Audit-7: new input event types for device-agnostic support
-        stylus @8 :StylusInputEvent;
-        eyeTracking @9 :EyeTrackingInputEvent;
-        spatialGesture @10 :SpatialGestureInputEvent;
-        # Backend-specific input event type.
-        custom @7 :Data;
+        stylus @7 :StylusConsoleInputEvent;
+        eyeTracking @8 :EyeTrackingConsoleInputEvent;
+        spatialGesture @9 :SpatialGestureConsoleInputEvent;
+        # Backend-specific input event type. The doctrine shape
+        # (TIMELESSNESS.md:98): a typeId so a consumer can at least log
+        # what it skipped, plus an opaque payload. The previous
+        # `custom @7 :Data` was a raw blob with neither, and it was
+        # declared out of ordinal order between @6 and @8.
+        unknown @10 :UnknownConsoleEvent;
     }
 }
 
@@ -100,10 +118,10 @@ struct StyledText {
 
 struct TextSegment {
     text @0 :Text;
-    style @1 :TextStyle;
+    style @1 :ConsoleTextStyle;
 }
 
-struct TextStyle {
+struct ConsoleTextStyle {
     foreground @0 :T.Color;
     background @1 :T.Color;
     bold @2 :Bool;
@@ -122,7 +140,7 @@ struct HyperlinkStyle {
 
 # ── Terminal Control ────────────────────────────────────────────────────
 
-struct CursorPosition {
+struct CellPosition {
     column @0 :UInt32;
     row @1 :UInt32;
 }
@@ -141,14 +159,16 @@ struct TerminalInfo {
     rows @1 :UInt32;
     supportsColor @2 :Bool;
     supportsMouse @3 :Bool;
-    # Backend-decided terminal type identifier (e.g., "xterm", "vt100").
+    # Backend-decided terminal type identifier. Open text: the protocol
+    # never parses it, so a 2046 terminal encoding needs no ordinal and
+    # no consumer needs a table of this decade's emulator names.
     terminalType @4 :Text;
     # Audit-7: console mode (what kind of console this is).
     consoleMode @5 :ConsoleMode;
     # Audit-7: available output capabilities.
-    outputCapabilities @6 :List(OutputCapability);
+    outputCapabilities @6 :List(ConsoleOutputMode);
     # Audit-7: available input capabilities.
-    inputCapabilities @7 :List(InputCapability);
+    inputCapabilities @7 :List(ConsoleInputMode);
 }
 
 # Audit-7: console mode — declares what kind of console backend this is.
@@ -162,8 +182,11 @@ enum ConsoleMode {
     custom @6;
 }
 
-# Audit-7: granular output capability advertisement.
-enum OutputCapability {
+# Audit-7: granular output MODE advertisement — what kind of output this
+# console can deliver. Renamed from OutputCapability: it is a modality
+# list, not an authority declaration, and the old name read as a
+# capability token on every method that took it.
+enum ConsoleOutputMode {
     text @0;           # Plain text output
     styledText @1;     # Styled/rich text output
     audio @2;          # Audio/speech output
@@ -176,7 +199,7 @@ enum OutputCapability {
 }
 
 # Audit-7: granular input capability advertisement.
-enum InputCapability {
+enum ConsoleInputMode {
     keyboard @0;        # Keyboard input
     mouse @1;           # Mouse/trackpad input
     stylus @2;          # Stylus/pen input with pressure
@@ -207,7 +230,7 @@ struct SpatialOutputEvent {
     # Text to display in 3D space.
     text @1 :Text;
     # Text styling.
-    style @2 :TextStyle;
+    style @2 :ConsoleTextStyle;
     # How long the text should remain visible.
     lifetime @3 :T.Duration;
 }
@@ -255,7 +278,7 @@ enum InstrumentZoneKind {
 }
 
 # Audit-7: stylus/pen input event.
-struct StylusInputEvent {
+struct StylusConsoleInputEvent {
     # Position on the surface.
     position @0 :T.Vec2i;
     # Pressure (0.0 - 1.0).
@@ -269,7 +292,7 @@ struct StylusInputEvent {
 }
 
 # Audit-7: eye-tracking gaze input event.
-struct EyeTrackingInputEvent {
+struct EyeTrackingConsoleInputEvent {
     # Gaze point on the screen.
     gazePoint @0 :T.Vec2;
     # Confidence in the gaze measurement (0.0 - 1.0).
@@ -279,13 +302,14 @@ struct EyeTrackingInputEvent {
 }
 
 # Audit-7: spatial gesture input event for AR/VR.
-struct SpatialGestureInputEvent {
+struct SpatialGestureConsoleInputEvent {
     # Gesture name/identifier.
     gesture @0 :Text;
     # Hand position in 3D space.
     hand @1 :T.Vec3;
     # Confidence in the gesture recognition (0.0 - 1.0).
     confidence @2 :Float32;
+    metadata @3 :T.StringMap;
 }
 
 # Audit-7: subtitle/caption entry for accessibility.
@@ -352,19 +376,19 @@ enum ClearArea {
 # ── Service Interface ───────────────────────────────────────────────────
 
 interface ConsoleService {
-    readInput @0 () -> (event :InputEvent);
+    readInput @0 () -> (event :ConsoleInputEvent);
 
     subscribeInput @1 () -> (subscription :InputSubscription);
 
     writeText @2 (text :Text) -> T.VoidResult;
     writeStyled @3 (styled :StyledText) -> T.VoidResult;
 
-    moveCursor @4 (position :CursorPosition) -> T.VoidResult;
+    moveCursor @4 (position :CellPosition) -> T.VoidResult;
     setCursorStyle @5 (style :CursorStyle) -> T.VoidResult;
     clear @6 (area :ClearArea) -> T.VoidResult;
 
     getInfo @7 () -> (info :TerminalInfo);
-    getCursor @8 () -> (position :CursorPosition);
+    getCursor @8 () -> (position :CellPosition);
     getCapabilities @9 () -> (caps :TerminalCapabilities);
 
     subscribeCursor @10 () -> (subscription :CursorSubscription);
@@ -403,7 +427,7 @@ interface ConsoleService {
     stopRecording @22 (sessionId :UInt64) -> (session :ConsoleRecordingSession);
     pauseRecording @23 (sessionId :UInt64) -> T.VoidResult;
     resumeRecording @24 (sessionId :UInt64) -> T.VoidResult;
-    playback @25 (sessionId :UInt64, fromTime :T.Timestamp) -> (events :List(InputEvent));
+    playback @25 (sessionId :UInt64, fromTime :T.Timestamp) -> (events :List(ConsoleInputEvent));
     exportRecording @26 (sessionId :UInt64, format :RecordingFormat) -> (data :T.DataHandle);
     deleteRecording @27 (sessionId :UInt64) -> T.VoidResult;
     listRecordings @28 (pagination :T.Pagination) -> (sessions :List(ConsoleRecordingSession), total :UInt64);
@@ -420,7 +444,7 @@ interface ConsoleService {
     setAccessibilityMetadata @33 (metadata :AccessibilityMetadata) -> T.VoidResult;
 
     # Audit-9: content format negotiation at session start.
-    negotiateFormat @34 (clientFormats :List(OutputCapability)) -> (agreedFormat :OutputCapability);
+    negotiateFormat @34 (clientFormats :List(ConsoleOutputMode)) -> (agreedFormat :ConsoleOutputMode);
 
     # Audit-9: error recovery after backend crash.
     recoverSession @35 () -> (session :ConsoleRecoveryInfo);
@@ -437,10 +461,34 @@ interface ConsoleService {
     # Audit-10: theme negotiation for dark/light mode preference.
     getThemePreference @43 () -> (theme :ThemePreference);
     setThemePreference @44 (theme :ThemePreference) -> T.VoidResult;
-    subscribeTheme @45 () -> (subscription :ThemeSubscription);
+    subscribeTheme @45 () -> (subscription :ConsoleThemeSubscription);
+
+    # Raw byte stream into the focused session. Used by fullscreen apps
+    # (vim, htop, less), remote bridges, and any client that emits escape
+    # codes. The console backend embeds a byte parser, so this round-trips
+    # through the schema cleanly. `data` is opaque: the protocol never
+    # inspects it, so a 2046 terminal encoding needs no new method.
+    writeBytes @46 (data :Data) -> T.VoidResult;
+
+    # Notification from the input service that keyboard/pointer events are
+    # available. The console then pulls them via readInput / subscribeInput
+    # — pull-based data flow; the push is only a wake-up and carries no
+    # payload. Imported from the live OS, which dispatches both.
+    pushInput @47 () -> T.VoidResult;
+
+    # ─────────────────────────────────────────────────────────────────────
+    # MULTIPLEXER ENTRY POINT
+    #
+    # `ConsoleMultiplexer` hands out sessions and arbitrates focus over
+    # shared hardware. It was returned by nothing, so the whole
+    # multiplexing half of this file was uncallable (R8). Handing out a
+    # session and moving focus is an authority-granting act, so it is
+    # gated once here; no multiplexer method takes a capability token
+    # (ai.capnp:578-584).
+    openMultiplexer @48 (authority :Capability) -> (mux :ConsoleMultiplexer);
 }
 
-interface ThemeSubscription {
+interface ConsoleThemeSubscription {
     pull @0 () -> (theme :ThemePreference);
     cancel @1 () -> T.VoidResult;
 }
@@ -458,7 +506,7 @@ struct ConsoleWindow {
     isActive @5 :Bool;
     isVisible @6 :Bool;
     consoleMode @7 :ConsoleMode;
-    allowedCapabilities @8 :List(OutputCapability);
+    allowedCapabilities @8 :List(ConsoleOutputMode);
 }
 
 struct ConsoleWindowConfig {
@@ -467,7 +515,7 @@ struct ConsoleWindowConfig {
     size @2 :T.Vec2i;
     displayId @3 :UInt32;
     consoleMode @4 :ConsoleMode;
-    allowedCapabilities @5 :List(OutputCapability);
+    allowedCapabilities @5 :List(ConsoleOutputMode);
 }
 
 # ── Audit-10: Theme Preference ───────────────────────────────────────────
@@ -492,14 +540,14 @@ enum ThemeMode {
 }
 
 interface InputSubscription {
-    pull @0 () -> (events :List(InputEvent), total :UInt32);
+    pull @0 () -> (events :List(ConsoleInputEvent), total :UInt32);
 
     # Explicitly cancel this subscription and release resources.
     cancel @1 () -> T.VoidResult;
 }
 
 interface CursorSubscription {
-    pull @0 () -> (position :CursorPosition);
+    pull @0 () -> (position :CellPosition);
 
     # Explicitly cancel this subscription and release resources.
     cancel @1 () -> T.VoidResult;
@@ -529,31 +577,12 @@ enum RecordingFormat {
     custom @3;
 }
 
-interface ConsoleRecording {
-    # Start recording a new session.
-    startRecording @0 () -> (session :ConsoleRecordingSession);
-
-    # Stop recording and finalize the session.
-    stopRecording @1 (sessionId :UInt64) -> (session :ConsoleRecordingSession);
-
-    # Pause an active recording.
-    pauseRecording @2 (sessionId :UInt64) -> T.VoidResult;
-
-    # Resume a paused recording.
-    resumeRecording @3 (sessionId :UInt64) -> T.VoidResult;
-
-    # Play back a recorded session.
-    playback @4 (sessionId :UInt64, fromTime :T.Timestamp) -> (events :List(InputEvent));
-
-    # Export a session to a specific format.
-    exportRecording @5 (sessionId :UInt64, format :RecordingFormat) -> (data :T.DataHandle);
-
-    # Delete a recorded session.
-    deleteRecording @6 (sessionId :UInt64) -> T.VoidResult;
-
-    # List all recorded sessions.
-    listRecordings @7 (pagination :T.Pagination) -> (sessions :List(ConsoleRecordingSession), total :UInt64);
-}
+# `interface ConsoleRecording` DELETED. It duplicated ConsoleService's
+# eight recording methods ordinal-for-ordinal and was returned by no
+# method anywhere in the protocol — so it was a second, unreachable
+# authority path for recording. An implementer had to decide whether the
+# reachable methods and the dead interface shared state; now there is
+# nothing to decide. The recording contract lives on ConsoleService.
 
 # ── Audit-9: Console Sandboxing ─────────────────────────────────────────
 # Isolated console sessions for untrusted apps. Each sandboxed session
@@ -562,7 +591,7 @@ struct ConsoleSandbox {
     sessionId @0 :UInt64;
     isIsolated @1 :Bool;
     maxOutputRate @2 :UInt32;
-    allowedOutputCapabilities @3 :List(OutputCapability);
+    allowedOutputCapabilities @3 :List(ConsoleOutputMode);
 }
 
 enum ConsolePowerMode {
@@ -574,13 +603,13 @@ enum ConsolePowerMode {
 }
 
 struct AccessibilityMetadata {
-    role @0 :AccessibilityRole;
+    role @0 :ConsoleRole;
     label @1 :Text;
     description @2 :Text;
     state @3 :List(Text);
 }
 
-enum AccessibilityRole {
+enum ConsoleRole {
     staticText @0;
     editableText @1;
     button @2;
@@ -598,48 +627,46 @@ struct ConsoleRecoveryInfo {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-# v0.0.2 additions — Virtual Terminal Multiplexing
+# Virtual Terminal Multiplexing
 #
-# A kernel/OS typically needs multiple concurrent terminals:
-#   - vc0..vc6 virtual consoles (text + framebuffer-bound)
-#   - serial console (dedicated UART)
-#   - log console (kernel-only)
-#   - bootsplash console (early boot)
+# An OS typically needs several concurrent consoles at once, and they are
+# not interchangeable: an emergency shell must stay available when
+# everything else has crashed, a boot surface exists only until a session
+# manager takes over, a log sink is write-mostly, and an interactive
+# console is what a user actually types at.
 #
-# The multiplexing service hands out a ConsoleSession per logical
-# terminal. Sessions are independent input/output, may be focused
-# one at a time, and may rebind to different output backends.
+# Those are ROLES, and the set of roles is not closed by mathematics —
+# so the role is an open token, not an enum. The previous revision named
+# one platform's console architecture inside the enum and inside the
+# required-field examples (its device-node names, its kernel log device,
+# and two remote-attachment protocols). That is exactly the
+# platform-leak the file's own header forbids, and it left a 2046
+# console with no way to say what it is except `custom @7`.
+#
+# The multiplexing service hands out one ConsoleSession per logical
+# console. Sessions are independent input/output, may be focused one at
+# a time, and may rebind to different output backends.
 # ═══════════════════════════════════════════════════════════════════════
 
-# ── Terminal Classes ────────────────────────────────────────
-# Roles drive the multiplexing policy. Different roles have
-# different priority, ownership, and rerouting rules.
-
-enum TtyClass {
-    # Framebuffer-bound text console (vc0..vcN). Switchable.
-    virtualConsole @0;
-    # GPU-backed graphical terminal (kernel-controlled).
-    graphicalTerminal @1;
-    # Dedicated UART, e.g. for headless servers / early boot.
-    serialConsole @2;
-    # Kernel-only output (klog). Read by privileged tools.
-    kernelLogConsole @3;
-    # Boot-time UI shown until DE takes over.
-    bootSplash @4;
-    # Emergency shell. Always available, even when others crash.
-    safeModeShell @5;
-    # Remote-attached terminal (SSH, IPMI, ...).
-    remoteConsole @6;
-    # Backend-defined role (e.g. hot-pluggable debug console).
-    custom @7;
-}
-
 struct ConsoleSession {
-    # Session identifier (kernel-issued, stable).
+    # Session identifier (issued by the multiplexer, stable).
     handle @0 :UInt64;
-    # Human label (e.g., "vc0", "ttyS0", "kmsg").
+    # Human label — free text chosen by whoever opened the session.
+    # Deliberately open: a label is a display string, not an identifier
+    # any client must parse, and a backend may not have a device node to
+    # name. Unknown labels are ignored by consumers, never rejected.
     label @1 :Text;
-    class @2 :TtyClass;
+    # Open role token. A backend names its own roles; a consumer that
+    # does not recognise a token skips it (ai.capnp:43-47). The roles a
+    # general OS contract can state today:
+    #   "interactive"   — a console a user types at
+    #   "log"           — a write-mostly diagnostic sink
+    #   "boot"          — a surface that exists until a session manager
+    #                     takes over
+    #   "emergency"     — always available, even when other consoles fail
+    #   "debug"         — operator-attached, hot-pluggable
+    # Anything else a backend invents rides in this same open field.
+    class @2 :Text;
     # Encoding for text I/O.
     encoding @3 :Text;
     # Logical geometry in cells.
@@ -647,24 +674,20 @@ struct ConsoleSession {
     rows @5 :UInt32;
     # Whether the session is currently held by a focus owner.
     focused @6 :Bool;
-    # Current permissions — see ConsolePermission.
-    permissions @7 :UInt32;
 }
 
-enum ConsolePermission {
-    # Session accepts keyboard input.
-    inputReadable @0;
-    # Session accepts programmatic input.
-    inputWritable @1;
-    # Subscribers may read session output.
-    outputReadable @2;
-    # Subscribers may write to session output.
-    outputWritable @3;
-    # Session may be forcibly detached on session close.
-    forceCloseable @4;
-    # Backend-defined permission bit.
-    custom @5;
-}
+# ── AUTHORITY — READ THIS BEFORE ADDING A PERMISSION FIELD ──────────────
+# The previous revision carried `permissions :UInt32` beside an enum that
+# named six permission values and assigned none of them a bit. The field
+# was therefore required, unreadable across backends, and a second
+# authority describing what the session reference already grants.
+#
+# It is deleted, not repaired. Authority is the interface reference: the
+# ConsoleSession you hold IS what you may do with that session, gated
+# once at acquisition (DESIGN_PRINCIPLES.md:394, ai.capnp:49-60). A
+# client that may read holds a readable session; a client that may not
+# was never handed one. There is no bit to set, and therefore no bit to
+# disagree about.
 
 # ── Multiplexing Service ─────────────────────────────────────
 # Hands out sessions; arbitrates focus; routes I/O.
@@ -689,7 +712,7 @@ interface ConsoleMultiplexer {
 }
 
 interface ConsoleInputSubscription {
-    pull @0 () -> (events :List(InputEvent));
+    pull @0 () -> (events :List(ConsoleInputEvent));
     cancel @1 () -> T.VoidResult;
 }
 
@@ -711,6 +734,14 @@ struct ConsoleOutputEvent {
     styled @2 :StyledText;
 }
 
+# Unknown values are ignored, never rejected (ai.capnp:43-47). Replaces
+# the previous `custom @5 :Void`, which carried no typeId and no payload
+# and was therefore indistinguishable from "an event I cannot describe".
+struct UnknownConsoleEvent {
+    typeId @0 :UInt64;
+    payload @1 :Data;
+}
+
 struct ConsoleMuxEvent {
     at @0 :UInt64;
     union {
@@ -718,6 +749,6 @@ struct ConsoleMuxEvent {
         sessionClosed @2 :UInt64;
         focusChanged @3 :UInt64;
         sessionChanged @4 :ConsoleSession;
-        custom @5 :Void;
+        unknown @5 :UnknownConsoleEvent;
     }
 }

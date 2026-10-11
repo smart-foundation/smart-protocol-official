@@ -6,6 +6,33 @@
 # Zero-backend-assumption IPC contract. No SQL, no document store, no
 # specific database engine assumed. The backend decides storage strategy.
 #
+# Revamp fixes (this wave):
+#   - Vectors are content, not copied float lists. A top-100 search at
+#     4096 dimensions shipped ~1.6 MB of copied floats per response, plus
+#     the caller's query-vector copy on the way in — the exact pattern
+#     ai.capnp rejects. Vector payloads are T.DataHandle now, with a
+#     documented embedding MimeType convention.
+#   - The value path is a handle. `get`/`set`/`setWithTtl` took and
+#     returned inline `Data` while `exportNamespace` had already been
+#     converted, so any blob-sized value copied inline on every operation.
+#   - The header's "No SQL" claim is true: the query surface is now
+#     CONTENT — a query language is a T.MimeType and the query body is a
+#     T.DataHandle — so a backend declares which languages it accepts
+#     instead of the schema promising a dialect it never specified.
+#     `SchemaMigration` scripts are content too.
+#   - Unbounded result sets are paginated (graph neighbors, community
+#     detection, batch metadata, index listing).
+#   - The change feed can resume: events carry a monotonic `sequence` and
+#     the stream accepts `fromSequence`, so a reconnecting consumer
+#     resumes deterministically instead of replaying or skipping.
+#   - Snapshot ids are typed (T.SnapshotId), and the transaction handle
+#     has one spelling.
+#   - Storage-internals vocabularies (IndexType, ShardStrategy,
+#     SimilarityMetric) became open tokens.
+#   - Dead and duplicated surface is gone: NamespaceQuota, the local
+#     ConnectionPoolConfig (endpoint.capnp is its canonical home) and
+#     the duplicate `KeyValue` entry type.
+#
 # Improvements (audit):
 #   - ChangesSubscription has cancel() for explicit teardown.
 #   - ChangeType has custom variant for forward compatibility.
@@ -18,18 +45,18 @@
 using T = import "types.capnp";
 
 interface Database {
-    get @0 (namespace :Text, key :Text) -> (value :Data);
+    get @0 (namespace :Text, key :Text) -> (result :ValueResult);
     has @1 (namespace :Text, key :Text) -> (exists :Bool);
     # Paginated key listing — replaces unbounded List return.
     listKeys @2 (namespace :Text, prefix :Text, page :T.Pagination) -> (keys :List(Text), total :UInt64);
     count @3 (namespace :Text) -> (count :UInt64);
 
-    set @4 (namespace :Text, key :Text, value :Data) -> T.VoidResult;
+    set @4 (namespace :Text, key :Text, value :T.DataHandle) -> T.VoidResult;
     delete @5 (namespace :Text, key :Text) -> T.VoidResult;
     clear @6 (namespace :Text) -> T.VoidResult;
 
-    setBatch @7 (namespace :Text, entries :List(KeyValue)) -> T.VoidResult;
-    getBatch @8 (namespace :Text, keys :List(Text)) -> (entries :List(KeyValue));
+    setBatch @7 (namespace :Text, entries :List(KeyEntry)) -> T.VoidResult;
+    getBatch @8 (namespace :Text, keys :List(Text)) -> (entries :List(KeyEntry));
     deleteBatch @9 (namespace :Text, keys :List(Text)) -> T.VoidResult;
 
     # Paginated namespace listing.
@@ -39,8 +66,8 @@ interface Database {
     exportNamespace @12 (namespace :Text) -> (data :T.DataHandle);
     importNamespace @13 (namespace :Text, data :T.DataHandle) -> T.VoidResult;
 
-    subscribeChanges @14 (namespace :Text) -> (subscription :ChangesSubscription);
-    pullChanges @15 (subscription :ChangesSubscription) -> (changes :List(KeyChange));
+    subscribeChanges @14 (namespace :Text) -> (subscription :NamespaceChangeSubscription);
+    pullChanges @15 (subscription :NamespaceChangeSubscription) -> (changes :List(KeyChange));
 
     # ─── Typed Values ──────────────────────────────────────────
 
@@ -53,7 +80,7 @@ interface Database {
     # ─── TTL (Time-to-Live) ────────────────────────────────────
 
     # Set key with per-key TTL (auto-expiry).
-    setWithTtl @18 (namespace :Text, key :Text, value :Data, ttl :T.Duration) -> T.VoidResult;
+    setWithTtl @18 (namespace :Text, key :Text, value :T.DataHandle, ttl :T.Duration) -> T.VoidResult;
 
     # Query remaining TTL for a key.
     getTtl @19 (namespace :Text, key :Text) -> (remaining :T.Duration, exists :Bool);
@@ -64,10 +91,10 @@ interface Database {
     # ─── Key Metadata ──────────────────────────────────────────
 
     # Retrieve key metadata without fetching value.
-    getMetadata @21 (namespace :Text, key :Text) -> (metadata :KeyMetadata);
+    getMetadata @21 (namespace :Text, key :Text) -> (metadata :EntryMetadata);
 
     # Retrieve metadata for multiple keys in one call.
-    getBatchMetadata @22 (namespace :Text, keys :List(Text)) -> (metadata :List(KeyMetadata));
+    getBatchMetadata @22 (namespace :Text, page :T.Pagination) -> (metadata :List(EntryMetadata), totalCount :UInt64);
 
     # ─── Transactions ──────────────────────────────────────────
 
@@ -75,13 +102,13 @@ interface Database {
     beginTransaction @23 (namespace :Text, operations :List(TransactionOperation)) -> (transaction :Transaction);
 
     # Commit a transaction atomically.
-    commitTransaction @24 (transactionId :UInt64) -> T.VoidResult;
+    commitTransaction @24 (transactionId :TransactionId) -> T.VoidResult;
 
     # Rollback a transaction.
-    rollbackTransaction @25 (transactionId :UInt64) -> T.VoidResult;
+    rollbackTransaction @25 (transactionId :TransactionId) -> T.VoidResult;
 
     # Query transaction state.
-    getTransactionStatus @26 (transactionId :UInt64) -> (status :TransactionStatus);
+    getTransactionStatus @26 (transactionId :TransactionId) -> (status :TransactionStatus);
 
     # ─── Time-Series ───────────────────────────────────────────
 
@@ -99,77 +126,83 @@ interface Database {
     # Retrieve current schema.
     getSchema @30 () -> (schema :DatabaseSchema);
 
+    # What query languages this backend accepts. A consumer learns the
+    # vocabulary instead of assuming a dialect.
+    getQueryLanguages @31 () -> (languages :List(T.MimeType));
+
     # ─── Namespace Info ────────────────────────────────────────
 
     # Get detailed info for a namespace by ID.
-    getNamespace @31 (namespace :Text) -> (info :NamespaceInfo);
+    getNamespace @32 (namespace :Text) -> (info :NamespaceInfo);
 
     # ─── Watch Key ─────────────────────────────────────────────
 
     # Subscribe to changes on a specific key.
-    watchKey @32 (namespace :Text, key :Text) -> (subscription :KeySubscription);
+    watchKey @33 (namespace :Text, key :Text) -> (subscription :KeyChangeSubscription);
 
     # ─── Compaction ────────────────────────────────────────────
 
     # Trigger compaction/garbage collection for a namespace.
-    compactNamespace @33 (namespace :Text) -> T.VoidResult;
+    compactNamespace @34 (namespace :Text) -> T.VoidResult;
 
     # ─── Namespace Statistics ──────────────────────────────────
 
     # Detailed namespace statistics.
-    getNamespaceStats @34 (namespace :Text) -> (stats :NamespaceStats);
+    getNamespaceStats @35 (namespace :Text) -> (stats :NamespaceStats);
 
     # ─── Backup / Restore ──────────────────────────────────────
 
     # Create a point-in-time backup of a namespace.
-    backupNamespace @35 (namespace :Text) -> (backupId :Text, data :T.DataHandle);
+    backupNamespace @36 (namespace :Text) -> (result :NamespaceBackupResult);
 
     # Restore from a point-in-time backup.
-    restoreNamespace @36 (namespace :Text, backupId :Text) -> T.VoidResult;
+    restoreNamespace @37 (namespace :Text, backupId :T.BackupId) -> T.VoidResult;
 
     # ─── Key History ───────────────────────────────────────────
 
     # Retrieve change history for a specific key.
-    getKeyHistory @37 (namespace :Text, key :Text, page :T.Pagination) -> (history :List(ChangeCaptureEvent), total :UInt64);
+    getKeyHistory @38 (namespace :Text, key :Text, page :T.Pagination) -> (history :List(ChangeCaptureEvent), total :UInt64);
 
     # ─── Encryption ────────────────────────────────────────────
 
     # Encrypt a key's value with specified key.
-    encryptKey @38 (namespace :Text, key :Text, keyId :T.KeyId) -> T.VoidResult;
+    encryptKey @39 (namespace :Text, key :Text, keyId :T.KeyId) -> T.VoidResult;
 
     # Decrypt a key's value (if authorized).
-    decryptKey @39 (namespace :Text, key :Text) -> T.VoidResult;
+    decryptKey @40 (namespace :Text, key :Text) -> T.VoidResult;
 
     # ─── Change Data Capture (CDC) ─────────────────────────────
 
     # Subscribe to a CDC stream with exactly-once delivery guarantees.
-    subscribeChangeStream @40 (options :ChangeStreamOptions) -> (subscription :ChangeStreamSubscription);
+    subscribeChangeStream @41 (options :ChangeStreamOptions) -> (subscription :ChangeStreamSubscription);
 
     # ─── Database Encryption at Rest ──────────────────────────
 
     # Enable encryption for an entire namespace.
-    encryptNamespace @41 (namespace :Text, keyId :T.KeyId) -> T.VoidResult;
+    encryptNamespace @42 (namespace :Text, keyId :T.KeyId) -> T.VoidResult;
 
     # Get encryption status for a namespace.
-    getNamespaceEncryptionStatus @42 (namespace :Text) -> (status :NamespaceEncryptionStatus);
+    getNamespaceEncryptionStatus @43 (namespace :Text) -> (status :NamespaceEncryptionStatus);
 
     # ─── Database Audit Logging ─────────────────────────────────
 
     # Subscribe to audit log for compliance.
-    subscribeAuditLog @43 (filter :AuditLogFilter) -> (subscription :AuditLogSubscription);
+    subscribeAuditLog @44 (filter :AuditLogFilter) -> (subscription :AuditLogSubscription);
 
     # ─── Database Resource Monitoring ──────────────────────────
 
     # Get resource usage metrics for a namespace.
-    getResourceMonitor @44 (namespace :Text) -> (metrics :ResourceMetrics);
+    getResourceMonitor @45 (namespace :Text) -> (metrics :ResourceMetrics);
 
     # ─── Connection Pooling ─────────────────────────────────────
 
     # Get connection pool status.
-    getConnectionPoolStatus @45 () -> (status :ConnectionPoolStatus);
+    getConnectionPoolStatus @46 () -> (status :ConnectionPoolStatus);
 
-    # Configure connection pool.
-    configureConnectionPool @46 (config :ConnectionPoolConfig) -> T.VoidResult;
+    # Removed: `configureConnectionPool`. Pool configuration is the
+    # transport layer's business (endpoint.capnp owns ConnectionPoolConfig);
+    # a key-value service REPORTS its pool state, it does not take
+    # transport configuration.
 
     # ─── SQL-like Query ────────────────────────────────────────
 
@@ -182,21 +215,21 @@ interface Database {
     createIndex @48 (namespace :Text, index :IndexDefinition) -> T.VoidResult;
 
     # List indexes for a namespace.
-    listIndexes @49 (namespace :Text) -> (indexes :List(IndexDefinition));
+    listIndexes @49 (namespace :Text, pagination :T.Pagination) -> (indexes :List(IndexDefinition), totalCount :UInt64);
 
     # ─── Graph Data Model ─────────────────────────────────────
 
     # Add an edge to the graph.
-    addGraphEdge @50 (namespace :Text, edge :GraphEdge) -> T.VoidResult;
+    addGraphEdge @50 (namespace :Text, edge :GraphLink) -> T.VoidResult;
 
     # Find shortest path between two keys.
     shortestPath @51 (namespace :Text, request :GraphQueryRequest) -> (path :GraphPath);
 
     # Detect communities in the graph.
-    detectCommunities @52 (namespace :Text) -> (communities :List(Community));
+    detectCommunities @52 (namespace :Text, pagination :T.Pagination) -> (communities :List(Community), totalCount :UInt64);
 
     # Get neighbors of a key.
-    getNeighbors @53 (namespace :Text, key :Text, edgeType :Text) -> (neighbors :List(GraphEdge));
+    getNeighbors @53 (namespace :Text, key :Text, edgeType :Text, pagination :T.Pagination) -> (neighbors :List(GraphLink), totalCount :UInt64);
 
     # ─── Vector Database ─────────────────────────────────────
 
@@ -204,7 +237,7 @@ interface Database {
     insertVector @54 (namespace :Text, entry :VectorEntry) -> T.VoidResult;
 
     # Search by vector similarity.
-    searchVector @55 (namespace :Text, request :VectorSearchRequest) -> (results :List(VectorSearchResult));
+    searchVector @55 (namespace :Text, request :VectorSearchRequest) -> (results :List(VectorSearchResult), totalCount :UInt64);
 
     # Delete a vector entry.
     deleteVector @56 (namespace :Text, key :Text) -> T.VoidResult;
@@ -223,21 +256,21 @@ interface Database {
     # ─── Multi-Node Replication ──────────────────────────────
 
     # Start replication to a remote node.
-    startReplication @60 (config :DatabaseReplicationConfig) -> (replicationId :Text);
+    startReplication @60 (config :DatabaseReplicationConfig) -> (replicationId :ReplicationId);
 
     # Get replication status.
-    getReplicationStatus @61 (replicationId :Text) -> (status :ReplicationStatus);
+    getReplicationStatus @61 (replicationId :ReplicationId) -> (status :DatabaseReplicationStatus);
 
     # Stop replication.
-    stopReplication @62 (replicationId :Text) -> T.VoidResult;
+    stopReplication @62 (replicationId :ReplicationId) -> T.VoidResult;
 
     # ─── Event Sourcing ──────────────────────────────────────
 
     # Append an event to the event log.
-    appendEvent @63 (namespace :Text, entry :EventLogEntry) -> (eventId :UInt64);
+    appendEvent @63 (namespace :Text, entry :EventLogEntry) -> (eventId :T.EventId);
 
     # Replay events from a given event ID.
-    replayEvents @64 (namespace :Text, fromEventId :UInt64, page :T.Pagination) -> (events :List(EventLogEntry), total :UInt64);
+    replayEvents @64 (namespace :Text, fromEventId :T.EventId, page :T.Pagination) -> (events :List(EventLogEntry), totalCount :UInt64);
 
     # ─── Snapshot Isolation ──────────────────────────────────
 
@@ -245,10 +278,10 @@ interface Database {
     createSnapshot @65 (namespace :Text) -> (snapshot :DatabaseSnapshot);
 
     # Read from a snapshot (consistent point-in-time read).
-    readFromSnapshot @66 (snapshotId :Text, key :Text) -> (value :Data, exists :Bool);
+    readFromSnapshot @66 (snapshotId :T.SnapshotId, key :Text) -> (result :ValueResult);
 
     # Delete a snapshot.
-    deleteSnapshot @67 (snapshotId :Text) -> T.VoidResult;
+    deleteSnapshot @67 (snapshotId :T.SnapshotId) -> T.VoidResult;
 
     # ─── Sharding ────────────────────────────────────────────
 
@@ -259,16 +292,27 @@ interface Database {
     getShardInfo @69 (namespace :Text) -> (shards :List(ShardInfo));
 }
 
-interface ChangesSubscription {
+# Renamed from ChangesSubscription (clipboard.capnp and secret.capnp each
+# declare one): this is the namespace change feed.
+interface NamespaceChangeSubscription {
     pull @0 () -> (changes :List(KeyChange));
     # Explicit cancellation — stops the change stream and releases resources.
     cancel @1 () -> T.VoidResult;
 }
 
-struct KeyValue {
+# The ONE entry type: opaque bytes, an optional decoded view, TTL and
+# version. The previous `KeyValue` (opaque Data) and `KeyEntry` (typed
+# union) were two spellings of one concept used by different batch
+# methods, and `KeyValue` also collided with framebuffer.capnp's.
+struct KeyEntry {
     key @0 :Text;
-    value @1 :Data;
+    value @1 :T.DataHandle;
     timestamp @2 :T.Timestamp;
+    ttl @3 :T.Duration;
+    version @4 :UInt64;
+    # Decoded value when the backend can type it.
+    typed @5 :DatabaseValue;
+    metadata @6 :T.StringMap;
 }
 
 struct NamespaceInfo {
@@ -277,6 +321,22 @@ struct NamespaceInfo {
     # Total size in bytes of all values in this namespace.
     size @2 :UInt64;
     created @3 :T.Timestamp;
+    metadata @4 :T.StringMap;
+}
+
+struct NamespaceBackupResult {
+    union {
+        backup @0 :NamespaceBackup;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct NamespaceBackup {
+    backupId @0 :T.BackupId;
+    data @1 :T.DataHandle;
+    keyCount @2 :UInt64;
+    metadata @3 :T.StringMap;
 }
 
 struct KeyChange {
@@ -284,6 +344,7 @@ struct KeyChange {
     key @1 :Text;
     namespace @2 :Text;
     timestamp @3 :T.Timestamp;
+    metadata @4 :T.StringMap;
 }
 
 enum ChangeType {
@@ -291,6 +352,14 @@ enum ChangeType {
     delete @1;
     clear @2;
     custom @3;
+}
+
+struct ValueResult {
+    union {
+        value @0 :T.DataHandle;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
 
 # ─── Typed Values ─────────────────────────────────────────────
@@ -308,19 +377,9 @@ struct DatabaseValue {
     }
 }
 
-# ─── Key Entry (enriched with TTL and version) ────────────────
-
-struct KeyEntry {
-    key @0 :Text;
-    value @1 :DatabaseValue;
-    timestamp @2 :T.Timestamp;
-    ttl @3 :T.Duration;
-    version @4 :UInt64;
-}
-
 # ─── Key Metadata ─────────────────────────────────────────────
 
-struct KeyMetadata {
+struct EntryMetadata {
     key @0 :Text;
     sizeBytes @1 :UInt64;
     createdAt @2 :T.Timestamp;
@@ -328,21 +387,31 @@ struct KeyMetadata {
     expiresAt @4 :T.Timestamp;
     version @5 :UInt64;
     encrypted @6 :Bool;
+    metadata @7 :T.StringMap;
 }
 
 # ─── Transactions ─────────────────────────────────────────────
 
+# A transaction has ONE handle spelling. The previous shape carried a raw
+# UInt64 `id` that `commitTransaction`/`rollbackTransaction`/
+# `getTransactionStatus` accepted directly, so holding the struct and
+# holding its id both authorized a commit — two authority paths for one
+# handle.
+struct TransactionId { id @0 :UInt64; }
+
 struct Transaction {
-    id @0 :UInt64;
+    id @0 :TransactionId;
     namespace @1 :Text;
     operations @2 :List(TransactionOperation);
     status @3 :TransactionStatus;
+    metadata @4 :T.StringMap;
 }
 
 struct TransactionOperation {
     type @0 :TransactionOpType;
     key @1 :Text;
     value @2 :DatabaseValue;
+    metadata @3 :T.StringMap;
 }
 
 enum TransactionOpType {
@@ -369,7 +438,12 @@ struct ChangeCaptureEvent {
     oldValue @3 :DatabaseValue;
     newValue @4 :DatabaseValue;
     timestamp @5 :T.Timestamp;
-    transactionId @6 :UInt64;
+    transactionId @6 :TransactionId;
+    # Monotonic within the namespace. THE resume cursor: a reconnecting
+    # consumer passes the last sequence it saw and continues
+    # deterministically.
+    sequence @7 :UInt64;
+    metadata @8 :T.StringMap;
 }
 
 # ─── Time-Series ──────────────────────────────────────────────
@@ -395,6 +469,7 @@ struct DatabaseSchema {
     version @0 :UInt32;
     namespaces @1 :List(NamespaceSchema);
     migrations @2 :List(SchemaMigration);
+    metadata @3 :T.StringMap;
 }
 
 struct NamespaceSchema {
@@ -402,18 +477,24 @@ struct NamespaceSchema {
     keyPattern @1 :Text;
     valueType @2 :Text;
     indexes @3 :List(Text);
+    metadata @4 :T.StringMap;
 }
 
 struct SchemaMigration {
     fromVersion @0 :UInt32;
     toVersion @1 :UInt32;
-    upScript @2 :Text;
-    downScript @3 :Text;
+    # Migration scripts are CONTENT (a language plus a body), not a
+    # promised dialect.
+    upScript @2 :T.DataHandle;
+    downScript @3 :T.DataHandle;
+    metadata @4 :T.StringMap;
 }
 
 # ─── Key Subscription ─────────────────────────────────────────
 
-struct KeySubscription {
+# Renamed from KeySubscription (key_management.capnp declares an
+# interface of that name): this is the per-key change feed's handle.
+struct KeyChangeSubscription {
     id @0 :UInt64;
 }
 
@@ -428,25 +509,24 @@ struct NamespaceStats {
     ttlKeyCount @5 :UInt64;
     oldestKey @6 :T.Timestamp;
     newestKey @7 :T.Timestamp;
+    metadata @8 :T.StringMap;
 }
 
-# ─── Namespace Quota ──────────────────────────────────────────
-
-struct NamespaceQuota {
-    namespace @0 :Text;
-    maxSizeBytes @1 :UInt64;
-    maxKeys @2 :UInt64;
-    maxTtlSeconds @3 :UInt64;
-    currentSizeBytes @4 :UInt64;
-    currentKeys @5 :UInt64;
-}
-
+# Removed: NamespaceQuota — a third quota type (after the foundation's
+# T.Quota and the filesystem one), and referenced by no method. Quota
+# belongs to the resource-limit contract, not to the key-value one.
 # ─── Change Data Capture ────────────────────────────────────
 
+# The honest set. `exactlyOnce` used to sit here; it cannot be delivered
+# by a durable-log consumer without a coordinator the protocol does not
+# define, so a backend claiming it either lies or invents one. The feed
+# carries a monotonic `sequence` (see ChangeCaptureEvent) so a consumer
+# can achieve effective-exactly-once itself: resume from the last
+# sequence it processed.
 enum DeliveryGuarantee {
-    atLeastOnce @0;
-    exactlyOnce @1;
-    atMostOnce @2;
+    unspecified @0;
+    atMostOnce @1;
+    atLeastOnce @2;
     custom @3;
 }
 
@@ -454,10 +534,15 @@ struct ChangeStreamOptions {
     namespace @0 :Text;
     # Start reading from this timestamp (0 = from now).
     fromTimestamp @1 :T.Timestamp;
+    # Resume from a monotonic sequence number. Present this and the
+    # stream continues where the consumer stopped instead of replaying
+    # from a timestamp (which may skip or duplicate events).
+    fromSequence @2 :UInt64;
     # Delivery guarantee level.
-    delivery @2 :DeliveryGuarantee;
+    delivery @3 :DeliveryGuarantee;
     # Batch size for events.
-    batchSize @3 :UInt32;
+    batchSize @4 :UInt32;
+    metadata @5 :T.StringMap;
 }
 
 interface ChangeStreamSubscription {
@@ -472,6 +557,7 @@ struct NamespaceEncryptionStatus {
     encrypted @1 :Bool;
     keyId @2 :T.KeyId;
     algorithm @3 :Text;
+    metadata @4 :T.StringMap;
 }
 
 # ─── Audit Log ──────────────────────────────────────────────
@@ -493,6 +579,7 @@ struct AuditLogEntry {
     operation @4 :AuditOperation;
     result @5 :Text;
     ipAddress @6 :Text;
+    metadata @7 :T.StringMap;
 }
 
 struct AuditLogFilter {
@@ -500,6 +587,7 @@ struct AuditLogFilter {
     actor @1 :Text;
     operations @2 :List(AuditOperation);
     since @3 :T.Timestamp;
+    metadata @4 :T.StringMap;
 }
 
 interface AuditLogSubscription {
@@ -518,16 +606,10 @@ struct ResourceMetrics {
     connectionCount @5 :UInt32;
     cacheHitRate @6 :Float32;
     timestamp @7 :T.Timestamp;
+    metadata @8 :T.StringMap;
 }
 
 # ─── Connection Pool ────────────────────────────────────────
-
-struct ConnectionPoolConfig {
-    minConnections @0 :UInt32;
-    maxConnections @1 :UInt32;
-    idleTimeout @2 :T.Duration;
-    maxLifetime @3 :T.Duration;
-}
 
 struct ConnectionPoolStatus {
     activeConnections @0 :UInt32;
@@ -538,38 +620,53 @@ struct ConnectionPoolStatus {
 
 # ─── Query Language ─────────────────────────────────────────
 
+# A query is CONTENT: the language is a T.MimeType and the query body is
+# a T.DataHandle. The previous `query :Text` promised a "SQL-like"
+# dialect the file's own header forbids and nothing specified, so every
+# backend invented one. A backend now declares which query languages it
+# accepts (see `DatabaseDescriptor.queryLanguages`), and a consumer that
+# does not recognise a language ignores it rather than guessing.
 struct QueryRequest {
-    query @0 :Text;
-    parameters @1 :T.StringMap;
-    page @2 :T.Pagination;
+    language @0 :T.MimeType;
+    query @1 :T.DataHandle;
+    parameters @2 :T.StringMap;
+    page @3 :T.Pagination;
 }
 
 struct QueryResult {
+    union {
+        rows @0 :QueryRows;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct QueryRows {
     columns @0 :List(Text);
     rows @1 :List(T.StringMap);
     affectedCount @2 :UInt64;
     page @3 :T.Pagination;
+    # Set when the result was truncated to the page.
+    truncated @4 :Bool;
 }
 
 # ─── Database Indexing ───────────────────────────────────────
 
-enum IndexType {
-    btree @0;
-    hash @1;
-    fullText @2;
-    custom @3;
-}
-
+# Index kind as an open token ("btree", "hash", "fullText", ...):
+# storage-internals vocabulary. A 2046 index structure is a string.
 struct IndexDefinition {
     name @0 :Text;
-    indexType @1 :IndexType;
+    indexType @1 :Text;
     fields @2 :List(Text);
     unique @3 :Bool;
+    metadata @4 :T.StringMap;
 }
 
 # ─── Graph Data Model ───────────────────────────────────────
 
-struct GraphEdge {
+# Renamed from GraphEdge (system_search.capnp declares its own): this is
+# the database graph's link type.
+struct GraphLink {
     fromKey @0 :Text;
     toKey @1 :Text;
     edgeType @2 :Text;
@@ -579,8 +676,9 @@ struct GraphEdge {
 
 struct GraphPath {
     nodes @0 :List(Text);
-    edges @1 :List(GraphEdge);
+    edges @1 :List(GraphLink);
     totalWeight @2 :Float64;
+    metadata @3 :T.StringMap;
 }
 
 struct Community {
@@ -588,6 +686,7 @@ struct Community {
     members @1 :List(Text);
     size @2 :UInt32;
     internalDensity @3 :Float32;
+    metadata @4 :T.StringMap;
 }
 
 struct GraphQueryRequest {
@@ -596,36 +695,48 @@ struct GraphQueryRequest {
     endKey @2 :Text;
     edgeType @3 :Text;
     maxDepth @4 :UInt32;
+    metadata @5 :T.StringMap;
 }
 
-# ─── Vector Database ───────────────────────────────────────
-
-enum SimilarityMetric {
-    cosine @0;
-    euclidean @1;
-    dotProduct @2;
-    manhattan @3;
-    custom @4;
-}
+# ─── Vector Database ────────────────────────────────────────
+#
+# Dense vectors are CONTENT: a 4096-dimension embedding is 16 KB of
+# floats, and a top-100 search used to copy ~1.6 MB of them into one
+# response (plus the query vector on the way in). The convention is
+# `application/vnd.smart.embedding` (see ai.capnp): little-endian
+# Float32, row-major, with the dimension count and element type declared
+# in `parameters`. A consumer that does not recognise the type ignores
+# the payload rather than misreading it.
+#
+# The similarity metric is an open token ("cosine", "euclidean",
+# "dotProduct", ...): the mathematical set is defensible, the spellings
+# are not, and the token lets a backend report what it actually used.
 
 struct VectorEntry {
     key @0 :Text;
-    vector @1 :List(Float32);
-    metadata @2 :T.StringMap;
+    vector @1 :T.DataHandle;
+    # Dimension count, element type ("float32") and layout as declared
+    # data, so the encoding travels with the payload.
+    parameters @2 :T.StringMap;
+    metadata @3 :T.StringMap;
 }
 
 struct VectorSearchRequest {
     namespace @0 :Text;
-    queryVector @1 :List(Float32);
-    metric @2 :SimilarityMetric;
+    queryVector @1 :T.DataHandle;
+    # Similarity metric as an open token.
+    metric @2 :Text;
     topK @3 :UInt32;
     filter @4 :T.StringMap;
+    page @5 :T.Pagination;
 }
 
 struct VectorSearchResult {
     key @0 :Text;
     score @1 :Float32;
-    vector @2 :List(Float32);
+    # Present only when the caller asked for the vector itself; a search
+    # no longer ships vectors nobody requested.
+    vector @2 :T.DataHandle;
     metadata @3 :T.StringMap;
 }
 
@@ -657,57 +768,63 @@ enum ReplicationStrategy {
     custom @3;
 }
 
+# A replication stream's id, typed so it cannot be confused with any
+# other Text id in the file.
+struct ReplicationId { id @0 :UInt64; }
+
 struct DatabaseReplicationConfig {
     targetNamespace @0 :Text;
     targetNodeId @1 :Text;
     strategy @2 :ReplicationStrategy;
     syncInterval @3 :T.Duration;
     conflictResolution @4 :Text;
+    metadata @5 :T.StringMap;
 }
 
-struct ReplicationStatus {
+struct DatabaseReplicationStatus {
     sourceNamespace @0 :Text;
     targetNodeId @1 :Text;
     state @2 :Text;
     lagMs @3 :UInt64;
     lastSyncAt @4 :T.Timestamp;
+    metadata @5 :T.StringMap;
 }
 
 # ─── Event Sourcing ────────────────────────────────────────
 
 struct EventLogEntry {
-    eventId @0 :UInt64;
+    eventId @0 :T.EventId;
     namespace @1 :Text;
     key @2 :Text;
+    # Event kind as an open token.
     eventType @3 :Text;
-    payload @4 :Data;
+    # Event payload as content.
+    payload @4 :T.DataHandle;
     timestamp @5 :T.Timestamp;
     metadata @6 :T.StringMap;
 }
 
+
 # ─── Snapshot Isolation ────────────────────────────────────
 
 struct DatabaseSnapshot {
-    snapshotId @0 :Text;
+    snapshotId @0 :T.SnapshotId;
     namespace @1 :Text;
     createdAt @2 :T.Timestamp;
     keyCount @3 :UInt64;
+    metadata @4 :T.StringMap;
 }
 
 # ─── Sharding ──────────────────────────────────────────────
 
-enum ShardStrategy {
-    hash @0;
-    range @1;
-    geo @2;
-    custom @3;
-}
-
+# Sharding strategy as an open token ("hash", "range", "geo", ...):
+# how a namespace is partitioned is storage-internals vocabulary.
 struct ShardConfig {
     namespace @0 :Text;
-    strategy @1 :ShardStrategy;
+    strategy @1 :Text;
     shardCount @2 :UInt32;
     shardKey @3 :Text;
+    metadata @4 :T.StringMap;
 }
 
 struct ShardInfo {
@@ -717,4 +834,5 @@ struct ShardInfo {
     keyCount @3 :UInt64;
     sizeBytes @4 :UInt64;
     nodeId @5 :Text;
+    metadata @6 :T.StringMap;
 }

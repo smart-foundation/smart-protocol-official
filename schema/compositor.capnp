@@ -1,47 +1,180 @@
 @0xa1b2c3d4e5f60005;
 
 # ══════════════════════════════════════════════════════════════════════
-# Compositor — display composition, surface management, input routing,
-# drag-and-drop, accessibility, and theming. Backend-agnostic: works
-# with Wayland, X11, macOS CoreGraphics, or custom compositors.
+# Compositor — display composition and the ONE surface commit path.
 #
-# Improvements:
-#   - Session.HandshakeRequest.applicationId uses T.AppId.
-#   - SurfaceUpdate.appId uses T.AppId.
-#   - ShutdownEvent.gracePeriodMs → T.Duration (backend-agnostic time).
-#   - DndEvent.action uses typed DragAction enum.
-#   - All Data payloads >1KB use T.DataHandle (DragData, thumbnails,
-#     icons, cursor images, unknown events).
-#   - CompositorStats time fields use T.Duration.
-#   - AccessibilityAction.id uses T.AccessNodeId.
-#   - listLayers accepts T.Pagination.
-#   - All subscription interfaces have cancel methods.
-#   - All enums have other/custom variants for forward compatibility.
+# WHAT THIS IS
+#   The compositor is the component that owns presentation: outputs,
+#   surfaces, the frame lifecycle, the cursor, drag-and-drop, input
+#   routing and screen capture. Every app talks to it through ONE
+#   interface, `Session`, obtained by handshake. There is no second
+#   compositor contract and no standalone surface contract: surface.capnp
+#   was merged into this file (its `FrameSubmission`/`SurfaceCommit`
+#   fork and its `SyncFence.native :UInt64` are gone) and deleted.
 #
-# Audit-7 improvements:
-#   - SurfaceRole extended: gameLoop, voiceOnly, spatialAnchor, splitZone, floatingPin.
-#   - HdrMetadata struct for HDR color management.
-#   - SpatialPose / SpatialAnchor for AR/VR spatial surfaces.
-#   - DisplayZone for multi-display orchestration.
-#   - AnimationDefinition for animation pipeline.
-#   - SurfaceAccessControl for per-surface security.
-#   - CompositorHealth for health monitoring.
-#   - StateSnapshot for state persistence.
-#   - RemoteAccessConfig for remote compositor access.
-#   - ResourceLimits for GPU/surface resource management.
-#   - Session methods: updateAccessibilityTree, createDisplayZone, defineAnimation,
-#     setSpatialPose, createSpatialAnchor, setSurfaceAccessControl, getHealthCheck,
-#     saveState, restoreState, setRemoteAccess, getResourceLimits, setResourceLimits.
+# WHO CONSUMES IT
+#   Apps (create a surface, commit frames, read events), the window
+#   manager (reorders and places surfaces), the shell (panels, bubbles).
+#
+# WHAT IS DELIBERATELY OPAQUE
+#   Buffer identity (`T.BufferId`), fences (`T.FenceHandle`), surface
+#   roles and capability kinds (open tokens). The backend decides how a
+#   surface is backed, how a fence is signalled, and which capability
+#   vocabularies it recognises. Nothing here names a display server, a
+#   rendering API or a display protocol.
+#
+# THE COMMIT PATH (one path, typed end to end)
+#   `attachBuffer` binds a buffer to a surface by `T.BufferId`.
+#   `commit` then submits `SurfaceCommit`, which references that same
+#   `T.BufferId`, carries damage as geometry, presents on a
+#   `PresentIntent`, and waits on a `SyncFence` that holds a
+#   `T.FenceHandle`. Buffer identity, fence identity and damage are
+#   opaque/typed everywhere; there is no `UInt8` buffer index and no
+#   `UInt64` "native" fence handle to reinterpret per backend.
+#
+# HOW IT RELATES TO OTHER SERVICES
+#   accessibility.capnp owns the accessibility tree (this file only binds
+#   a surface to a tree root). theme.capnp owns theme tokens (this file
+#   only relays them). windowmanager.capnp places windows on these
+#   outputs and imports this file's output types and session handshake.
+#   shell.capnp aggregates; it does not re-describe surfaces.
+#
+# This file publishes the batch's canonical service-session handshake
+# (`SessionRequest`/`SessionResponse`/`CapabilityRequest`); windowmanager,
+# ime and shell import it rather than declaring rival shapes. Event unions
+# terminate with the protocol's canonical `T.UnknownEvent`.
 # ══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using Theme = import "theme.capnp";
 
 # ══════════════════════════════════════════════════════════════════════
-# SESSION (new interface, ordinal 13)
-# Every app starts here. One session per app.
+# SERVICE SESSION HANDSHAKE
+#
+# One pattern for every session-based service in the protocol: compositor,
+# windowmanager, ime, shell. A capability kind invented in any later year
+# is expressible on the day it is invented, because the request is a union
+# whose `standard` arm is an OPEN TOKEN, not a frozen enum — the wm/shell/ime
+# handshakes used to freeze their capability sets as closed enums, which
+# made a future capability unrequestable without a schema edit.
+#
+# Authority: the granted references ARE the authority. Nothing in this
+# file re-implements access control, and no method checks a permission
+# string.
 # ══════════════════════════════════════════════════════════════════════
 
-interface Session {
+struct SessionRequest {
+    applicationId   @0 :T.AppId;
+    applicationName @1 :Text;
+    version         @2 :T.Version;
+    protocolVersion @3 :T.Version;
+    capabilities    @4 :List(CapabilityRequest);
+    metadata        @5 :List(T.Meta);
+}
+
+struct SessionResponse {
+    sessionId     @0 :T.SessionId;
+    agreedVersion @1 :T.Version;
+    granted       @2 :List(GrantedCapability);
+    denied        @3 :List(DeniedCapability);
+    service       @4 :ServiceInfo;
+    result        @5 :HandshakeResult;
+    metadata @6 :T.StringMap;
+}
+
+enum HandshakeResult {
+    accepted             @0;
+    acceptedDegraded     @1;
+    rejectedNoCapacity   @2;
+    rejectedUnauthorized @3;
+    rejectedBadVersion   @4;
+    other                @5;
+    custom               @6;
+}
+
+# What a session-based service publishes about itself. `capabilities` is
+# an open vocabulary — see the conformance tokens at the end of this file.
+struct ServiceInfo {
+    name         @0 :Text;
+    version      @1 :T.Version;
+    capabilities @2 :List(Text);
+    metadata     @3 :List(T.Meta);
+}
+
+struct CapabilityRequest {
+    union {
+        # Open token. A capability the backend recognises is granted; one
+        # it does not is denied with a reason, never silently ignored.
+        standard @0 :Text;
+        # Global hotkey registration, which needs a binding, not just a name.
+        hotkeys  @1 :List(HotkeyRequest);
+        # A capability with parameters the schema does not model.
+        custom   @2 :CustomCapability;
+        unknown  @3 :Void;
+    }
+}
+
+struct HotkeyRequest {
+    key         @0 :LogicalKey;
+    modifiers   @1 :T.ModifierState;
+    description @2 :Text;
+}
+
+struct CustomCapability {
+    name       @0 :Text;
+    parameters @1 :List(T.Meta);
+}
+
+struct GrantedCapability {
+    capability @0 :CapabilityRequest;
+    # Typed capability handle (opaque; backend-issued).
+    capabilityHandle @1 :T.CapabilityHandle;
+}
+
+struct DeniedCapability {
+    capability @0 :CapabilityRequest;
+    reason     @1 :DenialReason;
+    message    @2 :Text;
+}
+
+enum DenialReason {
+    notSupported      @0;
+    notAuthorized     @1;
+    resourceExhausted @2;
+    requiresConsent   @3;
+    servicePolicy     @4;
+    other             @5;
+    custom            @6;
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SESSION — the one compositor contract
+#
+# Ordinal policy. Cap'n Proto requires interface ordinals to be sequential
+# with no holes, so removing a method renumbers the ones after it. Pre-release
+# this is free, and the mapping below is recorded so an implementer holding an
+# older draft never has to guess:
+#
+#   unchanged  @0–@23   (handshake … updateAccessibilityTree)
+#   @24        defineAnimation          was @25
+#   @25        setSpatialPose           was @26
+#   @26        createSpatialAnchor      was @27
+#   @27        destroySpatialAnchor     was @28
+#   @28–@37    buffer/frame/capture/layer/inhibit surface, merged from the
+#             deleted surface.capnp and the deleted flat `Compositor`
+#             interface (attachBuffer, getSurfaceState, getFrameMetrics,
+#             capture, listLayers, setSurfaceOrder, raiseSurface,
+#             lowerSurface, inhibitOutput, uninhibitOutput)
+#   deleted    createDisplayZone, setSurfaceAccessControl, getHealthCheck,
+#             saveState/restoreState, setRemoteAccess,
+#             get/setResourceLimits, add/removeKeyframe, playAnimation,
+#             acquireDrmKeys/releaseDrmKeys, subscribeLiveRegionChanges,
+#             getGestureResult, loadPlugin/unloadPlugin, and the whole
+#             legacy flat `Compositor` interface with its four subscription
+#             interfaces
+# ══════════════════════════════════════════════════════════════════════
+
+interface CompositorSession {
 
     struct HandshakeRequest {
         applicationId   @0 :T.AppId;
@@ -53,22 +186,12 @@ interface Session {
     }
 
     struct HandshakeResponse {
-        sessionId      @0 :T.SessionId;
-        agreedVersion  @1 :T.Version;
-        granted        @2 :List(GrantedCapability);
-        denied         @3 :List(DeniedCapability);
-        compositor     @4 :CompositorInfo;
-        result         @5 :HandshakeResult;
-    }
-
-    enum HandshakeResult {
-        accepted             @0;
-        acceptedDegraded     @1;
-        rejectedNoCapacity   @2;
-        rejectedUnauthorized @3;
-        rejectedBadVersion   @4;
-        other                @5;
-        custom               @6;
+        sessionId     @0 :T.SessionId;
+        agreedVersion @1 :T.Version;
+        granted       @2 :List(GrantedCapability);
+        denied        @3 :List(DeniedCapability);
+        compositor    @4 :ServiceInfo;
+        result        @5 :HandshakeResult;
     }
 
     handshake @0 (request :HandshakeRequest)
@@ -89,7 +212,7 @@ interface Session {
 
     # ── Hot Path ──────────────────────────────────────────────
 
-    commit         @5 (commit :SurfaceCommit) -> ();
+    commit @5 (commit :SurfaceCommit) -> (result :T.VoidResult);
 
     # ── Escape Hatch ──────────────────────────────────────────
 
@@ -111,7 +234,8 @@ interface Session {
     showCursor         @15 () -> (result :T.VoidResult);
     getCursorTheme     @16 () -> (theme :CursorTheme);
     setCursorTheme     @17 (theme :CursorTheme) -> (result :T.VoidResult);
-    listCursorThemes   @18 (pagination :T.Pagination) -> (themes :List(CursorThemeInfo), totalCount :UInt32);
+    listCursorThemes   @18 (pagination :T.Pagination)
+                           -> (themes :List(CursorThemeInfo), total :UInt64);
 
     # ── Drag and Drop ─────────────────────────────────────────
 
@@ -121,217 +245,74 @@ interface Session {
 
     # ── Query ─────────────────────────────────────────────────
 
-    query           @21 (query :Query) -> (result :QueryResult);
+    query @21 (query :Query, pagination :T.Pagination) -> (result :CompositorQueryResult);
 
     # ── Events ────────────────────────────────────────────────
 
-    subscribe       @22 (filter :EventFilter)
-                    -> (stream :EventStream);
+    subscribe @22 (filter :EventFilter) -> (stream :EventStream);
 
-    # ── Accessibility tree propagation (audit-7) ──
-    updateAccessibilityTree @23 (surface :T.SurfaceId, tree :AccessibilityTree) -> T.VoidResult;
+    # ── Accessibility binding ─────────────────────────────────
+    # The tree itself lives in accessibility.capnp. This binds a surface to
+    # the root of its tree so a backend can route events to the right app.
 
-    # ── Multi-display zone coordination (audit-7) ──
-    createDisplayZone @24 (request :DisplayZoneRequest) -> (zone :DisplayZone);
+    updateAccessibilityTree @23 (surface :T.SurfaceId, root :T.AccessNodeId)
+                              -> T.VoidResult;
 
-    # ── Animation pipeline (audit-7) ──
-    defineAnimation @25 (request :AnimationDefinitionRequest) -> (animationId :UInt64);
+    # ── Animation ─────────────────────────────────────────────
+    # Uses the canonical T.AnimationSpec. There is no keyframe interface:
+    # keyframe interpolation is a rendering-engine concern, and
+    # T.AnimationSpec already carries the curve and its parameters.
 
-    # ── Spatial surface management (audit-7 false positive: compositor_spatial.capnp belongs here) ──
-    setSpatialPose @26 (surface :T.SurfaceId, pose :SpatialPose) -> T.VoidResult;
-    createSpatialAnchor @27 (surface :T.SurfaceId, anchor :SpatialAnchor) -> T.VoidResult;
-    destroySpatialAnchor @28 (anchorId :Text) -> T.VoidResult;
+    defineAnimation @24 (request :AnimationDefinitionRequest)
+                     -> (animationId :UInt64);
 
-    # ── Surface security (audit-7) ──
-    setSurfaceAccessControl @29 (surface :T.SurfaceId, control :SurfaceAccessControl) -> T.VoidResult;
+    # ── Spatial ───────────────────────────────────────────────
 
-    # ── Compositor health (audit-7) ──
-    getHealthCheck @30 () -> (health :CompositorHealth);
+    setSpatialPose @25 (surface :T.SurfaceId, pose :SurfaceSpatialPose) -> T.VoidResult;
+    createSpatialAnchor @26 (surface :T.SurfaceId, anchor :SpatialAnchor)
+                         -> (anchorId :UInt64);
+    destroySpatialAnchor @27 (anchorId :UInt64) -> T.VoidResult;
 
-    # ── Compositor state persistence (audit-7) ──
-    saveState @31 () -> (snapshot :StateSnapshot);
-    restoreState @32 (snapshot :StateSnapshot) -> T.VoidResult;
+    # ── Buffers and frame state (merged from surface.capnp) ───
 
-    # ── Remote compositor access (audit-7) ──
-    setRemoteAccess @33 (config :RemoteAccessConfig) -> T.VoidResult;
+    attachBuffer @28 (surface :T.SurfaceId, buffer :T.BufferId,
+                      offset :T.Vec2i) -> T.VoidResult;
 
-    # ── Compositor resource management (audit-7) ──
-    getResourceLimits @34 () -> (limits :ResourceLimits);
-    setResourceLimits @35 (limits :ResourceLimits) -> T.VoidResult;
+    getSurfaceState @29 (surface :T.SurfaceId) -> (state :SurfaceState);
 
-    # ── Animation engine keyframe methods (audit-9 What's Still Missing) ──
-    addKeyframe @36 (animationId :UInt64, keyframe :Keyframe) -> T.VoidResult;
-    removeKeyframe @37 (animationId :UInt64, keyframeIndex :UInt32) -> T.VoidResult;
-    playAnimation @38 (animationId :UInt64) -> T.VoidResult;
+    getFrameMetrics @30 (surface :T.SurfaceId) -> (metrics :FrameMetrics);
 
-    # ── DRM session management (audit-9 What's Still Missing) ──
-    acquireDrmKeys @39 (surface :T.SurfaceId, drmInfo :DrmInfo) -> (keyHandle :UInt64);
-    releaseDrmKeys @40 (keyHandle :UInt64) -> T.VoidResult;
+    # ── Capture (merged from surface.capnp and the legacy flat interface) ──
+    # One capture authority for the whole protocol. `format` is an open
+    # content type: a 2035 codec needs no ordinal.
 
-    # ── Live region accessibility events (audit-9 What's Still Missing) ──
-    subscribeLiveRegionChanges @41 (filter :LiveRegionFilter) -> (subscription :LiveRegionSubscription);
+    capture @31 (request :CaptureRequest) -> (result :CompositorCaptureResult);
 
-    # ── Gesture recognition results (audit-9 What's Still Missing) ──
-    getGestureResult @42 (sessionId :T.DragSessionId) -> (result :GestureResult);
+    # ── Layers and stacking (merged from the legacy flat interface) ──
 
-    # ── Plugin loading/unloading (audit-9 What's Still Missing) ──
-    loadPlugin @43 (pluginId :Text) -> (plugin :PluginInfo);
-    unloadPlugin @44 (pluginId :Text) -> T.VoidResult;
+    listLayers @32 (output :T.OutputId, pagination :T.Pagination)
+               -> (layers :List(LayerInfo), total :UInt64);
+
+    setSurfaceOrder @33 (surface :T.SurfaceId, order :SurfaceOrder)
+                     -> (result :T.VoidResult);
+
+    raiseSurface  @34 (surface :T.SurfaceId) -> (result :T.VoidResult);
+    lowerSurface  @35 (surface :T.SurfaceId) -> (result :T.VoidResult);
+
+    # ── Output power inhibition (merged from the legacy flat interface) ──
+
+    inhibitOutput @36 (output :T.OutputId, reason :Text)
+                   -> (handle :T.InhibitHandle);
+    uninhibitOutput @37 (handle :T.InhibitHandle) -> (result :T.VoidResult);
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# EXISTING COMPOSITOR INTERFACE
-# Ordinals 0-25 preserved exactly as-is.
-# ══════════════════════════════════════════════════════════════════════
-
-interface Compositor {
-    createLayer @0 (outputId :T.OutputId) -> (layerId :UInt64);
-    destroyLayer @1 (layerId :UInt64) -> T.VoidResult;
-    reorderLayers @2 (outputId :T.OutputId, layers :List(UInt64)) -> T.VoidResult;
-    addSurface @3 (layerId :UInt64, surfaceId :T.SurfaceId) -> T.VoidResult;
-    removeSurface @4 (layerId :UInt64, surfaceId :T.SurfaceId) -> T.VoidResult;
-
-    setCursor @5 (surfaceId :T.SurfaceId, hotspot :T.Vec2i) -> T.VoidResult;
-    hideCursor @6 () -> T.VoidResult;
-    showCursor @7 () -> T.VoidResult;
-    warpCursor @8 (position :T.Vec2i) -> T.VoidResult;
-    confineCursor @9 (region :T.Region) -> T.VoidResult;
-    getCursorState @10 () -> (state :CursorState);
-
-    startDrag @11 (surfaceId :T.SurfaceId, icon :T.SurfaceId, source :Text) -> (sessionId :T.DragSessionId);
-    cancelDrag @12 (sessionId :T.DragSessionId) -> T.VoidResult;
-    subscribeDnd @13 () -> (subscription :DndSubscription);
-
-    setInputFocus @14 (surfaceId :T.SurfaceId) -> T.VoidResult;
-    subscribeInput @15 () -> (subscription :InputSubscription);
-
-    requestFrameCallback @16 (callback :UInt64) -> T.VoidResult;
-
-    inhibitScreensaver @17 (clientId :T.ClientId, reason :Text) -> (handle :T.InhibitHandle);
-    uninhibit @18 (handle :T.InhibitHandle) -> T.VoidResult;
-
-    captureOutput @19 (outputId :T.OutputId, format :T.PixelFormat) -> (captureId :T.CaptureId);
-
-    setCursorShape @20 (shape :T.CursorShape) -> T.VoidResult;
-
-    listLayers @21 (outputId :T.OutputId, pagination :T.Pagination) -> (layers :List(LayerInfo), totalCount :UInt32);
-
-    subscribeGestures @22 () -> (subscription :GestureSubscription);
-}
-
-interface DndSubscription {
-    pull @0 () -> (event :DndEvent);
-
-    # Explicitly cancel this subscription and release resources.
-    cancel @1 () -> T.VoidResult;
-}
-
-interface InputSubscription {
-    pull @0 () -> (event :InputEvent);
-
-    # Explicitly cancel this subscription and release resources.
-    cancel @1 () -> T.VoidResult;
-}
-
-struct CursorState {
-    surfaceId @0 :T.SurfaceId;
-    hotspot @1 :T.Vec2i;
-    position @2 :T.Vec2i;
-    visible @3 :Bool;
-}
-
-struct DndEvent {
-    sessionId @0 :T.DragSessionId;
-    action @1 :DragAction;
-    position @2 :T.Vec2i;
-    mimeTypes @3 :List(Text);
-}
-
-struct InputEvent {
-    type @0 :InputEventType;
-    timestamp @1 :T.Timestamp;
-    keyboard @2 :KeyboardEvent;
-    pointer @3 :PointerEvent;
-    touch @4 :TouchEvent;
-    scroll @5 :ScrollEvent;
-}
-
-enum InputEventType {
-    keyboard @0;
-    pointer @1;
-    touch @2;
-    gamepad @3;
-    scroll @4;
-    other @5;
-    custom @6;
-}
-
-struct KeyboardEvent {
-    key @0 :UInt32;
-    scancode @1 :UInt32;
-    mods @2 :T.ModifierState;
-    pressed @3 :Bool;
-}
-
-struct PointerEvent {
-    button @0 :UInt32;
-    position @1 :T.Vec2i;
-    delta @2 :T.Vec2i;
-    buttons @3 :UInt32;
-    mods @4 :T.ModifierState;
-}
-
-struct TouchEvent {
-    slot @0 :Int32;
-    position @1 :T.Vec2i;
-    pressure @2 :Float32;
-    touched @3 :Bool;
-}
-
-struct ScrollEvent {
-    position @0 :T.Vec2i;
-    scrollX @1 :Float32;
-    scrollY @2 :Float32;
-    discreteX @3 :Int32;
-    discreteY @4 :Int32;
-    mods @5 :T.ModifierState;
-}
-
-struct LayerInfo {
-    id @0 :UInt64;                    # Deprecated: use layerId. Kept for ordinal stability.
-    name @1 :Text;
-    zBase @2 :Int32;
-    surfaces @3 :List(T.SurfaceId);
-    # Typed layer identifier (preferred over raw id field above).
-    layerId @4 :T.LayerId;
-}
-
-interface GestureSubscription {
-    pull @0 () -> (event :T.GestureEvent);
-
-    # Explicitly cancel this subscription and release resources.
-    cancel @1 () -> T.VoidResult;
-}
-
-# ── Session Types (moved from inside Session interface) ──────
+# ── CompositorSession types ─────────────────────────────────────────────
 
 struct CompositorInfo {
-    name            @0 :Text;
-    version         @1 :T.Version;
-    protocolVersion @2 :T.Version;
-    capabilities    @3 :List(CapabilityKind);
-    backend         @4 :BackendKind;
-    metadata        @5 :List(T.Meta);
-}
-
-enum BackendKind {
-    native   @0;
-    nested   @1;
-    remote   @2;
-    headless @3;
-    embedded @4;
-    unknown  @5;
-    custom   @6;
+    name         @0 :Text;
+    version      @1 :T.Version;
+    capabilities @2 :List(Text);
+    metadata     @3 :List(T.Meta);
 }
 
 enum GoodbyeReason {
@@ -342,41 +323,17 @@ enum GoodbyeReason {
     custom    @4;
 }
 
-# ── Surface ──────────────────────────────────────────────────
+# ── Surface ───────────────────────────────────────────────────
 
 struct SurfaceRequest {
-    role     @0 :SurfaceRole;
+    # Open token. A surface kind is backend/WM policy, not interop: a
+    # compositor for a paradigm with no "dialog" and no "dock" has no
+    # ordinal to use. Conformance tokens are published at the end of this
+    # file; an unrecognised role is treated as `other`.
+    kind     @0 :Text;
     geometry @1 :GeometryHint;
     parent   @2 :T.SurfaceId;
     metadata @3 :List(T.Meta);
-}
-
-enum SurfaceRole {
-    window         @0;
-    dialog         @1;
-    tooltip        @2;
-    popup          @3;
-    menu           @4;
-    notification   @5;
-    panel          @6;
-    wallpaper      @7;
-    overlay        @8;
-    splash         @9;
-    screensaver    @10;
-    spatial        @11;
-    kiosk          @12;
-    dock           @13;
-    osd            @14;
-    virtualKeyboard @15;
-    accessibility  @16;
-    custom         @17;
-    other          @18;
-    # Audit-7 additions: multi-device surface classes
-    gameLoop       @19;
-    voiceOnly      @20;
-    spatialAnchor  @21;
-    splitZone      @22;
-    floatingPin    @23;
 }
 
 struct GeometryHint {
@@ -389,13 +346,16 @@ struct GeometryHint {
 }
 
 enum PlacementHint {
-    compositorChooses @0;
-    centered          @1;
-    underPointer      @2;
-    nearParent        @3;
-    cascadeFromParent @4;
-    custom            @5;
-    other             @6;
+    # Absent means the backend decides; it must never silently mean a
+    # specific paradigm value.
+    unspecified @0;
+    compositorChooses @1;
+    centered @2;
+    underPointer @3;
+    nearParent @4;
+    cascadeFromParent @5;
+    custom @6;
+    other @7;
 }
 
 struct SurfaceResponse {
@@ -416,23 +376,31 @@ enum SurfaceResult {
 
 struct SurfaceUpdate {
     union {
-        title    @0 :Text;
-        appId    @1 :T.AppId;
-        icon     @2 :IconData;
-        metadata @3 :List(T.Meta);
-        accessibilityTree @4 :AccessibilityTree;
+        title       @0 :Text;
+        appId       @1 :T.AppId;
+        icon        @2 :IconData;
+        metadata    @3 :List(T.Meta);
+        geometry    @4 :GeometryHint;
+        # Backend-specific update, as open key/value data.
+        custom      @5 :T.StringMap;
+        unknown     @6 :Void;
     }
 }
 
 struct IconData {
     union {
-        named  @0 :Text;
-        pixels @1 :T.DataHandle;
+        named   @0 :Text;
+        pixels  @1 :T.DataHandle;
+        unknown @2 :Void;
     }
-    size @2 :T.Vec2;
+    size @3 :T.Vec2;
 }
 
-# ── Surface Hints ────────────────────────────────────────────
+# ── Surface Hints ─────────────────────────────────────────────
+# Declarations by the app; the compositor decides how to honour them.
+# The rendering directives that used to live in surface.capnp
+# (material vocabulary, blur radius, GPU selection) are gone: styling
+# belongs to theme tokens and renderer choice belongs to the backend.
 
 struct SurfaceHints {
     skipDecorations @0 :Bool;
@@ -445,7 +413,11 @@ struct SurfaceHints {
     anchor          @7 :AnchorEdges;
     layer           @8 :SurfaceLayer;
     interactivity   @9 :LayerInteractivity;
-    metadata       @10 :List(T.Meta);
+    inputRegion     @10 :T.Region;
+    opaqueRegion    @11 :T.Region;
+    cornerRadius    @12 :T.CornerRadius;
+    shadow          @13 :ShadowShape;
+    metadata        @14 :List(T.Meta);
 }
 
 struct AnchorEdges {
@@ -456,31 +428,90 @@ struct AnchorEdges {
 }
 
 enum SurfaceLayer {
-    background @0;
-    bottom     @1;
-    top        @2;
-    overlay    @3;
-    other      @4;
-    custom     @5;
+    # Absent means the backend decides; it must never silently mean a
+    # specific paradigm value.
+    unspecified @0;
+    background @1;
+    bottom @2;
+    top @3;
+    overlay @4;
+    other @5;
+    custom @6;
 }
 
 enum LayerInteractivity {
-    none      @0;
-    onDemand  @1;
-    exclusive @2;
-    other     @3;
-    custom    @4;
+    # Absent means the backend decides; it must never silently mean a
+    # specific paradigm value.
+    unspecified @0;
+    none @1;
+    onDemand @2;
+    exclusive @3;
+    other @4;
+    custom @5;
 }
 
-# ── Cursor ───────────────────────────────────────────────────
+# A shadow is DECLARED (it exists, its colour and offset); how it is
+# rendered — blur radius, spread, shader — is the backend's business.
+struct ShadowShape {
+    enabled @0 :Bool;
+    offset  @1 :T.Vec2;
+    color   @2 :T.Color;
+}
+
+struct SurfaceOrder {
+    union {
+        raise   @0 :Void;
+        lower   @1 :Void;
+        above   @2 :T.SurfaceId;
+        below   @3 :T.SurfaceId;
+        unknown @4 :Void;
+    }
+}
+
+struct LayerInfo {
+    id       @0 :T.LayerId;
+    name     @1 :Text;
+    zBase    @2 :Int32;
+    output   @3 :T.OutputId;
+    surfaces @4 :List(T.SurfaceId);
+}
+
+# ── Surface state (merged from surface.capnp) ─────────────────
+
+struct SurfaceState {
+    id            @0 :T.SurfaceId;
+    parent        @1 :T.SurfaceId;
+    position      @2 :T.Vec2i;
+    size          @3 :T.Size;
+    scale         @4 :Float32;
+    transform     @5 :T.BufferTransform;
+    opacity       @6 :Float32;
+    visible       @7 :Bool;
+    mapped        @8 :Bool;
+    hasInputRegion @9 :Bool;
+    zIndex        @10 :Int32;
+}
+
+struct SurfaceInfo {
+    surfaceId @0 :T.SurfaceId;
+    kind      @1 :Text;
+    rect      @2 :T.Rect;
+    visible   @3 :Bool;
+    focused   @4 :Bool;
+    output    @5 :T.OutputId;
+    metadata  @6 :List(T.Meta);
+}
+
+# ── Cursor ────────────────────────────────────────────────────
 
 struct Cursor {
     union {
         named    @0 :T.CursorShape;
         surface  @1 :CursorImage;
         hidden   @2 :Void;
+        unknown  @3 :Void;
     }
-    hotspot @3 :T.Vec2i;
+    hotspot @4 :T.Vec2i;
 }
 
 struct CursorImage {
@@ -488,7 +519,6 @@ struct CursorImage {
     height @1 :UInt32;
     hotX   @2 :Int32;
     hotY   @3 :Int32;
-    # Inline for small cursors; use buffer reference for large/high-res cursors.
     pixels @4 :T.DataHandle;
     format @5 :T.PixelFormat;
     scale  @6 :Float32;
@@ -509,6 +539,7 @@ struct CursorConfinement {
         surface @1 :T.SurfaceId;
         output  @2 :T.OutputId;
         lock    @3 :Void;
+        unknown @4 :Void;
     }
 }
 
@@ -524,40 +555,38 @@ struct CursorThemeInfo {
     sizes       @2 :List(UInt32);
 }
 
-# ── Commit ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# THE COMMIT PATH
+#
+# One struct, typed end to end. `buffer` is the same `T.BufferId` that
+# `attachBuffer` bound to the surface — there is no per-surface index and
+# no re-interpretation of a number. `fence` holds a `T.FenceHandle`, never
+# a raw "native" integer. `damage` is geometry.
+# ══════════════════════════════════════════════════════════════════════
 
 struct SurfaceCommit {
-    surfaceId   @0 :T.SurfaceId;
-    frameId     @1 :UInt64;
-    bufferIndex @2 :UInt8;
-    format      @3 :T.PixelFormat;
-    # Optional damage hint. If absent, compositor tracks dirty-state itself.
-    # Apps that track their own damaged regions pass them; apps that can't
-    # simply omit the field (compositor still optimizes via implicit damage).
+    surfaceId @0 :T.SurfaceId;
+    frameId   @1 :UInt64;
+    buffer    @2 :T.BufferId;
+    format    @3 :T.PixelFormat;
+    # Optional damage hint. If absent, the compositor tracks dirty state.
     damageOption @4 :DamageOption;
-    present     @5 :PresentIntent;
-    fence       @6 :SyncFence;
-    transform   @7 :T.BufferTransform;
+    present      @5 :PresentIntent;
+    fence        @6 :SyncFence;
+    transform    @7 :T.BufferTransform;
 }
 
 struct DamageOption {
     union {
-        # No explicit damage hint from the app; compositor infers from state.
+        # No explicit damage hint from the app; compositor infers.
         omitted @0 :Void;
         # Full surface considered damaged (simplest, slowest).
         full    @1 :Void;
         # Specific rectangles carry damage.
         rects   @2 :List(T.Rect);
-        # Backend-extension: opaque damage blob (engine-specific).
-        custom  @3 :Data;
-    }
-}
-
-struct DamageRegion {
-    union {
-        full  @0 :Void;
-        rects @1 :List(T.Rect);
-        none  @2 :Void;
+        # Backend extension: opaque damage blob, as content.
+        custom  @3 :T.MimeType;
+        unknown @4 :Void;
     }
 }
 
@@ -566,13 +595,16 @@ struct PresentIntent {
         immediate @0 :Void;
         nextVsync @1 :Void;
         atTime    @2 :T.Timestamp;
+        periodic  @3 :T.Duration;
+        unknown   @4 :Void;
     }
 }
 
 struct SyncFence {
     union {
-        native @0 :UInt64;
-        none   @1 :Void;
+        handle  @0 :T.FenceHandle;
+        none    @1 :Void;
+        unknown @2 :Void;
     }
 }
 
@@ -586,17 +618,36 @@ struct FrameSignal {
     dropped         @6 :UInt32;
 }
 
-# ── Drag and Drop ────────────────────────────────────────────
+# Frame metrics (merged from surface.capnp). `committedDamage` is
+# geometry, never pixels.
+struct FrameData {
+    surfaceId       @0 :T.SurfaceId;
+    frameId         @1 :UInt64;
+    timestamp       @2 :T.Timestamp;
+    size            @3 :T.Size;
+    buffer          @4 :T.BufferId;
+    presentationTime @5 :T.Timestamp;
+    committedDamage @6 :T.Region;
+}
+
+struct FrameMetrics {
+    frameCount    @0 :UInt64;
+    lastFrameAt   @1 :T.Timestamp;
+    avgFrameTime  @2 :T.Duration;
+    droppedFrames @3 :UInt64;
+    jankCount     @4 :UInt64;
+}
+
+# ── Drag and Drop ─────────────────────────────────────────────
 
 struct DragOffer {
-    mimeTypes @0 :List(Text);
+    mimeTypes @0 :List(T.MimeType);
     data      @1 :List(DragData);
     actions   @2 :List(DragAction);
 }
 
 struct DragData {
-    mimeType @0 :Text;
-    # Inline for small payloads; use buffer reference for large drag data.
+    mimeType @0 :T.MimeType;
     payload  @1 :T.DataHandle;
 }
 
@@ -604,7 +655,7 @@ struct DragSession {
     id     @0 :T.DragSessionId;
     source @1 :T.SurfaceId;
     target @2 :T.SurfaceId;
-    action @3 :DragAction;
+    action    @3 :DragAction;
 }
 
 enum DragAction {
@@ -618,138 +669,97 @@ enum DragAction {
 }
 
 struct DragStartRequest {
-    surface    @0 :T.SurfaceId;
-    offer      @1 :DragOffer;
-    actions    @2 :List(DragAction);
-    # Inline for small thumbnails; use buffer reference for large previews.
-    thumbnail  @3 :T.DataHandle;
-    hotspot    @4 :T.Vec2i;
-    metadata   @5 :List(T.Meta);
+    surface   @0 :T.SurfaceId;
+    offer     @1 :DragOffer;
+    actions   @2 :List(DragAction);
+    thumbnail @3 :T.DataHandle;
+    hotspot   @4 :T.Vec2i;
+    metadata  @5 :List(T.Meta);
 }
 
 struct DragStartResult {
     union {
         session @0 :T.DragSessionId;
         error   @1 :T.Error;
+        unknown @2 :Void;
     }
 }
 
-# ── Theme ────────────────────────────────────────────────────
+# ── Capture ───────────────────────────────────────────────────
+# One capture authority in the protocol. The requested form is an open
+# content type, so a future image or video encoding needs no ordinal.
 
-struct Theme {
-    colorScheme    @0 :ColorScheme;
-    accentColor    @1 :T.Color;
-    fontScale      @2 :Float32;
-    cursorSize     @3 :UInt32;
-    cursorTheme    @4 :Text;
-    iconTheme      @5 :Text;
-    animations     @6 :AnimationPreferences;
-    reducedMotion  @7 :Bool;
-    highContrast   @8 :Bool;
-    metadata       @9 :List(T.Meta);
+struct CaptureRequest {
+    union {
+        output  @0 :T.OutputId;
+        surface @1 :T.SurfaceId;
+        region  @2 :OutputRegion;
+        unknown @3 :Void;
+    }
+    format @4 :T.MimeType;
 }
 
-enum ColorScheme {
-    light  @0;
-    dark   @1;
-    system @2;
-    other  @3;
-    custom @4;
+struct OutputRegion {
+    output @0 :T.OutputId;
+    rect   @1 :T.Rect;
 }
 
-struct AnimationPreferences {
-    enabled     @0 :Bool;
-    speedScale  @1 :Float32;
-    reduceMotion @2 :Bool;
+struct CompositorCaptureResult {
+    union {
+        frame   @0 :CaptureFrame;
+        error   @1 :T.Error;
+        unknown @2 :Void;
+    }
 }
 
-# ── Accessibility ────────────────────────────────────────────
-
-struct AccessibilityNode {
-    id          @0 :T.AccessNodeId;
-    role        @1 :AccessibilityRole;
-    name        @2 :Text;
-    description @3 :Text;
-    value       @4 :Text;
-    state       @5 :AccessibilityState;
-    bounds      @6 :T.Rect;
-    children    @7 :List(T.AccessNodeId);
-    actions     @8 :List(AccessibilityAction);
-    metadata    @9 :List(T.Meta);
+struct CaptureFrame {
+    width     @0 :UInt32;
+    height    @1 :UInt32;
+    stride    @2 :UInt32;
+    format    @3 :T.PixelFormat;
+    timestamp @4 :T.Timestamp;
+    pixels    @5 :T.DataHandle;
+    metadata @6 :T.StringMap;
 }
 
-enum AccessibilityRole {
-    window        @0;
-    panel         @1;
-    button        @2;
-    link          @3;
-    menuItem      @4;
-    radioButton   @5;
-    checkBox      @6;
-    text          @7;
-    textField     @8;
-    comboBox      @9;
-    slider        @10;
-    image         @11;
-    separator     @12;
-    progressBar   @13;
-    scrollBar     @14;
-    tree          @15;
-    treeItem      @16;
-    list          @17;
-    listItem      @18;
-    table         @19;
-    tableRow      @20;
-    tableCell     @21;
-    tab           @22;
-    tabPanel      @23;
-    menu          @24;
-    toolBar       @25;
-    statusBar     @26;
-    alert         @27;
-    dialog        @28;
-    titleBar      @29;
-    application   @30;
-    group         @31;
-    heading       @32;
-    label         @33;
-    tooltip       @34;
-    popUp         @35;
-    notification  @36;
-    custom        @37;
-    other         @38;
+# ── Animation ─────────────────────────────────────────────────
+
+struct AnimationDefinitionRequest {
+    surface @0 :T.SurfaceId;
+    property @1 :Text;
+    spec @2 :T.AnimationSpec;
+    # From/to values are open key/value pairs: any animatable property is
+    # expressible without a new field.
+    from @3 :T.StringMap;
+    to   @4 :T.StringMap;
 }
 
-struct AccessibilityState {
-    enabled       @0 :Bool;
-    focused       @1 :Bool;
-    selected      @2 :Bool;
-    checked       @3 :Bool;
-    expanded      @4 :Bool;
-    collapsed     @5 :Bool;
-    invisible     @6 :Bool;
-    modal         @7 :Bool;
-    multiline     @8 :Bool;
-    required      @9 :Bool;
-    editable      @10 :Bool;
-    draggable     @11 :Bool;
-    droppable     @12 :Bool;
-    protected     @13 :Bool;
-    busy          @14 :Bool;
+# ── Spatial ───────────────────────────────────────────────────
+
+struct SurfaceSpatialPose {
+    position @0 :T.Vec3;
+    rotation @1 :T.Vec4;
+    scale    @2 :T.Vec3;
+    anchor   @3 :SpatialAnchor;
 }
 
-struct AccessibilityAction {
-    id    @0 :T.AccessNodeId;
-    name  @1 :Text;
-    description @2 :Text;
+struct SpatialAnchor {
+    union {
+        # A backend-issued opaque anchor reference.
+        reference @0 :UInt64;
+        none      @1 :Void;
+        unknown   @2 :Void;
+    }
+    # Whether this anchor survives a session (backend-reported).
+    persistent @3 :Bool;
 }
 
-struct AccessibilityTree {
-    root   @0 :T.AccessNodeId;
-    nodes  @1 :List(AccessibilityNode);
-}
-
-# ── Query ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# QUERY
+# Every list answer is bounded: the caller passes a page and receives a
+# total, so "500 of 3,400" is answerable and an empty list is
+# distinguishable from a failed one (see `notSupported`).
+# ══════════════════════════════════════════════════════════════════════
 
 struct Query {
     union {
@@ -759,9 +769,9 @@ struct Query {
         surfaceInfo            @3 :T.SurfaceId;
         focusedSurface         @4 :Void;
         compositorCapabilities @5 :Void;
-        supportedFeatures      @6 :Void;
-        compositorStats        @7 :Void;
-        custom                 @8 :CustomQuery;
+        compositorStats        @6 :Void;
+        custom                 @7 :CustomQuery;
+        unknown                @8 :Void;
     }
 }
 
@@ -770,43 +780,39 @@ struct CustomQuery {
     parameters @1 :List(T.Meta);
 }
 
-struct QueryResult {
+struct CompositorQueryResult {
     union {
-        outputs        @0 :List(OutputInfo);
-        outputInfo     @1 :OutputInfo;
-        surfaces       @2 :List(SurfaceInfo);
-        surfaceInfo    @3 :SurfaceInfo;
-        capabilities   @4 :List(CapabilityKind);
-        features       @5 :List(Text);
-        stats          @6 :CompositorStats;
-        custom         @7 :List(T.Meta);
-        notSupported   @8 :Void;
+        outputs      @0 :List(OutputInfo);
+        outputInfo   @1 :OutputInfo;
+        surfaces     @2 :List(SurfaceInfo);
+        surfaceInfo  @3 :SurfaceInfo;
+        capabilities @4 :List(Text);
+        stats        @5 :CompositorStats;
+        custom       @6 :List(T.Meta);
+        notSupported @7 :Void;
+        unknown      @8 :Void;
     }
+    # Total number of items the query would return unpaged. Zero for
+    # single-item and non-list answers.
+    total @9 :UInt64;
 }
 
-struct SurfaceInfo {
-    surfaceId    @0 :T.SurfaceId;
-    kind         @1 :SurfaceRole;
-    rect         @2 :T.Rect;
-    visible      @3 :Bool;
-    focused      @4 :Bool;
-    output       @5 :T.OutputId;
-    metadata     @6 :List(T.Meta);
-}
+# ── Outputs (canonical home; windowmanager imports these) ─────
 
 struct OutputInfo {
-    outputId                   @0 :T.OutputId;
-    name                       @1 :Text;
-    description                @2 :Text;
-    physicalMillimetersWidth   @3 :UInt32;
-    physicalMillimetersHeight  @4 :UInt32;
-    resolution                 @5 :T.Vec2i;
-    refreshRate                @6 :T.FrameRate;
-    position                   @7 :T.Vec2i;
-    scale                      @8 :Float32;
-    primary                    @9 :Bool;
+    outputId                  @0 :T.OutputId;
+    name                      @1 :Text;
+    description               @2 :Text;
+    physicalMillimetersWidth  @3 :UInt32;
+    physicalMillimetersHeight @4 :UInt32;
+    resolution                @5 :T.Vec2i;
+    refreshRate               @6 :T.FrameRate;
+    position                  @7 :T.Vec2i;
+    scale                     @8 :Float32;
+    primary                   @9 :Bool;
     connected                 @10 :Bool;
-    modes                     @11 :List(OutputMode);
+    enabled                   @11 :Bool;
+    modes                     @12 :List(OutputMode);
 }
 
 struct OutputMode {
@@ -819,21 +825,23 @@ struct OutputMode {
 struct CompositorStats {
     activeSessions @0 :UInt32;
     activeSurfaces @1 :UInt32;
-    cpuTime        @2 :T.Duration;
-    gpuTime        @3 :T.Duration;
-    frameTime      @4 :T.Duration;
-    droppedFrames  @5 :UInt64;
-    uptime         @6 :T.Duration;
-    memoryBytes    @7 :UInt64;
+    activeOutputs  @2 :UInt32;
+    cpuTime        @3 :T.Duration;
+    gpuTime        @4 :T.Duration;
+    frameTime      @5 :T.Duration;
+    droppedFrames  @6 :UInt64;
+    uptime         @7 :T.Duration;
+    memoryBytes    @8 :UInt64;
 }
 
 # ══════════════════════════════════════════════════════════════════════
 # EVENTS
-# All events through one stream. Forward compatible forever.
+# One stream, pull-based, bounded by the caller. `unknown` carries a typed
+# discriminator so a consumer can route an event kind it has never seen.
 # ══════════════════════════════════════════════════════════════════════
 
 interface EventStream {
-    next   @0 () -> (event :CompositorEvent);
+    pull   @0 (maxEvents :UInt32) -> (events :List(CompositorEvent));
     cancel @1 () -> T.VoidResult;
 }
 
@@ -843,17 +851,17 @@ struct EventFilter {
 }
 
 enum EventKind {
-    surfaceEvents    @0;
-    frameEvents      @1;
-    inputEvents      @2;
-    focusEvents      @3;
-    outputEvents     @4;
-    compositorEvents @5;
-    dragEvents       @6;
-    themeEvents      @7;
+    surfaceEvents     @0;
+    frameEvents       @1;
+    inputEvents       @2;
+    focusEvents       @3;
+    outputEvents      @4;
+    compositorEvents  @5;
+    dragEvents        @6;
+    themeEvents       @7;
     accessibilityEvents @8;
-    other            @9;
-    custom           @10;
+    other             @9;
+    custom            @10;
 }
 
 struct CompositorEvent {
@@ -862,66 +870,61 @@ struct CompositorEvent {
     surfaceDestroyed       @1  :T.SurfaceId;
     surfaceGeometryChanged @2  :SurfaceGeometryEvent;
     surfaceStateChanged    @3  :SurfaceStateEvent;
+    surfaceOrderChanged    @4  :SurfaceOrderEvent;
 
-    frameReady             @4  :FrameSignal;
-    framePresented         @5  :FrameSignal;
+    frameReady             @5  :FrameSignal;
+    framePresented         @6  :FrameSignal;
 
-    pointerEnter           @6  :PointerEnterEvent;
-    pointerLeave           @7  :PointerLeaveEvent;
-    pointerMove            @8  :PointerMoveEvent;
-    pointerButton          @9  :PointerButtonEvent;
-    pointerScroll          @10 :PointerScrollEvent;
-    keyboardKey            @11 :KeyboardKeyEvent;
-    keyboardModifiers      @12 :KeyboardModifiersEvent;
-    touchDown              @13 :TouchDownEvent;
-    touchUp                @14 :TouchUpEvent;
-    touchMove              @15 :TouchMoveEvent;
+    pointerEnter           @7  :PointerEnterEvent;
+    pointerLeave           @8  :PointerLeaveEvent;
+    pointerMove            @9  :PointerMoveEvent;
+    pointerButton          @10 :PointerButtonEvent;
+    pointerScroll          @11 :PointerScrollEvent;
+    keyboardKey            @12 :KeyboardKeyEvent;
+    keyboardModifiers      @13 :KeyboardModifiersEvent;
+    touchDown              @14 :TouchDownEvent;
+    touchUp                @15 :TouchUpEvent;
+    touchMove              @16 :TouchMoveEvent;
 
-    stylusDown             @16 :StylusEvent;
-    stylusUp               @17 :StylusEvent;
-    stylusMove             @18 :StylusEvent;
-    stylusButton           @19 :StylusButtonEvent;
+    stylusDown             @17 :StylusEvent;
+    stylusUp               @18 :StylusEvent;
+    stylusMove             @19 :StylusEvent;
+    stylusButton           @20 :StylusButtonEvent;
 
-    gestureSwipeBegin      @20 :GestureSwipeEvent;
-    gestureSwipeUpdate     @21 :GestureSwipeEvent;
-    gestureSwipeEnd        @22 :GestureSwipeEvent;
-    gesturePinchBegin      @23 :GesturePinchEvent;
-    gesturePinchUpdate     @24 :GesturePinchEvent;
-    gesturePinchEnd        @25 :GesturePinchEvent;
+    gestureSwipeBegin      @21 :GestureSwipeEvent;
+    gestureSwipeUpdate     @22 :GestureSwipeEvent;
+    gestureSwipeEnd        @23 :GestureSwipeEvent;
+    gesturePinchBegin      @24 :GesturePinchEvent;
+    gesturePinchUpdate     @25 :GesturePinchEvent;
+    gesturePinchEnd        @26 :GesturePinchEvent;
 
-    focusGained            @26 :FocusEvent;
-    focusLost              @27 :FocusEvent;
+    focusGained            @27 :SurfaceFocusEvent;
+    focusLost              @28 :SurfaceFocusEvent;
 
-    outputAdded            @28 :OutputInfo;
-    outputRemoved          @29 :T.OutputId;
-    outputChanged          @30 :OutputInfo;
+    outputAdded            @29 :OutputInfo;
+    outputRemoved          @30 :T.OutputId;
+    outputChanged          @31 :OutputInfo;
 
-    compositorReady        @31 :CompositorInfo;
-    compositorShutdown     @32 :ShutdownEvent;
+    compositorReady        @32 :CompositorInfo;
+    compositorShutdown     @33 :ShutdownEvent;
 
-    cursorChanged          @33 :CursorChangedEvent;
+    cursorChanged          @34 :CursorChangedEvent;
 
-    dragEntered            @34 :DragEnteredEvent;
-    dragMoved              @35 :DragMovedEvent;
-    dragDropped            @36 :DragDroppedEvent;
-    dragFinished           @37 :DragFinishedEvent;
-    dragCancelled          @38 :Void;
+    dragEntered            @35 :DragEnteredEvent;
+    dragMoved              @36 :DragMovedEvent;
+    dragDropped            @37 :DragDroppedEvent;
+    dragFinished           @38 :DragFinishedEvent;
+    dragCancelled          @39 :Void;
 
-    themeChanged           @39 :ThemeChangedEvent;
+    themeChanged           @40 :ThemeChangedEvent;
 
-    accessibilityTreeChanged @40 :AccessibilityTreeChangedEvent;
+    accessibilityTreeChanged @41 :AccessibilityTreeChangedEvent;
 
-    unknown                @41 :UnknownEvent;
+    unknown                @42 :T.UnknownEvent;
     }
 }
 
-struct UnknownEvent {
-    typeId  @0 :UInt64;
-    # Inline for small payloads; use buffer reference for large unknown events.
-    payload @1 :T.DataHandle;
-}
-
-# ── Event Details ─────────────────────────────────────────────
+# ── Event details ─────────────────────────────────────────────
 
 struct SurfaceGeometryEvent {
     surfaceId @0 :T.SurfaceId;
@@ -933,6 +936,12 @@ struct SurfaceStateEvent {
     surfaceId @0 :T.SurfaceId;
     visible   @1 :Bool;
     focused   @2 :Bool;
+}
+
+struct SurfaceOrderEvent {
+    surfaceId @0 :T.SurfaceId;
+    order     @1 :SurfaceOrder;
+    metadata @2 :T.StringMap;
 }
 
 struct PointerEnterEvent {
@@ -1016,9 +1025,11 @@ enum ScrollSource {
 
 struct KeyboardKeyEvent {
     surfaceId @0 :T.SurfaceId;
+    # The logical key. `name` is an open token and `codepoint` is Unicode:
+    # neither asserts a particular keyboard layout or key-numbering scheme.
     key       @1 :LogicalKey;
     scancode  @2 :UInt32;
-    action    @3 :KeyAction;
+    transition @3 :KeyTransition;
     modifiers @4 :T.ModifierState;
     timestamp @5 :T.Timestamp;
     text      @6 :Text;
@@ -1030,18 +1041,12 @@ struct LogicalKey {
     codepoint @1 :UInt32;
 }
 
-enum KeyAction {
+enum KeyTransition {
     pressed  @0;
     released @1;
     other    @2;
     custom   @3;
 }
-
-# ModifierState removed in Batch 10 (Audit-4).
-# All references now use T.ModifierState from types.capnp.
-# The local definition lacked scrollLock and used 'meta' instead of 'super'.
-# Ordinals 0-5 of the deleted struct are now permanently reserved
-# and must never be reused for a new struct in this file.
 
 struct KeyboardModifiersEvent {
     surfaceId @0 :T.SurfaceId;
@@ -1087,7 +1092,7 @@ struct StylusEvent {
     tiltY     @6 :Float32;
     rotation  @7 :Float32;
     distance  @8 :Float32;
-    toolType  @9 :StylusTool;
+    toolType  @9 :Text;
     timestamp @10 :T.Timestamp;
 }
 
@@ -1097,16 +1102,6 @@ struct StylusButtonEvent {
     button    @2 :UInt32;
     pressed   @3 :Bool;
     timestamp @4 :T.Timestamp;
-}
-
-enum StylusTool {
-    pen      @0;
-    eraser   @1;
-    brush    @2;
-    pencil   @3;
-    airbrush @4;
-    other    @5;
-    custom   @6;
 }
 
 struct GestureSwipeEvent {
@@ -1129,7 +1124,7 @@ struct GesturePinchEvent {
     timestamp @7 :T.Timestamp;
 }
 
-struct FocusEvent {
+struct SurfaceFocusEvent {
     surfaceId @0 :T.SurfaceId;
     reason    @1 :FocusReason;
     timestamp @2 :T.Timestamp;
@@ -1146,9 +1141,9 @@ enum FocusReason {
 }
 
 struct ShutdownEvent {
-    reason        @0 :ShutdownReason;
-    gracePeriod   @1 :T.Duration;
-    message       @2 :Text;
+    reason      @0 :ShutdownReason;
+    gracePeriod @1 :T.Duration;
+    message     @2 :Text;
 }
 
 enum ShutdownReason {
@@ -1166,7 +1161,7 @@ struct CursorChangedEvent {
     timestamp @2 :T.Timestamp;
 }
 
-# ── Drag and Drop Events ──────────────────────────────────────
+# ── Drag and drop events ──────────────────────────────────────
 
 struct DragEnteredEvent {
     sessionId @0 :T.DragSessionId;
@@ -1195,356 +1190,63 @@ struct DragFinishedEvent {
     action    @1 :DragAction;
 }
 
-# ── Theme Events ──────────────────────────────────────────────
+# ── Theme and accessibility events ────────────────────────────
+# Both relay the canonical contracts; neither re-declares a model.
 
 struct ThemeChangedEvent {
-    theme @0 :Theme;
+    tokens @0 :Theme.ThemeTokens;
 }
-
-# ── Accessibility Events ──────────────────────────────────────
 
 struct AccessibilityTreeChangedEvent {
     surfaceId @0 :T.SurfaceId;
-    tree      @1 :AccessibilityTree;
+    root      @1 :T.AccessNodeId;
 }
 
 # ══════════════════════════════════════════════════════════════════════
-# CAPABILITIES
-# Kernel-enforced. Not permission strings. Not booleans.
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Nothing above depends on any value in this section. They are published so
+# that today's tools have a discoverable spelling for surface kinds and
+# capability kinds; an unrecognised value MUST be ignored, never rejected.
+# They are Text and never enums: an enum here would be an eternal
+# commitment to today's spelling.
 # ══════════════════════════════════════════════════════════════════════
 
-enum CapabilityKind {
-    createWindow      @0;
-    createPopup       @1;
-    createOverlay     @2;
-    createPanel       @3;
-    createWallpaper   @4;
-    createSpatial     @5;
-    captureOwn        @6;
-    captureOutput     @7;
-    captureAll        @8;
-    capturePrivate    @9;
-    receiveInput     @10;
-    exclusiveInput   @11;
-    globalHotkeys    @12;
-    queryOutputs     @13;
-    configureOutput  @14;
-    setCursor        @15;
-    confineCursor    @16;
-    lockCursor       @17;
-    warpCursor       @18;
-    setCursorTheme   @19;
-    startDrag        @20;
-    readTheme        @21;
-    readAccessibility @22;
-    custom           @23;
-    other            @24;
-}
+const kindWindow           :Text = "window";
+const kindDialog           :Text = "dialog";
+const kindTooltip          :Text = "tooltip";
+const kindPopup            :Text = "popup";
+const kindMenu             :Text = "menu";
+const kindNotification     :Text = "notification";
+const kindPanel            :Text = "panel";
+const kindWallpaper        :Text = "wallpaper";
+const kindOverlay          :Text = "overlay";
+const kindSplash           :Text = "splash";
+const kindScreensaver      :Text = "screensaver";
+const kindKiosk            :Text = "kiosk";
+const kindDock             :Text = "dock";
+const kindOnScreenDisplay  :Text = "osd";
+const kindVirtualKeyboard  :Text = "virtualKeyboard";
+const kindOther            :Text = "other";
 
-struct CapabilityRequest {
-    union {
-        standard @0 :CapabilityKind;
-        hotkeys  @1 :List(HotkeyRequest);
-        custom   @2 :CustomCapability;
-    }
-}
-
-struct HotkeyRequest {
-    key         @0 :LogicalKey;
-    modifiers   @1 :T.ModifierState;
-    description @2 :Text;
-}
-
-struct CustomCapability {
-    name       @0 :Text;
-    parameters @1 :List(T.Meta);
-}
-
-struct GrantedCapability {
-    capability @0 :CapabilityRequest;
-    handle    @1 :UInt64;               # Deprecated: use capabilityHandle. Kept for ordinal stability.
-    # Typed capability handle (preferred over raw handle field above).
-    capabilityHandle @2 :T.CapabilityHandle;
-}
-
-struct DeniedCapability {
-    capability @0 :CapabilityRequest;
-    reason     @1 :DenialReason;
-    message    @2 :Text;
-}
-
-enum DenialReason {
-    notSupported      @0;
-    notAuthorized     @1;
-    resourceExhausted @2;
-    requiresConsent   @3;
-    compositorPolicy  @4;
-    other             @5;
-    custom            @6;
-}
-
-# ══════════════════════════════════════════════════════════════════════
-# AUDIT-7 ADDITIONS — Spatial, Animation, Health, Security
-# ══════════════════════════════════════════════════════════════════════
-
-# ── HDR Metadata (audit-7) ──
-struct HdrMetadata {
-    colorSpace @0 :Text;
-    maxLuminance @1 :UInt32;
-    minLuminance @2 :UInt32;
-    maxFrameAverage @3 :UInt32;
-    maxContent @4 :UInt32;
-}
-
-# ── Spatial Pose (audit-7: compositor_spatial.capnp belongs here) ──
-struct SpatialPose {
-    position @0 :T.Vec3;
-    rotation @1 :T.Vec4;
-    scale @2 :T.Vec3;
-    anchor @3 :SpatialAnchor;
-}
-
-struct SpatialAnchor {
-    type @0 :AnchorType;
-    planeId @1 :Text;
-    objectId @2 :Text;
-    cloudAnchor @3 :Bool;
-    persistent @4 :Bool;
-}
-
-enum AnchorType {
-    none @0;
-    plane @1;
-    object @2;
-    world @3;
-    cloud @4;
-    other @5;
-    custom @6;
-}
-
-# ── Display Zone (audit-7) ──
-struct DisplayZoneRequest {
-    outputId @0 :T.OutputId;
-    zoneId @1 :Text;
-    bounds @2 :T.Rect;
-    role @3 :ZoneRole;
-    permissions @4 :List(ZonePermission);
-    interaction @5 :InteractionMode;
-}
-
-struct DisplayZone {
-    zoneId @0 :Text;
-    bounds @1 :T.Rect;
-    role @2 :ZoneRole;
-    permissions @3 :List(ZonePermission);
-    interaction @4 :InteractionMode;
-}
-
-enum ZoneRole {
-    driver @0;
-    passenger @1;
-    rearLeft @2;
-    rearRight @3;
-    center @4;
-    other @5;
-    custom @6;
-}
-
-enum ZonePermission {
-    viewContent @0;
-    interact @1;
-    showVideo @2;
-    showNavigation @3;
-    other @4;
-    custom @5;
-}
-
-enum InteractionMode {
-    touch @0;
-    gesture @1;
-    voice @2;
-    dPad @3;
-    other @4;
-    custom @5;
-}
-
-# ── Animation Definition (audit-7: compositor_animation.capnp belongs here) ──
-struct AnimationDefinitionRequest {
-    surface @0 :T.SurfaceId;
-    property @1 :Text;
-    spec @2 :T.AnimationSpec;
-    from @3 :T.Meta;
-    to @4 :T.Meta;
-}
-
-# ── Surface Access Control (audit-7) ──
-struct SurfaceAccessControl {
-    allowedProcesses @0 :List(T.AppId);
-    requireConsent @1 :Bool;
-    secureContent @2 :Bool;
-}
-
-# ── Compositor Health (audit-7) ──
-struct CompositorHealth {
-    healthy @0 :Bool;
-    cpuUsage @1 :Float32;
-    gpuUsage @2 :Float32;
-    memoryBytes @3 :UInt64;
-    lastFrameTime @4 :T.Duration;
-    droppedFrames @5 :UInt64;
-    issues @6 :List(HealthIssue);
-}
-
-struct HealthIssue {
-    severity @0 :IssueSeverity;
-    message @1 :Text;
-    timestamp @2 :T.Timestamp;
-}
-
-enum IssueSeverity {
-    info @0;
-    warning @1;
-    error @2;
-    critical @3;
-    custom @4;
-}
-
-# ── State Snapshot (audit-7) ──
-struct StateSnapshot {
-    timestamp @0 :T.Timestamp;
-    surfaces @1 :List(SurfaceInfo);
-    outputs @2 :List(OutputInfo);
-    theme @3 :Theme;
-    metadata @4 :List(T.Meta);
-}
-
-# ── Remote Access (audit-7) ──
-struct RemoteAccessConfig {
-    enabled @0 :Bool;
-    requireAuth @1 :Bool;
-    maxConnections @2 :UInt32;
-}
-
-# ── Resource Limits (audit-7) ──
-struct ResourceLimits {
-    maxSurfaces @0 :UInt32;
-    maxGpuMemoryBytes @1 :UInt64;
-    maxFramebuffers @2 :UInt32;
-}
-
-# ── Animation Engine (audit-8 What's Still Missing) ──
-struct Keyframe {
-    time @0 :Float32;
-    value @1 :T.Meta;
-    easing @2 :EasingType;
-    interpolation @3 :InterpolationType;
-}
-
-enum EasingType {
-    linear @0;
-    easeIn @1;
-    easeOut @2;
-    easeInOut @3;
-    spring @4;
-    custom @5;
-}
-
-enum InterpolationType {
-    none @0;
-    linear @1;
-    bezier @2;
-    spline @3;
-    custom @4;
-}
-
-struct PhysicsSpring {
-    stiffness @0 :Float32;
-    damping @1 :Float32;
-    mass @2 :Float32;
-    initialVelocity @3 :Float32;
-}
-
-# ── Surface Content Protection (audit-8 What's Still Missing) ──
-struct DrmInfo {
-    contentType @0 :DrmContentType;
-    protected @1 :Bool;
-    keyId @2 :Text;
-}
-
-enum DrmContentType {
-    undefined @0;
-    clear @1;
-    drmL1 @2;
-    drmL2 @3;
-    drmL3 @4;
-    custom @5;
-}
-
-# ── Accessibility Live Regions (audit-8 What's Still Missing) ──
-struct LiveRegionInfo {
-    surfaceId @0 :T.SurfaceId;
-    politeness @1 :LiveRegionPoliteness;
-    label @2 :Text;
-}
-
-enum LiveRegionPoliteness {
-    polite @0;
-    assertive @1;
-    custom @2;
-}
-
-# ── Gesture Recognition Pipeline (audit-8 What's Still Missing) ──
-struct GesturePipeline {
-    recognizerType @0 :GestureRecognizerType;
-    minPoints @1 :UInt32;
-    maxPoints @2 :UInt32;
-    historySize @3 :UInt32;
-}
-
-enum GestureRecognizerType {
-    none @0;
-    tap @1;
-    doubleTap @2;
-    longPress @3;
-    pan @4;
-    pinch @5;
-    rotation @6;
-    swipe @7;
-    custom @8;
-}
-
-# ── Compositor Plugin System (audit-8 What's Still Missing) ──
-struct PluginInfo {
-    id @0 :Text;
-    name @1 :Text;
-    version @2 :T.Version;
-    capabilities @3 :List(Text);
-    enabled @4 :Bool;
-}
-
-# ── Live Region Filter / Subscription (audit-9 What's Still Missing) ──
-struct LiveRegionFilter {
-    surfaceIds @0 :List(T.SurfaceId);
-    politeness @1 :List(LiveRegionPoliteness);
-}
-
-interface LiveRegionSubscription {
-    pull @0 () -> (event :LiveRegionEvent);
-    cancel @1 () -> T.VoidResult;
-}
-
-struct LiveRegionEvent {
-    surfaceId @0 :T.SurfaceId;
-    politeness @1 :LiveRegionPoliteness;
-    label @2 :Text;
-    timestamp @3 :T.Timestamp;
-}
-
-# ── Gesture Recognition Result (audit-9 What's Still Missing) ──
-struct GestureResult {
-    recognized @0 :Bool;
-    gestureType @1 :GestureRecognizerType;
-    confidence @2 :Float32;
-    data @3 :T.Meta;
-    timestamp @4 :T.Timestamp;
-}
+const capCreateWindow      :Text = "createWindow";
+const capCreatePopup       :Text = "createPopup";
+const capCreateOverlay     :Text = "createOverlay";
+const capCreatePanel       :Text = "createPanel";
+const capCreateWallpaper   :Text = "createWallpaper";
+const capCaptureOwn        :Text = "captureOwn";
+const capCaptureOutput     :Text = "captureOutput";
+const capCaptureAll        :Text = "captureAll";
+const capCapturePrivate    :Text = "capturePrivate";
+const capReceiveInput      :Text = "receiveInput";
+const capExclusiveInput    :Text = "exclusiveInput";
+const capGlobalHotkeys     :Text = "globalHotkeys";
+const capQueryOutputs      :Text = "queryOutputs";
+const capConfigureOutput   :Text = "configureOutput";
+const capSetCursor         :Text = "setCursor";
+const capConfineCursor     :Text = "confineCursor";
+const capWarpCursor        :Text = "warpCursor";
+const capSetCursorTheme    :Text = "setCursorTheme";
+const capStartDrag         :Text = "startDrag";
+const capReadTheme         :Text = "readTheme";
+const capReadAccessibility :Text = "readAccessibility";

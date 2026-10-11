@@ -16,11 +16,11 @@
 #   - ContentProtectionResult.error → T.Error.
 #   - Night light temperature documented as Kelvin in field name.
 #   - AdaptiveSyncCaps.variant has custom variant for forward compatibility.
-#   - DisplayConnection has other variant for forward compatibility.
+#   - DisplayConnection has custom variant for forward compatibility.
 #   - HdrStandard has other variant for forward compatibility.
 #   - PqMode has other variant for forward compatibility.
-#   - DpmsState has other variant for forward compatibility.
-#   - ColorSpace has other variant for forward compatibility.
+#   - ColorSpace now uses the foundation's T.ColorSpace (its local copy was a
+#     seven-value shadow of the canonical enum); `custom` is the extension arm.
 #   - MonitorEvent union has custom variant for forward compatibility.
 #   - Vec2f references corrected to T.Vec2 (canonical type in types.capnp).
 #   - List returns use T.Pagination via MonitorFilter.
@@ -34,7 +34,7 @@
 #   - Monitor.foldPosition :FoldPosition for fold position details.
 #   - AdaptiveRefreshPolicy enum for refresh rate adaptation.
 #   - Display.setAdaptiveRefreshPolicy / getAdaptiveRefreshPolicy.
-#   - IccProfile struct for ICC profile management.
+#   - DisplayIccProfile struct for ICC profile management.
 #   - Display.loadIccProfile / getIccProfileData.
 #   - ColorManagementConfig struct for color management pipeline.
 #   - Display.setColorManagement / getColorManagement.
@@ -73,6 +73,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
 
 interface Display {
     # ── Core discovery ──
@@ -101,7 +102,11 @@ interface Display {
     setRotation @14 (outputId :T.OutputId, rotation :T.SurfaceTransform) -> T.VoidResult;
     setPrimary @15 (outputId :T.OutputId, primary :Bool) -> T.VoidResult;
     setEnabled @16 (outputId :T.OutputId, enabled :Bool) -> T.VoidResult;
-    setDpms @17 (outputId :T.OutputId, state :DpmsState) -> T.VoidResult;
+    # T.PowerSleepState, not a local DpmsState: display power state is one
+    # concept with one vocabulary (types.capnp:2140), and the local copy was
+    # a verbatim duplicate of framebuffer.capnp's — which has also been
+    # deleted there, so the pair is gone from both files.
+    setDpms @17 (outputId :T.OutputId, state :T.PowerSleepState) -> T.VoidResult;
 
     setMirroring @18 (outputId :T.OutputId, sources :List(T.OutputId)) -> T.VoidResult;
     clearMirroring @19 (outputId :T.OutputId) -> T.VoidResult;
@@ -142,7 +147,7 @@ interface Display {
     getAdaptiveRefreshPolicy @40 (outputId :T.OutputId) -> (policy :AdaptiveRefreshPolicy);
 
     # ── ICC profile management ──
-    loadIccProfile @41 (outputId :T.OutputId, profile :IccProfile) -> T.VoidResult;
+    loadIccProfile @41 (outputId :T.OutputId, profile :DisplayIccProfile) -> T.VoidResult;
     getIccProfileData @42 (outputId :T.OutputId, profileId :T.ColorProfileId) -> (data :T.DataHandle);
 
     # ── Color management pipeline ──
@@ -197,7 +202,7 @@ interface Display {
     negotiateContentProtection @65 (outputId :T.OutputId, requiredLevel :ContentProtectionLevel) -> (result :ContentProtectionResult);
 
     # ── Display calibration (audit-7 false positive: belongs here, not in display_calibration.capnp) ──
-    startCalibration @66 (outputId :T.OutputId, profile :IccProfile) -> T.VoidResult;
+    startCalibration @66 (outputId :T.OutputId, profile :DisplayIccProfile) -> T.VoidResult;
     getCalibrationStatus @67 (outputId :T.OutputId) -> (status :CalibrationStatus);
 
     # ── Display recommendations (audit-7) ──
@@ -240,7 +245,25 @@ interface Display {
     runColorAccuracyTest @84 (outputId :T.OutputId) -> (result :ColorAccuracyTest);
 
     # Console text forwarding.
-    writeConsoleText @85 (text :Text) -> ();
+    # T.VoidResult, not `()`. An empty result list silently discards
+    # every failure of a write to a terminal, which is a real failure
+    # mode (a blocked or overflowing console); DESIGN_PRINCIPLES.md:428
+    # — "NEVER swallow errors silently".
+    writeConsoleText @85 (text :Text) -> T.VoidResult;
+
+    # ─────────────────────────────────────────────────────────────────────
+    # DRIVER ENTRY POINT
+    #
+    # `DisplayProvider` below was returned by NOTHING — no method in the
+    # protocol produced it, so its whole subtree (DisplayConnectionSubscription,
+    # DisplayConnectionEvent, ModeSpec, DisplayMetadata, ConnectionStatus) was
+    # unreachable contract: a display driver author following this file
+    # implemented ten types no client could ever call (R8). Acquiring a
+    # provider is an authority-granting act (it hands out the ability to
+    # change modes on hardware other clients are using), so it is gated
+    # once here, and no provider method takes a capability token
+    # (ai.capnp:578-584).
+    openProvider @86 (authority :Capability) -> (provider :DisplayProvider);
 }
 
 interface BrightnessSubscription {
@@ -263,12 +286,41 @@ interface HdrSubscription {
     cancel @1 () -> T.VoidResult;
 }
 
+# ══════════════════════════════════════════════════════════════════════
+# HONESTY RULE FOR THIS FILE
+# ══════════════════════════════════════════════════════════════════════
+# Physical size, refresh rate and EDID come from hardware that frequently
+# does not exist. A headless framebuffer has no physical size because
+# there is no panel; a mode with no stated timing has no refresh rate; a
+# fixed-refresh panel reports one rate and no range.
+#
+# So every such field is paired with an explicit validity flag, and the
+# meaning of "unset" is always "not reported by the hardware":
+#   * physicalSizeMm (0,0) with physicalSizeValid=false means THERE IS NO
+#     PANEL — not "a panel of zero size". Any DPI computed from it is
+#     undefined, not zero.
+#   * refreshRate 0 with refreshRateValid=false means the mode table did
+#     not state a rate. This is the field that produced "60 Hz" on
+#     hardware that never said 60.
+#   * edid empty means no EDID was read. An empty EDID is not a 128-byte
+#     block of zeros pretending to be one.
+#
+# The alternative shape made all three mandatory, which left exactly one
+# way for a caller to proceed when the hardware had nothing to say:
+# invent a value. (Imported from the live OS, which populates them.)
+# ══════════════════════════════════════════════════════════════════════
+
 struct Monitor {
     id @0 :T.OutputId;
     name @1 :Text;
     manufacturer @2 :Text;
     model @3 :Text;
-    # Physical size in millimetres — enables real DPI calculation.
+    # Physical panel size in millimetres — enables real DPI calculation.
+    #
+    # VALID ONLY when physicalSizeValid is true. (0,0) with the flag false
+    # means there is no physical panel: a virtual adapter, a headless
+    # framebuffer, or an output with no EDID to read the size from. Compute
+    # nothing from it in that case; report the size as unknown.
     physicalSizeMm @4 :T.Vec2;
     # Position in the global display layout.
     position @5 :T.Vec2i;
@@ -287,6 +339,12 @@ struct Monitor {
     # Current active mode.
     currentMode @12 :DisplayMode;
     # Current refresh rate in Hz (float for VRR).
+    #
+    # VALID ONLY when refreshRateValid is true. Zero with the flag false
+    # means the mode table stated no rate — not "0 Hz", which is not a rate
+    # any panel has. A fixed-refresh panel with a stated rate reports that
+    # rate with the flag true; a VRR-capable panel additionally reports
+    # its range in refreshRateMin/Max below.
     refreshRate @13 :Float32;
     # HDR enabled on this output.
     hdr @14 :Bool;
@@ -315,6 +373,32 @@ struct Monitor {
     circularConfig @25 :CircularDisplayConfig;
     # Audit-7: Color depth in bits per pixel.
     colorDepthBits @26 :UInt32;
+    # ── Honesty flags (imported from the live OS). Declared last so the
+    #    struct's fields ascend; Cap'n Proto keys on the @N, not
+    #    declaration order, so this is wire-neutral. Each one qualifies a
+    #    field above per the HONESTY RULE block. A VRR range is reported
+    #    only when refreshRateRangeValid is true; a fixed-refresh panel
+    #    leaves min = max = 0 with that flag false, because "cannot vary"
+    #    and "nobody told us" are different facts. ──
+    physicalSizeValid @27 :Bool;       # physicalSizeMm @4 is real only when true
+    refreshRateValid @28 :Bool;        # refreshRate @13 is a real rate only when true
+    refreshRateMin @29 :Float32;       # VRR lower bound (see refreshRateRangeValid)
+    refreshRateMax @30 :Float32;       # VRR upper bound
+    refreshRateRangeValid @31 :Bool;   # min/max are real only when true
+    # Raw EDID as read from the output, when one was read.
+    #
+    # EMPTY means no EDID was present or the read failed — and both of
+    # those are common: a mode with no stated descriptor has none, and a
+    # read on a non-I2C panel fails routinely. An empty block here must
+    # never be rendered as "128 bytes of zeros", which is what a
+    # fixed-size buffer that was never filled looks like.
+    #
+    # The bytes are the hardware's, verbatim. Interpreting them is the
+    # caller's job (or display.capnp's, via getEdidData @63); a client
+    # that wants the physical size should read Monitor.physicalSizeMm
+    # with its validity flag rather than parsing raw bytes.
+    edid @32 :Data;
+    edidValid @33 :Bool;
 }
 
 enum DisplayConnection {
@@ -356,21 +440,11 @@ struct AdaptiveSyncCaps {
     maxRefreshRate @3 :UInt32;
 }
 
-enum DpmsState {
-    on @0;
-    standby @1;
-    suspend @2;
-    off @3;
-    other @4;
-    # Backend-specific DPMS state.
-    custom @5;
-}
-
 struct ColorProfile {
     id @0 :T.ColorProfileId;
     name @1 :Text;
     # Named color space.
-    colorSpace @2 :ColorSpace;
+    colorSpace @2 :T.ColorSpace;
     # White point (x, y) in CIE 1931.
     whitePoint @3 :T.Vec2;
     # Luminance range in nits.
@@ -380,20 +454,6 @@ struct ColorProfile {
     isHdr @6 :Bool;
 }
 
-enum ColorSpace {
-    srgb @0;
-    displayP3 @1;
-    bt2020 @2;
-    dciP3 @3;
-    adobeRgb @4;
-    rec601 @5;
-    rec709 @6;
-    linearSrgb @7;
-    linearDisplayP3 @8;
-    other @9;
-    # Backend-specific color space.
-    custom @10;
-}
 
 struct HdrMode {
     enabled @0 :Bool;
@@ -533,12 +593,13 @@ enum AdaptiveRefreshPolicy {
     custom @5;
 }
 
-struct IccProfile {
+struct DisplayIccProfile {
     id @0 :T.ColorProfileId;
     name @1 :Text;
     data @2 :T.DataHandle;
-    colorSpace @3 :ColorSpace;
+    colorSpace @3 :T.ColorSpace;
     version @4 :Text;
+    metadata @5 :T.StringMap;
 }
 
 struct ColorManagementConfig {
@@ -848,7 +909,7 @@ interface DisplayProvider {
     # Whether the connector is physically attached.
     getConnectionStatus @4 () -> (status :ConnectionStatus);
     # Subscribe to hotplug events.
-    subscribeConnection @5 () -> (subscription :ConnectionSubscription);
+    subscribeConnection @5 () -> (subscription :DisplayConnectionSubscription);
     # Health ping (see DriverLifecycle.ping).
     ping @6 () -> (health :T.DriverHealth);
 }
@@ -886,12 +947,12 @@ enum ConnectionStatus {
     custom @4;
 }
 
-interface ConnectionSubscription {
-    pull @0 () -> (events :List(ConnectionEvent));
+interface DisplayConnectionSubscription {
+    pull @0 () -> (events :List(DisplayConnectionEvent));
     cancel @1 () -> T.VoidResult;
 }
 
-struct ConnectionEvent {
+struct DisplayConnectionEvent {
     at @0 :UInt64;
     status @1 :ConnectionStatus;
 }

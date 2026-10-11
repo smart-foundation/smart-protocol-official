@@ -11,7 +11,9 @@ using T = import "types.capnp";
 #
 # All handles are UInt64 (opaque, backend-assigned). All sizes use T.Size.
 # All timestamps use T.Timestamp. All errors use T.Error.
-# The deprecated Buffer interface is preserved for migration.
+# NOTE: the older flat `Buffer` interface no longer exists — the session
+# model (`BufferService` + handshake) replaced it, and this comment is the
+# last trace of a migration that is over.
 #
 # Audit-8 enhancements:
 #   - BufferType: gpu, tensor, audio, compressed variants.
@@ -29,13 +31,15 @@ interface BufferService {
     struct HandshakeRequest {
         applicationId @0 :T.AppId;
         version       @1 :T.Version;
-        metadata      @2 :List(T.Meta);
+        annotations   @2 :List(T.Meta);
+        extensions    @3 :T.StringMap;
     }
 
     struct HandshakeResponse {
         sessionId @0 :T.SessionId;
         result    @1 :HandshakeResult;
         limits    @2 :BufferLimits;
+        extensions @3 :T.StringMap;
     }
 
     enum HandshakeResult {
@@ -152,18 +156,23 @@ enum AccessPattern {
     readOnce @3;      # Read once, not reused
 }
 
+# Access INTENT, not madvise names: a capability runtime has no
+# MADV_SEQUENTIAL, and `dontFork` presumed fork() exists. The spellings
+# below are what the advice MEANS, so a backend maps them onto whatever
+# it has.
 enum BufferAdvice {
-    normal @0;          # No specific advice
-    sequential @1;      # Expect sequential access ( POSIX MADV_SEQUENTIAL )
-    random @2;          # Expect random access ( POSIX MADV_RANDOM )
-    willNeed @3;        # Will need this buffer soon ( POSIX MADV_WILLNEED )
-    dontNeed @4;        # Will not need this buffer ( POSIX MADV_DONTNEED )
-    remove @5;          # Hint that this region is no longer needed
-    dontFork @6;        # Do not copy to child process on fork
-    merge @7;           # Hint to merge with adjacent mappings
-    unmerge @8;         # Hint to unmerge from adjacent mappings
-    hwpoison @9;        # Poison this page for testing
-    softDirty @10;      # Reset soft dirty tracking
+    unspecified @0;     # No specific advice
+    sequential @1;      # Expect sequential access
+    random @2;          # Expect random access
+    willNeed @3;        # Will need this buffer soon
+    doneWith @4;        # Will not need this buffer
+    remove @5;          # This region is no longer needed
+    merge @6;           # Hint to merge with adjacent mappings
+    unmerge @7;         # Hint to unmerge from adjacent mappings
+    # The remaining Linux memory-management vocabulary (dontFork,
+    # hwpoison, softDirty) is gone: it describes kernel internals a
+    # consumer cannot act on portably.
+    custom @8;
 }
 
 # ── Buffer Overcommit (Audit-10) ─────────────────────────────────────────
@@ -236,6 +245,7 @@ struct SharedMemoryResult {
     union {
         sharedMemory @0 :SharedMemoryRegion;
         error        @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
@@ -248,6 +258,7 @@ struct SharedMemoryRegion {
     alignment @4 :UInt32;
     # Optional cache-coherence hint.
     cache @5 :CacheMode;
+    metadata @6 :T.StringMap;
 }
 
 enum CacheMode {
@@ -270,12 +281,14 @@ struct BufferRequest {
     compression        @6 :BufferCompression;
     # Audit-8: security requirements for this buffer.
     security           @7 :BufferSecurity;
+    metadata @8 :T.StringMap;
 }
 
 struct BufferResult {
     union {
         buffer @0 :BufferInformation;
         error  @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
@@ -301,6 +314,7 @@ struct BufferInformation {
     compression        @13 :BufferCompression;
     # Audit-8: synchronization primitive for producer-consumer.
     sync               @14 :BufferSync;
+    metadata @15 :T.StringMap;
 }
 
 # ── Ring buffers ──
@@ -326,6 +340,7 @@ struct RingBufferResult {
     union {
         ringBuffer @0 :RingBufferInformation;
         error      @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
@@ -339,6 +354,7 @@ struct RingBufferInformation {
     mode               @6 :RingMode;
     # Current fill level (0.0 - 1.0).
     fillLevel          @7 :Float32;
+    metadata @8 :T.StringMap;
 }
 
 # ── Queries ──
@@ -346,23 +362,28 @@ struct BufferInfoResult {
     union {
         info  @0 :BufferInformation;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
+# Queries answerable by ANY backend. The previous union mixed three
+# addressing regimes: global questions, buffer-id questions, and a
+# display-shaped `formats :T.OutputId` (a headless backend could not
+# answer its own query), plus a `testPattern` whose result type said
+# nothing about the contract. Both are gone.
 struct BufferQuery {
     union {
         sharedMemoryUsage @0 :Void;
         maxBuffers        @1 :Void;
-        formats           @2 :T.OutputId;
-        custom            @3 :CustomQuery;
-        ringFill          @4 :UInt64;
-        testPattern       @5 :Text;
+        custom            @2 :CustomBufferQuery;
+        ringFill          @3 :UInt64;
     }
 }
 
-struct CustomQuery {
+struct CustomBufferQuery {
     name       @0 :Text;
     parameters @1 :List(T.Meta);
+    metadata @2 :T.StringMap;
 }
 
 struct BufferQueryResult {
@@ -395,6 +416,7 @@ interface BufferSubscription {
 struct BufferPullResult {
     events    @0 :List(BufferEvent);
     totalCount @1 :UInt32;
+    metadata @2 :T.StringMap;
 }
 
 struct BufferEvent {
@@ -405,6 +427,11 @@ struct BufferEvent {
         sharedMemoryAllocated @3 :SharedMemoryRegion;
         sharedMemoryReleased @4 :UInt64;
         error @5 :T.Error;
+        # The forward-compatibility slot every other event union in the
+        # protocol carries. Without it, a backend cannot emit a future
+        # buffer event without a schema change, and consumers'
+        # exhaustive switches are a fork waiting to happen.
+        unknown @6 :T.UnknownEvent;
     }
 }
 
@@ -432,6 +459,7 @@ struct BufferSecurity {
     encryptionKeyId @4 :Text;
     # Audit-9: encryption algorithm (e.g., "AES-256-GCM", "ChaCha20-Poly1305").
     encryptionAlgorithm @5 :Text;
+    metadata @6 :T.StringMap;
 }
 
 # ── Buffer Compression ─────────────────────────────────────────────────
@@ -464,12 +492,14 @@ struct BufferPoolRequest {
     count @3 :UInt8;
     type @4 :BufferType;
     name @5 :Text;
+    metadata @6 :T.StringMap;
 }
 
 struct BufferPoolResult {
     union {
         pool @0 :BufferPoolInfo;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
@@ -479,6 +509,7 @@ struct BufferPoolInfo {
     bufferCount @2 :UInt8;
     freeCount @3 :UInt8;
     buffers @4 :List(BufferInformation);
+    metadata @5 :T.StringMap;
 }
 
 # ── Buffer Format Info ─────────────────────────────────────────────────
@@ -508,6 +539,7 @@ struct GpuBufferInfo {
     coherencyDomain @4 :Text;
     # Supported access flags (read, write, execute).
     accessFlags @5 :UInt32;
+    metadata @6 :T.StringMap;
 }
 
 # ── Tensor Buffer Info (Audit-9) ───────────────────────────────────────
@@ -526,6 +558,7 @@ struct TensorBufferInfo {
     layout @4 :Text;
     # Whether this tensor is a view into another buffer.
     isView @5 :Bool;
+    metadata @6 :T.StringMap;
 }
 
 # ── Buffer Statistics (Audit-9) ───────────────────────────────────────
@@ -546,12 +579,20 @@ struct BufferStatistics {
 # Enables zero-copy buffer passing between camera, display, GPU, and
 # video decoder without CPU intervention.
 struct DmaBufferHandle {
-    # Opaque DMA file descriptor (backend-specific).
-    fd @0 :Int32;
+    # Opaque, backend-decoded DMA handle token.
+    #
+    # This used to be `fd :Int32`. A file descriptor is a per-process
+    # table index: the NUMBER is meaningless in the receiving process
+    # (dma-buf sharing passes the descriptor itself, not the integer),
+    # and a browser or Windows backend has no fd at all. The token lets
+    # each backend carry the handle the way its platform does; the
+    # passing mechanism is a backend detail, which is where it belongs.
+    token @0 :Data;
     # Size of the DMA buffer in bytes.
     size @1 :UInt64;
-    # DMA-BUF flags (e.g., read/write/export).
-    flags @2 :UInt32;
+    # Open-flag tokens for this export (e.g., "read", "write").
+    flags @2 :List(Text);
+    metadata @3 :T.StringMap;
 }
 
 struct DmaBufferInfo {
@@ -563,6 +604,7 @@ struct DmaBufferInfo {
     cacheMode @3 :CacheMode;
     # allocation timestamp for lifetime tracking.
     createdAt @4 :T.Timestamp;
+    metadata @5 :T.StringMap;
 }
 
 # ── Buffer Migration (Audit-9) ─────────────────────────────────────────
@@ -574,12 +616,14 @@ struct BufferMigrationRequest {
     targetRegion @1 :Text;
     # Whether to copy (false) or move (true) the buffer.
     copyOnly @2 :Bool;
+    metadata @3 :T.StringMap;
 }
 
 struct BufferMigrationResult {
     union {
         success @0 :BufferInformation;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
@@ -592,12 +636,14 @@ struct ConversionStep {
     targetFormat @1 :T.PixelFormat;
     # Hardware accelerator to use (e.g., "gpu", "vdpau", "vaapi").
     accelerator @2 :Text;
+    metadata @3 :T.StringMap;
 }
 
 struct ConversionPipeline {
     steps @0 :List(ConversionStep);
     # Whether to perform conversions in-place (reduces memory usage).
     inPlace @1 :Bool;
+    metadata @2 :T.StringMap;
 }
 
 # ── Cross-Process Buffer Sharing (Audit-9) ─────────────────────────────
@@ -614,5 +660,6 @@ struct BufferExportResult {
     union {
         exportedHandle @0 :UInt64;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }

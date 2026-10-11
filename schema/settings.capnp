@@ -1,19 +1,69 @@
 @0xa1b2c3d4e5f60022;
 
-using T = import "types.capnp";
-
 # ══════════════════════════════════════════════════════════════════════
 # Settings — hierarchical key-value configuration store.
 #
-# Improvements beyond the original schema:
-#   - SettingsSubscription has cancel method.
-#   - SettingValue.data uses T.DataHandle for large payloads.
-#   - SettingValue has custom variant for forward compatibility (audit-3).
-#   - getAll uses T.Pagination for bounded results (audit-3).
-#   - listDomains uses T.Pagination for bounded results (audit-3).
-#   - SettingsSubscription.pullPage adds paginated variant (audit-3).
-#   - SettingsSubscription.pull accepts T.Pagination (audit-4).
+# WHAT THIS IS
+#   The one settings store: domain+key, a recursive value model, change
+#   subscription, optimistic concurrency, and delta reads. The shell
+#   delegates here rather than carrying a domain-less copy.
+#
+# THE ONE WIRE-HONESTNESS DEFECT, FIXED
+#   `get` used to return a bare `SettingValue`. `SettingValue`'s zero member
+#   is `string`, so a missing key arrived as an empty string — a consumer
+#   reading `ui.accent` that was never set painted an empty accent instead
+#   of applying the default, and every backend invented a different
+#   sentinel. `get` now returns a result union carrying the value, an
+#   explicit `exists`, and `T.Error`.
+#
+# WHO MAY WRITE, STATED SO NO BACKEND GUESSES
+#   Writes are gated ONCE, by the capability held when the caller acquired
+#   this service. The store does not check per-key permissions itself: a
+#   backend that also enforces a rule inside `set` has two authorities that
+#   must agree forever. Writing `system.*` requires a platform capability;
+#   an app holding none may still read public domains and write its own.
+#
+# WHAT WAS DELETED, AND WHY
+#   - `pullSettings` — a deprecated second path to the same change stream.
+#     Two paths to one fact is a merge conflict waiting to happen.
+#   - Roaming profiles (`createRoamingProfile`, `syncRoamingProfile`,
+#     `RoamingProfile`): cross-device sync with a raw `deviceToken :Data`
+#     credential passed as a parameter. Credentials are capability
+#     references, never message fields, and this was a second settings
+#     transport beside the shell's handoff.
+#   - Encrypted settings (`setEncrypted`, `getEncrypted`): encryption as a
+#     STORE METHOD made the store a crypto participant that must hold or
+#     borrow a key path, and it took the value inline. Secret handling is
+#     secret.capnp's job; the store accepts an opaque blob it never parses.
+#   - The dependency graph (`setDependency`, `getDependencies`,
+#     `getDependents`, `SettingDependency`): a policy engine's internals.
+#   - Templates (`createTemplate`, `applyTemplate`, `listTemplates`,
+#     `deleteTemplate`, `SettingTemplate`): presets with no caller.
+#   - The reactive subscription: a second subscription to the same changes,
+#     and the one missing its bound.
+#   - The orphan structs no method ever referenced: `SettingScope`,
+#     `ManagedPolicy`, `ConditionalValue`, `SettingCondition`,
+#     `TimeRangeCondition`, `AiTunedMetadata`. Two of them were worse than
+#     dead: `SettingCondition` hardwired `batteryAbove`/`batteryBelow`/
+#     `charging` into the UNIVERSAL settings contract, so a rack server
+#     evaluated battery conditions as nonsense, and `TimeRangeCondition`
+#     carried a `daysOfWeek` bitmask with no published bit assignment.
+#
+# WHAT WAS KEPT, AND WHY IT IS WORTH KEEPING
+#   `getSettingsDiff` — a delta read instead of a full-state poll. It is the
+#   best eco design in the batch and the pattern the shell handoff and
+#   package update checks should copy. `getVersion`/`setIfUnchanged` —
+#   optimistic concurrency, correctly shaped. `getHistory` — the change
+#   audit trail. Bulk set/get — bounded and useful.
+#
+# ON `SettingValue.list` AND `SettingMap`
+#   Both stay. `SettingMap` is the wire type for multi-entry reads and
+#   writes (getAll, bulkSet, bulkGet); `SettingValue.list`/`dict` are the
+#   recursive value forms. Collapsing them would remove a shape, not a
+#   duplicate: a sequence is not a mapping.
 # ══════════════════════════════════════════════════════════════════════
+
+using T = import "types.capnp";
 
 struct SettingMap {
     entries @0 :List(SettingMapEntry);
@@ -25,99 +75,75 @@ struct SettingMapEntry {
 }
 
 interface Settings {
-    get @0 (domain :Text, key :Text) -> (value :SettingValue);
+    get @0 (domain :Text, key :Text) -> (result :SettingResult);
     set @1 (domain :Text, key :Text, value :SettingValue) -> T.VoidResult;
-    getAll @2 (domain :Text, pagination :T.Pagination) -> (settings :SettingMap, total :UInt32);
+    getAll @2 (domain :Text, pagination :T.Pagination)
+            -> (settings :SettingMap, total :UInt64);
 
     delete @3 (domain :Text, key :Text) -> T.VoidResult;
     clear  @4 (domain :Text) -> T.VoidResult;
 
-    listDomains @5 (pagination :T.Pagination) -> (domains :List(Text), total :UInt32);
+    listDomains @5 (pagination :T.Pagination)
+                -> (domains :List(Text), total :UInt64);
 
     watch       @6 (domain :Text, key :Text) -> (subscription :SettingsSubscription);
     watchDomain @7 (domain :Text) -> (subscription :SettingsSubscription);
-    # DEPRECATED: Use SettingsSubscription.pull or pullPage instead.
-    pullSettings @8 (subscription :SettingsSubscription) -> (changes :List(SettingChange));
 
-    # Audit-8: bulk set multiple settings at once (false positive: bulk operations belong here).
-    bulkSet @9 (domain :Text, entries :List(SettingMapEntry)) -> T.VoidResult;
+    # Bulk set multiple settings at once.
+    bulkSet @8 (domain :Text, entries :List(SettingMapEntry)) -> T.VoidResult;
 
-    # Audit-8: bulk get multiple settings at once.
-    bulkGet @10 (domain :Text, keys :List(Text)) -> (entries :List(SettingMapEntry));
+    # Bulk get multiple settings at once.
+    bulkGet @9 (domain :Text, keys :List(Text)) -> (entries :List(SettingMapEntry));
 
-    # Audit-8: list settings by typed category.
-    listByCategory @11 (category :SettingCategory, pagination :T.Pagination)
-                   -> (entries :List(SettingMapEntry), total :UInt32);
+    # List settings by category. `category` is an OPEN token: a settings
+    # domain invented in any later year (spatial, neural-interface, ambient)
+    # has no ordinal to wait for. Conformance tokens are published below.
+    listByCategory @10 (category :Text, pagination :T.Pagination)
+                    -> (entries :List(SettingMapEntry), total :UInt64);
 
-    # Audit-8: set a per-app override.
-    setAppOverride @12 (appId :T.AppId, key :Text, value :SettingValue) -> T.VoidResult;
+    # Per-app overrides. The HOST gates these: whether app X may override
+    # setting Y is a capability decision made at acquisition, not a parameter
+    # this service re-decides per call.
+    setAppOverride @11 (appId :T.AppId, key :Text, value :SettingValue)
+                    -> T.VoidResult;
+    # `exists` rather than an error, because "not set" is an answer.
+    getAppOverride @12 (appId :T.AppId, key :Text)
+                    -> (value :SettingValue, exists :Bool);
+    clearAppOverride @13 (appId :T.AppId, key :Text) -> T.VoidResult;
 
-    # Audit-8: get a per-app override.
-    getAppOverride @13 (appId :T.AppId, key :Text) -> (value :SettingValue, exists :Bool);
+    # Settings version for conflict detection.
+    getVersion @14 (domain :Text, key :Text) -> (version :UInt64);
 
-    # Audit-8: clear a per-app override.
-    clearAppOverride @14 (appId :T.AppId, key :Text) -> T.VoidResult;
+    # Optimistic concurrency: set only if the version is unchanged.
+    setIfUnchanged @15 (domain :Text, key :Text, value :SettingValue,
+                        expectedVersion :UInt64) -> T.VoidResult;
 
-    # Audit-8: create a roaming profile.
-    createRoamingProfile @15 (name :Text) -> (profileId :Text);
+    # Settings change history (audit trail).
+    getHistory @16 (domain :Text, key :Text, pagination :T.Pagination)
+               -> (changes :List(SettingChange), total :UInt64);
 
-    # Audit-8: sync a roaming profile across devices.
-    syncRoamingProfile @16 (profileId :Text, deviceToken :Data) -> (changes :List(SettingChange));
-
-    # Audit-8: get settings version for conflict detection.
-    getVersion @17 (domain :Text, key :Text) -> (version :UInt64);
-
-    # Audit-8: set if unchanged (optimistic concurrency).
-    setIfUnchanged @18 (domain :Text, key :Text, value :SettingValue, expectedVersion :UInt64) -> T.VoidResult;
-
-    # Audit-8: get settings history (audit trail).
-    getHistory @19 (domain :Text, key :Text, pagination :T.Pagination)
-               -> (changes :List(SettingChange), total :UInt32);
-
-    # Audit-9: set a settings dependency (when keyA changes, re-evaluate keyB).
-    setDependency @20 (domain :Text, key :Text, dependsOn :Text) -> T.VoidResult;
-
-    # Audit-9: get all dependencies for a setting.
-    getDependencies @21 (domain :Text, key :Text) -> (dependencies :List(SettingDependency));
-
-    # Audit-9: get all settings that depend on a given setting.
-    getDependents @22 (domain :Text, key :Text) -> (dependents :List(SettingDependency));
-
-    # Audit-9: create a settings template/preset.
-    createTemplate @23 (template :SettingTemplate) -> (templateId :Text);
-
-    # Audit-9: apply a settings template.
-    applyTemplate @24 (templateId :Text) -> T.VoidResult;
-
-    # Audit-9: list all settings templates.
-    listTemplates @25 () -> (templates :List(SettingTemplate));
-
-    # Audit-9: delete a settings template.
-    deleteTemplate @26 (templateId :Text) -> T.VoidResult;
-
-    # Audit-10: Subscribe to settings as a reactive stream (push-based).
-    subscribeSettingsReactive @27 (domain :Text) -> (subscription :ReactiveSettingsSubscription);
-
-    # Audit-10: Get settings diff since a given version (efficient sync).
-    getSettingsDiff @28 (domain :Text, sinceVersion :UInt64) -> (changes :List(SettingChange), currentVersion :UInt64);
-
-    # Audit-10: Set an encrypted setting value.
-    setEncrypted @29 (domain :Text, key :Text, value :Data, keyId :T.KeyId) -> T.VoidResult;
-
-    # Audit-10: Get an encrypted setting value (decrypted).
-    getEncrypted @30 (domain :Text, key :Text) -> (value :Data, exists :Bool);
+    # Delta read instead of a full-state poll. The eco pattern the rest of
+    # the protocol should copy.
+    getSettingsDiff @17 (domain :Text, sinceVersion :UInt64)
+                    -> (changes :List(SettingChange), currentVersion :UInt64);
 }
 
 interface SettingsSubscription {
-    pull   @0 (pagination :T.Pagination) -> (changes :List(SettingChange), total :UInt32);
+    pull @0 (maxEvents :UInt32) -> (changes :List(SettingChange));
     cancel @1 () -> T.VoidResult;
-    # Paginated variant of pull for large change streams.
-    pullPage @2 (pagination :T.Pagination) -> (changes :List(SettingChange), total :UInt32);
 }
 
-interface ReactiveSettingsSubscription {
-    pull @0 () -> (changes :List(SettingChange));
-    cancel @1 () -> T.VoidResult;
+# ── Values ───────────────────────────────────────────────────
+
+struct SettingResult {
+    union {
+        value   @0 :SettingValue;
+        # The key is not set. An answer, not a fault — and no longer
+        # indistinguishable from an empty string.
+        notSet  @1 :Void;
+        error   @2 :T.Error;
+        unknown @3 :Void;
+    }
 }
 
 struct SettingValue {
@@ -129,8 +155,9 @@ struct SettingValue {
         data    @4 :T.DataHandle;
         list    @5 :List(SettingValue);
         dict    @6 :SettingMap;
-        # Unknown or backend-specific value type.
-        custom  @7 :Data;
+        # A value type this schema was frozen before. Carries a type
+        # discriminator so a consumer can route it.
+        unknown @7 :T.UnknownEvent;
     }
 }
 
@@ -139,128 +166,28 @@ struct SettingChange {
     key       @1 :Text;
     value     @2 :SettingValue;
     timestamp @3 :T.Timestamp;
-    # Audit-8: who made the change (actor ID).
+    # Opaque actor token, backend-decided (an app id, a user id, or a
+    # service name). Text because the schema does not model the identity
+    # system; consumers route on it, they do not parse it.
     actorId   @4 :Text;
+    # Monotonic store version after this change, so a consumer can tell
+    # whether it has seen everything without re-reading.
+    version   @5 :UInt64;
 }
 
-# Audit-8: typed setting categories (replaces freeform domain strings).
-enum SettingCategory {
-    security @0;
-    display @1;
-    accessibility @2;
-    network @3;
-    system @4;
-    user @5;
-    audio @6;
-    privacy @7;
-    developer @8;
-    custom @9;
-}
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Published so today's tools have a discoverable spelling for setting
+# categories. An unrecognised value MUST be ignored, never rejected.
+# ══════════════════════════════════════════════════════════════════════
 
-# Audit-8: setting scope for per-app overrides and managed settings.
-struct SettingScope {
-    union {
-        global @0 :Void;
-        perApp @1 :T.AppId;
-        perUser @2 :Text;
-        perProfile @3 :Text;
-        managed @4 :ManagedPolicy;
-        inherited @5 :Text;
-        custom @6 :Data;
-    }
-}
-
-# Audit-8: enterprise managed policy.
-struct ManagedPolicy {
-    policyId @0 :Text;
-    provider @1 :Text;
-    locked @2 :Bool;
-    inheritedAt @3 :T.Timestamp;
-}
-
-# Audit-8: conditional value for time-aware settings.
-struct ConditionalValue {
-    value @0 :SettingValue;
-    condition @1 :SettingCondition;
-    priority @2 :UInt32;
-}
-
-# Audit-8: setting condition.
-struct SettingCondition {
-    union {
-        always @0 :Void;
-        timeRange @1 :TimeRangeCondition;
-        batteryAbove @2 :UInt32;
-        batteryBelow @3 :UInt32;
-        charging @4 :Bool;
-        custom @5 :Data;
-    }
-}
-
-# Audit-8: time range condition.
-struct TimeRangeCondition {
-    afterHour @0 :UInt8;
-    beforeHour @1 :UInt8;
-    daysOfWeek @2 :UInt32;
-}
-
-# Audit-8: AI-tuned metadata.
-struct AiTunedMetadata {
-    modelId @0 :Text;
-    confidence @1 :Float32;
-    source @2 :AiTuneSource;
-    learnedAt @3 :T.Timestamp;
-}
-
-# Audit-8: AI tune source.
-enum AiTuneSource {
-    usagePattern @0;
-    timeOfDay @1;
-    locationBased @2;
-    explicitHint @3;
-    custom @4;
-}
-
-# Audit-8: roaming profile.
-struct RoamingProfile {
-    profileId @0 :Text;
-    name @1 :Text;
-    settings @2 :List(SettingMapEntry);
-    syncToken @3 :Data;
-    lastSyncAt @4 :T.Timestamp;
-    deviceCount @5 :UInt32;
-}
-
-# Audit-9: settings dependency graph for policy engine.
-
-struct SettingDependency {
-    domain @0 :Text;
-    key @1 :Text;
-    # Setting that must be re-evaluated when the above changes.
-    dependsOn @2 :Text;
-    # Trigger: re-read, re-evaluate, or disable.
-    trigger @3 :DependencyTrigger;
-    # Priority for ordering.
-    priority @4 :UInt32;
-}
-
-enum DependencyTrigger {
-    reRead @0;       # Re-read the dependent setting
-    reEvaluate @1;  # Re-evaluate the dependent setting's condition
-    disable @2;      # Disable the dependent setting
-    custom @3;
-}
-
-# Audit-9: settings template/preset system.
-
-struct SettingTemplate {
-    templateId @0 :Text;
-    name @1 :Text;
-    description @2 :Text;
-    # Settings entries in this template.
-    entries @3 :List(SettingMapEntry);
-    # Tags for categorization (e.g., "night-mode", "power-saving").
-    tags @4 :List(Text);
-    # When this template was created.
-    createdAt @5 :T.Timestamp;
-}
+const categorySecurity      :Text = "security";
+const categoryDisplay       :Text = "display";
+const categoryAccessibility :Text = "accessibility";
+const categoryNetwork       :Text = "network";
+const categorySystem        :Text = "system";
+const categoryUser          :Text = "user";
+const categoryAudio         :Text = "audio";
+const categoryPrivacy       :Text = "privacy";
+const categoryDeveloper     :Text = "developer";

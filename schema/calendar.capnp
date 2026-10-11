@@ -5,26 +5,86 @@ using T = import "types.capnp";
 # ═══════════════════════════════════════════════════════════════════════
 # Calendar — event management, scheduling, free/busy, recurrence.
 #
-# Improvements (audit-7):
-#   - Recurrence.rrule for RFC 5545 complex recurrence rules.
-#   - EventLocation struct for structured locations (address, coords, virtual).
-#   - VideoConference struct for meeting URLs, dial-in, provider metadata.
-#   - EventAttachment struct for typed event attachments.
+# The zero-cost posture is correct and is kept: EventAttachment.data is
+# a T.DataHandle, import/export are T.DataHandle, the hot paths are
+# paginated, and the event subscription has a pull-paginated variant.
+#
+# ── RECURRENCE PRECEDENCE WAS UNDECLARED ──────────────────────────────
+#
+# `Recurrence` carried TWO representations of one fact — the structured
+# fields (frequency, interval, count, until, daysOfWeek, dayOfMonth,
+# monthOfYear) and a raw RFC 5545 `rrule` string — with no precedence
+# rule. The classic fork: two backends expand the same recurring event
+# differently depending on which field they honour, a backend that fills
+# `rrule` but not `frequency` produces an event whose series is invisible
+# to any consumer that only reads the structured fields, and every
+# consumer has to re-implement "which wins".
+#
+# Declared now: the STRUCTURED fields are authoritative. `rrule` is an
+# opaque backend hint for a rule the structured fields cannot express,
+# and a backend MUST report that it used it by setting
+# `structuredFieldsIncomplete`. A consumer that reads only the structured
+# fields therefore never sees a different series than the backend
+# expands. `Recurrence` also gains a timezone, because a daily 09:00
+# event crossing a DST boundary had no declared expansion.
+#
+# ── DELEGATION WAS FIVE BOOLEANS ───────────────────────────────────────
+#
+# `DelegatePermissions` (canRead/canWrite/canCreate/canDelete/canShare)
+# was RBAC, which DESIGN_PRINCIPLES.md:399 forbids, in parallel with
+# capability.capnp. Delegation semantics had to be implemented twice and
+# the two systems could disagree about who may read a delegated calendar
+# — a delegation granted here could outlive a capability revoked there.
+# The booleans AND the delegateCalendar/revokeDelegation methods are both
+# deleted: delegation is capability.capnp's `attenuate @2` + `transfer`,
+# so it joins the one authority model and gains revocation that booleans
+# never had.
+#
+# ── VENDOR NAMES AND CALENDAR SYSTEMS ──────────────────────────────────
+#
+# `CalendarSubscription` named `google` and `exchange` in a required
+# position, so a CalDAV-compatible server (Radicale, Fastmail, a
+# self-hosted Baïkal) and any 2046 service had only `custom` carrying
+# nothing. `CalendarType` named six calendar systems as permanent
+# ordinals — the Chinese, Japanese, Coptic, Ethiopian and Hindu
+# calendars all had nowhere to go. Both are open tokens now.
+#
+# ── THREE NAMES FOR ONE FIELD ──────────────────────────────────────────
+#
+# `FreeBusyPrivacy` held free/busy/tentative/outOfOffice — which are
+# STATUSES — and was assigned to a field named `status`. It is
+# `FreeBusyStatus` now, and the value-identical duplicate in
+# contacts.capnp is deleted (this file owns availability).
+#
+# ── STRINGLY-TYPED TIME OF DAY ─────────────────────────────────────────
+#
+# `DayWorkingHours.startTime`/`endTime` were "HH:MM" strings: "09:00"
+# means something different on either side of a DST transition, and two
+# backends resolved the same string to different instants. They are
+# T.Duration offsets from local midnight now — an existing type, so no
+# new foundation primitive is needed.
+#
+# Improvements (audit-7/9), unchanged:
+#   - EventLocation, VideoConference, EventAttachment.
 #   - FreeBusyQuery/FreeBusyResult for privacy-preserving availability.
-#   - CalendarType enum for multi-calendar systems (Gregorian, Lunar, etc.).
-#   - CalendarSubscription enum for feed types (iCal, CalDAV, etc.).
-#   - HolidayCalendar struct for holiday calendars.
-#   - EventFilter expanded with dateRange, attendee, hasRecurrence.
-#   - Calendar sync protocol (false positive from calendar_sync.capnp):
-#     CalendarSyncService with incremental sync, conflict resolution.
-#   - Working hours model, event conflict detection, event versioning.
+#   - HolidayCalendar; EventQueryFilter with dateRange/attendee/hasRecurrence.
+#   - Calendar sync with incremental sync and conflict resolution.
+#   - Working hours, event conflict detection, event versioning.
+#   - Analytics, reminder escalation, theme config, response history.
 # ═══════════════════════════════════════════════════════════════════════
 
 interface CalendarService {
     listCalendars @0 (pagination :T.Pagination) -> (calendars :List(CalendarInfo), totalCount :UInt32);
     getCalendar @1 (calendarId :T.CalendarId) -> (calendar :CalendarInfo);
 
-    listEvents @2 (calendarId :T.CalendarId, range :TimeRange, filter :EventFilter, pagination :T.Pagination) -> (events :List(Event), totalCount :UInt32);
+    # `range` is a start/end pair of T.Timestamp. The local TimeRange
+    # struct was the third copy in the batch (contacts and calendar each
+    # had one, types.capnp's promoted T.TimeRange uses UInt64
+    # milliseconds — a different semantics), so the pair is spelled
+    # explicitly rather than through a colliding type.
+    listEvents @2 (calendarId :T.CalendarId, start :T.Timestamp, end :T.Timestamp,
+                   filter :EventQueryFilter, pagination :T.Pagination)
+               -> (events :List(Event), totalCount :UInt32);
     getEvent @3 (eventId :T.EventId) -> (event :Event);
     getToday @4 (pagination :T.Pagination) -> (events :List(Event), totalCount :UInt32);
     getUpcoming @5 (duration :T.Duration, pagination :T.Pagination) -> (events :List(Event), totalCount :UInt32);
@@ -42,7 +102,9 @@ interface CalendarService {
 
     # ── Audit-7 additions ────────────────────────────────────
 
-    # Privacy-preserving free/busy query.
+    # Privacy-preserving free/busy query. This is the canonical
+    # availability contract for the batch; contacts.capnp's duplicate
+    # getFreeBusy is deleted.
     queryFreeBusy @14 (query :FreeBusyQuery) -> (result :FreeBusyResult);
 
     # Check if a new event conflicts with existing events.
@@ -52,60 +114,38 @@ interface CalendarService {
     searchEvents @16 (query :Text, pagination :T.Pagination) -> (events :List(Event));
 
     # Import events from iCal/CSV format.
-    importEvents @17 (calendarId :T.CalendarId, format :Text, data :T.DataHandle) -> (imported :UInt32, warnings :List(T.Warning));
+    importEvents @17 (calendarId :T.CalendarId, format :Text, data :T.DataHandle)
+        -> (imported :UInt32, warnings :List(T.Warning));
 
     # Export events to iCal/CSV format.
-    exportEvents @18 (calendarId :T.CalendarId, range :TimeRange, format :Text) -> (data :T.DataHandle);
+    exportEvents @18 (calendarId :T.CalendarId, start :T.Timestamp, end :T.Timestamp, format :Text)
+        -> (data :T.DataHandle);
 
-    # Edit all future events in a recurring series.
+    # Edit all future events in a recurring series. Declared interaction
+    # with already-modified instances: an instance listed in
+    # `Recurrence.modifiedInstances` is left untouched unless its
+    # eventId is named explicitly, so "this and future" cannot silently
+    # overwrite a per-instance exception.
     updateEventSeries @19 (eventId :T.EventId, event :Event, scope :SeriesEditScope) -> T.VoidResult;
 
-    # ── Calendar sync (false positive: calendar_sync.capnp) ──
-    # Get the sync token for incremental sync.
+    # ── Calendar sync ──
     getSyncToken @20 (calendarId :T.CalendarId) -> (token :Text);
-
-    # Fetch changes since a sync token (incremental sync).
     syncChanges @21 (calendarId :T.CalendarId, syncToken :Text) -> (result :CalendarSyncResult);
-
-    # Resolve a sync conflict.
     resolveConflict @22 (calendarId :T.CalendarId, conflictId :Text, resolution :ConflictResolution) -> T.VoidResult;
 
-    # ── Working hours (audit-7) ──────────────────────────────
-    # Get working hours for a calendar.
+    # ── Working hours ──
     getWorkingHours @23 (calendarId :T.CalendarId) -> (hours :WorkingHours);
-
-    # Set working hours for a calendar.
     setWorkingHours @24 (calendarId :T.CalendarId, hours :WorkingHours) -> T.VoidResult;
 
-    # ── Delegation (audit-7) ─────────────────────────────────
-    # Delegate calendar management to another user.
-    delegateCalendar @25 (calendarId :T.CalendarId, delegateId :T.UserId, permissions :DelegatePermissions) -> T.VoidResult;
-
-    # Revoke calendar delegation.
-    revokeDelegation @26 (calendarId :T.CalendarId, delegateId :T.UserId) -> T.VoidResult;
-
     # ── Audit-9 additions ──────────────────────────────────────
-
-    # Get calendar analytics (meeting load, time tracking).
-    getCalendarAnalytics @27 (calendarId :T.CalendarId, range :TimeRange) -> (analytics :CalendarAnalytics);
-
-    # Get reminder escalation chain for an event.
-    getReminderEscalation @28 (eventId :T.EventId, reminderId :T.ReminderId) -> (escalation :ReminderEscalation);
-
-    # Set reminder escalation chain for an event.
-    setReminderEscalation @29 (eventId :T.EventId, escalation :ReminderEscalation) -> T.VoidResult;
-
-    # Get color/theme config for a calendar.
-    getCalendarTheme @30 (calendarId :T.CalendarId) -> (config :CalendarThemeConfig);
-
-    # Set color/theme config for a calendar.
-    setCalendarTheme @31 (calendarId :T.CalendarId, config :CalendarThemeConfig) -> T.VoidResult;
-
-    # Get attendee response history for an event.
-    getAttendeeResponseHistory @32 (eventId :T.EventId) -> (history :List(AttendeeResponseHistory));
-
-    # Get supported import/export format capabilities.
-    getFormatCapabilities @33 () -> (formats :List(FormatCapability));
+    getCalendarAnalytics @25 (calendarId :T.CalendarId, start :T.Timestamp, end :T.Timestamp)
+        -> (analytics :CalendarAnalytics);
+    getReminderEscalation @26 (eventId :T.EventId, reminderId :T.ReminderId) -> (escalation :ReminderEscalation);
+    setReminderEscalation @27 (eventId :T.EventId, escalation :ReminderEscalation) -> T.VoidResult;
+    getCalendarTheme @28 (calendarId :T.CalendarId) -> (config :CalendarThemeConfig);
+    setCalendarTheme @29 (calendarId :T.CalendarId, config :CalendarThemeConfig) -> T.VoidResult;
+    getAttendeeResponseHistory @30 (eventId :T.EventId) -> (history :List(AttendeeResponseHistory));
+    getFormatCapabilities @31 () -> (formats :List(FormatCapability));
 }
 
 interface EventsSubscription {
@@ -132,28 +172,14 @@ struct CalendarInfo {
     readOnly @5 :Bool;
     visible @6 :Bool;
     # ── Audit-7 additions ────────────────────────────────────
-    calendarType @7 :CalendarType;
-    subscription @8 :CalendarSubscription;
+    # Calendar system, as an open token (see the conformance consts).
+    calendarType @7 :Text;
+    # Feed type, as an open token: a CalDAV-compatible server, a hosted
+    # service, or a 2046 mechanism. `google` and `exchange` were 2026
+    # facts frozen into required positions.
+    subscription @8 :Text;
     isHoliday @9 :Bool;
     holidayRegion @10 :Text;
-}
-
-enum CalendarType {
-    gregorian @0;
-    lunar @1;
-    hebrew @2;
-    islamic @3;
-    persian @4;
-    buddhist @5;
-    custom @6;
-}
-
-enum CalendarSubscription {
-    ical @0;
-    caldav @1;
-    google @2;
-    exchange @3;
-    custom @4;
 }
 
 # ── Event ─────────────────────────────────────────────────────
@@ -180,36 +206,51 @@ struct Event {
     attachments @17 :List(EventAttachment);
     videoConference @18 :VideoConference;
     locationStructured @19 :EventLocation;
-    freeBusyPrivacy @20 :FreeBusyPrivacy;
-    # Version number for conflict detection (audit-7).
+    freeBusyPrivacy @20 :FreeBusyStatus;
     version @21 :UInt32;
 }
 
 # ── Recurrence ────────────────────────────────────────────────
+# PRECEDENCE, declared: the STRUCTURED fields are authoritative. `rrule`
+# is an opaque backend hint for a rule the structured fields cannot
+# express; a backend that used it MUST set
+# `structuredFieldsIncomplete` so a consumer reading only the structured
+# fields knows the series it sees may be incomplete. This closes the fork
+# where two backends expanded the same series differently depending on
+# which field they honoured.
 
 struct Recurrence {
-    frequency @0 :Frequency;
+    frequency @0 :RecurrenceFrequency;
     interval @1 :UInt32;       # Count of frequency units (e.g., 2 = every 2 weeks)
     count @2 :UInt32;          # Total occurrences (0 = unlimited)
     until @3 :T.Timestamp;     # End date (zero = use count or unlimited)
     daysOfWeek @4 :List(DayOfWeek);
     dayOfMonth @5 :UInt32;     # 1-31 (0 = not set)
     monthOfYear @6 :UInt32;    # 1-12  (0 = not set)
-    custom @7 :Text;           # Backend-specific recurrence rule
-    # RFC 5545 RRULE string for complex recurrence (audit-7).
+    # Backend-specific rule, as an open token.
+    custom @7 :Text;
+    # RFC 5545 RRULE string for a rule the structured fields cannot
+    # express. Advisory only; see the precedence rule above.
     rrule @8 :Text;
-    # Dates excluded from recurrence (audit-7).
+    # Dates excluded from recurrence.
     exceptions @9 :List(T.Timestamp);
-    # Modified instances that differ from the series (audit-7).
+    # Modified instances that differ from the series.
     modifiedInstances @10 :List(Event);
+    # True when the backend relied on `rrule` and could not project it
+    # into the structured fields above.
+    structuredFieldsIncomplete @11 :Bool;
+    # Timezone the series expands in. Previously absent, so a daily
+    # 09:00 event crossing a DST boundary had no declared expansion.
+    timezone @12 :Text;
 }
 
-enum Frequency {
-    daily @0;
-    weekly @1;
-    monthly @2;
-    yearly @3;
-    custom @4;
+enum RecurrenceFrequency {
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    daily @1;
+    weekly @2;
+    monthly @3;
+    yearly @4;
+    custom @5;
 }
 
 enum DayOfWeek {
@@ -227,20 +268,13 @@ enum DayOfWeek {
 
 struct Reminder {
     id @0 :T.ReminderId;
-    method @1 :ReminderMethod;
+    # Method, as an open token (see the conformance consts).
+    method @1 :Text;
     before @2 :T.Duration;     # How long before the event to trigger
     acknowledged @3 :Bool;
 }
 
-enum ReminderMethod {
-    alert @0;
-    email @1;
-    sms @2;
-    popup @3;
-    custom @4;
-}
-
-# ── Attendee ──────────────────────────────────────────────────
+# ── Attendee ─────────────────────────────────────────────────
 
 struct Attendee {
     id @0 :T.AttendeeId;
@@ -251,53 +285,65 @@ struct Attendee {
 }
 
 enum AttendeeStatus {
-    pending @0;
-    accepted @1;
-    declined @2;
-    tentative @3;
-    delegated @4;
-    custom @5;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    pending @1;
+    accepted @2;
+    declined @3;
+    tentative @4;
+    delegated @5;
+    custom @6;
 }
 
+# `duplicate` was an iCalendar bookkeeping detail leaked into the wire —
+# not a role any consumer can act on. It is retired rather than renamed.
 enum AttendeeRole {
-    chair @0;
-    required @1;
-    optional @2;
-    nonParticipant @3;
-    duplicate @4;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    chair @1;
+    required @2;
+    optional @3;
+    nonParticipant @4;
     custom @5;
 }
 
 enum EventStatus {
-    confirmed @0;
-    tentative @1;
-    cancelled @2;
-    custom @3;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    confirmed @1;
+    tentative @2;
+    cancelled @3;
+    custom @4;
 }
 
 enum Transparency {
-    opaque @0;
-    transparent @1;
-    custom @2;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    opaque @1;
+    transparent @2;
+    custom @3;
 }
 
-# ── Free/Busy (audit-7) ───────────────────────────────────────
+# ── Free/Busy ─────────────────────────────────────────────────
+# Named FreeBusyStatus, not FreeBusyPrivacy: the values are statuses,
+# and the old name was assigned to a field called `status` — three names
+# for one concept in three lines.
 
-enum FreeBusyPrivacy {
-    free @0;
-    busy @1;
-    tentative @2;
-    outOfOffice @3;
-    custom @4;
+enum FreeBusyStatus {
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    free @1;
+    busy @2;
+    tentative @3;
+    outOfOffice @4;
+    custom @5;
 }
 
 struct FreeBusyQuery {
     # Contact or user IDs to query.
     contactIds @0 :List(T.ContactId);
-    # Time range to query.
-    range @1 :TimeRange;
+    # Time range to query, as an explicit timestamp pair (no colliding
+    # local TimeRange).
+    start @1 :T.Timestamp;
+    end @2 :T.Timestamp;
     # Calendar IDs to include (empty = all calendars).
-    calendarIds @2 :List(T.CalendarId);
+    calendarIds @3 :List(T.CalendarId);
+    parameters @4 :T.StringMap;
 }
 
 struct FreeBusyResult {
@@ -306,137 +352,116 @@ struct FreeBusyResult {
 
 struct FreeBusyEntry {
     contactId @0 :T.ContactId;
-    status @1 :FreeBusyPrivacy;
+    status @1 :FreeBusyStatus;
     start @2 :T.Timestamp;
     end @3 :T.Timestamp;
-    # Whether event details are hidden (privacy).
+    # Whether event details are hidden. Declared what "hidden" means:
+    # the entry still carries contactId, start and end, so a "hidden"
+    # event is still a busy-slot disclosure by construction — a consumer
+    # MUST NOT treat detailsHidden as confidentiality of the slot.
     detailsHidden @4 :Bool;
 }
 
-# ── Structured Location (audit-7) ─────────────────────────────
+# ── Structured Location ──────────────────────────────────────
 
 struct EventLocation {
-    # Human-readable address.
     address @0 :Text;
-    # Geographic coordinates.
     latitude @1 :Float64;
     longitude @2 :Float64;
-    # Virtual meeting URL.
     virtualUrl @3 :T.Uri;
-    # Room or venue name.
     room @4 :Text;
+    parameters @5 :T.StringMap;
 }
 
-# ── Video Conference (audit-7) ────────────────────────────────
+# ── Video Conference ─────────────────────────────────────────
 
 struct VideoConference {
-    # Meeting URL.
     url @0 :T.Uri;
-    # Dial-in phone number.
     dialIn @1 :Text;
-    # Conference PIN.
     pin @2 :Text;
-    # Provider name (e.g., "zoom", "teams", "meet").
+    # Provider, as an open token. The previous examples ("zoom",
+    # "teams", "meet") were vendor names in a doc comment feeding an
+    # open field — a comment that becomes an enum.
     provider @3 :Text;
+    parameters @4 :T.StringMap;
 }
 
-# ── Event Attachment (audit-7) ────────────────────────────────
+# ── Event Attachment ─────────────────────────────────────────
 
 struct EventAttachment {
-    # Attachment name/title.
     name @0 :Text;
-    # MIME type.
-    mimeType @1 :Text;
-    # Attachment data (inline or buffer).
+    mimeType @1 :T.MimeType;
     data @2 :T.DataHandle;
-    # Attachment URI (for external references).
     uri @3 :T.Uri;
 }
 
-# ── Time Range ────────────────────────────────────────────────
+# ── Event Filter ─────────────────────────────────────────────
 
-struct TimeRange {
-    start @0 :T.Timestamp;
-    end @1 :T.Timestamp;
-}
-
-# ── Event Filter ──────────────────────────────────────────────
-
-struct EventFilter {
+struct EventQueryFilter {
     title @0 :Text;
     location @1 :Text;
     status @2 :EventStatus;
     # ── Audit-7 additions ────────────────────────────────────
-    dateRange @3 :TimeRange;
-    attendee @4 :Text;
-    hasRecurrence @5 :Bool;
+    start @3 :T.Timestamp;
+    end @4 :T.Timestamp;
+    attendee @5 :Text;
+    hasRecurrence @6 :Bool;
+    parameters @7 :T.StringMap;
 }
 
-# ── Holiday Calendar (audit-7) ────────────────────────────────
+# ── Holiday Calendar ────────────────────────────────────────
 
 struct HolidayCalendar {
-    # Holiday set name.
     name @0 :Text;
     # Region/country code (e.g., "US", "ZA").
     region @1 :Text;
-    # Year this calendar applies to.
     year @2 :UInt32;
-    # Custom holidays defined by the user.
     customHolidays @3 :List(Holiday);
 }
 
 struct Holiday {
     name @0 :Text;
     date @1 :T.Date;
-    # Whether this is a recurring annual holiday.
     recurring @2 :Bool;
 }
 
-# ── Calendar Sync (false positive: calendar_sync.capnp) ───────
+# ── Calendar Sync ───────────────────────────────────────────
 
 struct CalendarSyncResult {
-    # New sync token to use for next sync.
     newSyncToken @0 :Text;
-    # Events added or modified since last sync.
     changed @1 :List(Event);
-    # Event IDs deleted since last sync.
     deleted @2 :List(T.EventId);
-    # Whether there are more changes to fetch.
     hasMore @3 :Bool;
-    # Sync conflicts that need resolution.
     conflicts @4 :List(SyncConflict);
 }
 
 struct SyncConflict {
-    # Unique conflict identifier.
     conflictId @0 :Text;
-    # The event with the conflict.
     eventId @1 :T.EventId;
-    # Local version of the event.
     localVersion @2 :Event;
-    # Remote version of the event.
     remoteVersion @3 :Event;
-    # Timestamp when conflict was detected.
     detectedAt @4 :T.Timestamp;
 }
 
 enum ConflictResolution {
-    keepLocal @0;
-    keepRemote @1;
-    merge @2;
-    custom @3;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    keepLocal @1;
+    keepRemote @2;
+    merge @3;
+    custom @4;
 }
 
-# ── Series Edit Scope (audit-7) ───────────────────────────────
+# ── Series Edit Scope ───────────────────────────────────────
 
 enum SeriesEditScope {
-    thisInstance @0;
-    thisAndFuture @1;
-    allInstances @2;
-    custom @3;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    thisInstance @1;
+    thisAndFuture @2;
+    allInstances @3;
+    custom @4;
 }
 
-# ── Working Hours (audit-7) ───────────────────────────────────
+# ── Working Hours ────────────────────────────────────────────
 
 struct WorkingHours {
     # Working hours per day of week (index 0 = Sunday).
@@ -447,32 +472,32 @@ struct WorkingHours {
 
 struct DayWorkingHours {
     day @0 :DayOfWeek;
-    # Whether this is a working day.
     isWorkingDay @1 :Bool;
-    # Start time (HH:MM format, e.g., "09:00").
-    startTime @2 :Text;
-    # End time (HH:MM format, e.g., "17:00").
-    endTime @3 :Text;
+    # Start time as a T.Duration offset from LOCAL MIDNIGHT, not an
+    # "HH:MM" string: "09:00" meant something different on either side
+    # of a DST transition and two backends resolved the same string to
+    # different instants.
+    startTime @2 :T.Duration;
+    endTime @3 :T.Duration;
 }
 
-# ── Delegation (audit-7) ──────────────────────────────────────
-
-struct DelegatePermissions {
-    canRead @0 :Bool;
-    canWrite @1 :Bool;
-    canCreate @2 :Bool;
-    canDelete @3 :Bool;
-    canShare @4 :Bool;
-}
+# ── Delegation ───────────────────────────────────────────────
+# `DelegatePermissions` (five booleans) and the delegateCalendar /
+# revokeDelegation methods are both deleted. Delegation is capability.capnp's
+# `attenuate @2` followed by `transfer`: the delegator weakens a Capability
+# whose `target` names this calendar and hands the reference over, so
+# delegation joins the one authority model and gains revocation and
+# attenuation that booleans never had. capability.capnp's own header
+# records the rule — "There is no delegation method in boot.capnp,
+# kernel.capnp or anywhere else — that was a second, unenforced authority
+# grammar." Revoking the delegation is capability.capnp's `revoke @4`, so a
+# delegation can no longer outlive the capability it was made from.
 
 # ════════════════════════════════════════════════════════════════════════
 # Audit-9 additions: calendar analytics, reminder escalation, color/theme
 # integration, attendee response history, and format negotiation.
 # ════════════════════════════════════════════════════════════════════════
 
-# ── Calendar Analytics ──────────────────────────────────────────────────
-# Aggregated analytics for calendar usage. Provides meeting load
-# analysis and time tracking for schedule optimization.
 struct CalendarAnalytics {
     calendarId @0 :T.CalendarId;
     totalEvents @1 :UInt32;
@@ -482,49 +507,42 @@ struct CalendarAnalytics {
     busiestHourOfDay @5 :UInt32;
     meetingLoadScore @6 :Float32;
     freeTimePercentage @7 :Float32;
-    analyzedRange @8 :TimeRange;
+    start @8 :T.Timestamp;
+    end @9 :T.Timestamp;
 }
 
 # ── Reminder Escalation ────────────────────────────────────────────────
-# Escalation chain for reminders. When a reminder is not acknowledged
-# within the specified interval, the next escalation level triggers.
-# Enables progressive notification (alert → email → SMS → phone call).
+
 struct ReminderEscalation {
     reminderId @0 :T.ReminderId;
     levels @1 :List(EscalationLevel);
-    # Maximum number of escalation cycles before stopping.
     maxCycles @2 :UInt32;
 }
 
 struct EscalationLevel {
-    # Order in the escalation chain (0 = first).
     order @0 :UInt32;
-    # Delay before this level triggers after the previous level.
     delayAfterPrevious @1 :T.Duration;
-    # Notification method for this level.
-    method @2 :ReminderMethod;
-    # Recipients for this escalation level (user IDs or addresses).
-    recipients @3 :List(Text);
+    # Method, as an open token (see the reminder-method consts).
+    method @2 :Text;
+    # Recipients, as typed user ids — the previous List(Text) mixed
+    # "user IDs or addresses" in one list, so two namespaces in one field.
+    recipients @3 :List(T.UserId);
+    # Addresses for recipients that are not local users.
+    recipientAddresses @4 :List(Text);
 }
 
 # ── Calendar Color/Theme Integration ───────────────────────────────────
-# Links a calendar to a theme color configuration. Enables per-calendar
-# color coding in calendar UIs with system theme awareness.
+
 struct CalendarThemeConfig {
     calendarId @0 :T.CalendarId;
-    # Primary color for this calendar's events.
     primaryColor @1 :T.Color;
-    # Accent color for this calendar's events.
     accentColor @2 :T.Color;
-    # Whether to use the system theme's color scheme.
     useSystemTheme @3 :Bool;
-    # Opacity for event rendering (0.0 = transparent, 1.0 = opaque).
     opacity @4 :Float32;
 }
 
 # ── Attendee Response History ──────────────────────────────────────────
-# Detailed response tracking for event attendees. Records each
-# status change with timestamp for compliance and audit.
+
 struct AttendeeResponseHistory {
     attendeeId @0 :T.AttendeeId;
     eventId @1 :T.EventId;
@@ -539,14 +557,34 @@ struct AttendeeResponseEntry {
 }
 
 # ── Format Negotiation ─────────────────────────────────────────────────
-# Supported import/export format capabilities. Enables clients to
-# discover which formats the backend supports before calling
-# importEvents or exportEvents.
+
 struct FormatCapability {
     formatId @0 :Text;
     name @1 :Text;
-    mimeType @2 :Text;
+    mimeType @2 :T.MimeType;
     supportsImport @3 :Bool;
     supportsExport @4 :Bool;
     maxEventsPerBatch @5 :UInt32;
 }
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Today's spellings for the open tokens above. Nothing requires them; an
+# unrecognized token MUST be ignored rather than rejected.
+# ══════════════════════════════════════════════════════════════════════
+
+const calendarTypeGregorian :Text = "gregorian";
+const calendarTypeLunar     :Text = "lunar";
+const calendarTypeHebrew    :Text = "hebrew";
+const calendarTypeIslamic   :Text = "islamic";
+const calendarTypePersian   :Text = "persian";
+const calendarTypeBuddhist  :Text = "buddhist";
+
+const subscriptionIcal   :Text = "ical";
+const subscriptionCaldav :Text = "caldav";
+
+const reminderMethodAlert :Text = "alert";
+const reminderMethodEmail :Text = "email";
+const reminderMethodSms   :Text = "sms";
+const reminderMethodPopup :Text = "popup";

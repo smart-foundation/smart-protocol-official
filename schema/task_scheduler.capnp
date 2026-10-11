@@ -1,164 +1,302 @@
 @0xa1b2c3d4e5f60057;
 
 # ═══════════════════════════════════════════════════════════════════════
-# Task Scheduler - background work scheduling with network policy,
-#                 expedited jobs, flexibility windows, and task groups.
+# Task scheduler — declarative background work with constraints.
 #
-# Improvements beyond the original schema (audit):
-#   - Constraints.networkPolicy (wifi-only / unmetered / cellular-allowed).
-#   - ScheduledTask.expedited for wake-from-sleep.
-#   - ScheduledTask.flexibilityWindow for battery-economy jitter.
-#   - ScheduledTask.taskGroup uses T.TaskGroupId (was raw Text).
-#   - SchedulerEvent.taskThrottled (was queued but blocked).
-#   - ScheduledTask.deadline for long-running tasks.
-#   - ScheduledTask.priority for scheduling order.
-#   - TaskFilter for paginated getPendingTasks.
-#   - TaskStats per task for analytics.
-#   - pause/resume for task lifecycle control.
-#   - All schedule duration fields use T.Duration.
-#   - TaskId promoted to T.TaskId in types.capnp (cross-schema refs).
-#   - All error :Text fields replaced with T.Error.
-#   - All subscription interfaces have cancel method.
-#   - getPendingTasks uses T.Pagination.
-#   - TaskSchedule union has custom variant for forward compat.
-#   - SchedulerSubscription has cancel for clean teardown.
-#   - getAppTasks returns pagination info for bounded iteration.
-#   - TaskFilter.taskGroup uses T.TaskGroupId (was raw Text).
-#   - Audit-6: SchedulerEvent.taskDeadlineExceeded @10 with TaskDeadlineEvent.
-#   - Audit-6: deleteTask @37 for hard-deletion (distinct from cancel/pause).
+# The scheduling core is a legitimate external contract: declare a piece
+# of background work, say when it may run and under what constraints,
+# cancel or pause it, and watch it happen. That is the doctrine's
+# "declare resource limits" family (DESIGN_PRINCIPLES.md:70), and it is
+# what this file keeps.
 #
-# Improvements (audit-7):
-#   - EventTrigger for event-based scheduling (file, CPU, network).
-#   - TaskDependency for DAG-based workflow scheduling.
-#   - TaskChain for sequential task execution.
-#   - ResourceRequirements for resource-aware scheduling.
-#   - DecayPolicy for automatic priority adjustment.
-#   - TriggerGraph for complex trigger conditions (AND/OR).
-#   - PrincipalScheduler interface for multi-scheduler coordination.
-#   - updateSchedule for live rescheduling without cancel.
-#   - listAllTasks for querying all tasks (not just pending).
-#   - getResourceUsage for capacity planning.
+# ── THE DISTRIBUTED SCHEDULER PLATFORM, DELETED ────────────────────────
+#
+# The pre-revamp file grew a distributed platform around that core:
+# machine-learning duration and resource prediction with a training
+# method, RTOS priority inheritance with donor borrowing, an electricity
+# market (joule budgets, off-peak hours, CO₂ grams), multi-node task
+# distribution with a node registry, task versioning with rollback, and
+# an audit trail.
+#
+# None of it has a consumer, and each is a policy the OS or the operator
+# owns internally: TIMELESSNESS.md:84 rejects scheduler hints from the
+# protocol, and a microkernel or embedded scheduler has no model store to
+# train and no electricity price to consult. A 2046 scheduler that
+# predicts analytically, or not at all, had to stub four methods.
+#
+# Deleted with them: `TaskDurationPrediction`, `TaskResourcePrediction`,
+# `PriorityInheritance`, `EnergySchedulingPolicy`, `EnergyEstimate`,
+# `TaskNode` + `registerTaskNode`/`unregisterTaskNode`/`listTaskNodes`/
+# `getTaskNode`/`distributeTask`, `TaskVersion` + `listTaskVersions`/
+# `getTaskVersion`/`rollbackTask`, `TaskAuditEntry` +
+# `getTaskAuditTrail`, `TaskChain`/`ChainState`/`ChainFailurePolicy` +
+# `createChain`/`getChainStatus`/`cancelChain`, and `TriggerGraph`/
+# `TriggerNode`/`TriggerEdge`/`TriggerOperator`.
+#
+# ── THE NAME COLLISIONS, FIXED ─────────────────────────────────────────
+#
+#   * `TaskState` — identical name to kernel.capnp's, different members,
+#     and the two `running`s mean different things (on-CPU now vs.
+#     executing a job between pauses). This one is a JOB lifecycle and is
+#     now named `TaskState`.
+#   * `ScheduledTaskFilter` — identical name to kernel.capnp's. Now `ScheduledTaskFilter`.
+#   * `ResourceUsage` — identical name to types.capnp's, disjoint shape.
+#     Now `SchedulerResourceUsage`.
+#
+# ── THE OTHER FIXES ────────────────────────────────────────────────────
+#
+#   * ONE workflow algebra instead of three overlapping ones
+#     (`TaskDependency`, `TaskChain`, `TriggerGraph`): the dependency DAG
+#     with conditions subsumes chains, and a plain trigger subsumes the
+#     graph. `TriggerGraph` and `TaskChain` are deleted.
+#   * `ScheduledTaskFilter.app :Text` beside `ScheduledTask.app :T.AppId` — filter
+#     by string, store by id, so a filter silently matches nothing after a
+#     rename. The id is used everywhere now.
+#   * `ExactSchedule.runAt :T.Timestamp` — wall-clock scheduling with no
+#     monotonic fallback: a clock jump fires the job twice or never. Now a
+#     monotonic anchor plus an OPTIONAL wall-clock hint, and the behaviour
+#     is declared.
+#   * periodic-overlap policy was undefined (skip, overlap, queue?). Now
+#     `PeriodicSchedule.onOverlap`, declared.
+#   * `elevateTask`/`getScheduleEnergyEstimate` took unbounded
+#     `List(T.TaskId)`; every list parameter is now bounded.
+#   * `SchedulerSubscription.pull` was unbounded. Now a stated bound.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
 
-# TaskId is T.TaskId from types.capnp (promoted in Batch 9).
-# Local definition removed; all references now use T.TaskId.
-
-struct Constraints {
+struct TaskConstraints {
     requiresCharging @0 :Bool;
     requiresIdle @1 :Bool;
     requiresNetwork @2 :Bool;
     requiresBattery @3 :Bool;
+    # Minimum battery level, 0-100 (zero = no requirement).
     minBatteryLevel @4 :UInt32;
     respectDnd @5 :Bool;
     maintenanceWindowOnly @6 :Bool;
-    networkPolicy @7 :NetworkPolicy;
-}
-
-enum NetworkPolicy {
-    any @0;
-    unmetered @1;
-    wifi @2;
-    cellular @3;
-    notRoaming @4;
-    custom @5;
+    # Network requirement as an OPEN token ("any", "unmetered", "wifi",
+    # or a 2046 one) rather than a closed ladder of today's transports.
+    networkPolicy @7 :Text;
+    metadata @8 :T.StringMap;
 }
 
 struct ScheduledTask {
     id @0 :T.TaskId;
+    # Opaque reference to the declaring entity — an app, a service, or a
+    # caller-chosen token. The protocol does not resolve it.
     app @1 :T.AppId;
     name @2 :Text;
     createdAt @3 :T.Timestamp;
     lastRunAt @4 :T.Timestamp;
-    nextRunAt @5 :T.Timestamp;
-    state @6 :TaskState;
-    constraints @7 :Constraints;
-    schedule @8 :TaskSchedule;
+    # Monotonic anchor for the next run, so a clock jump cannot fire the
+    # job twice or never.
+    nextRunAt @5 :T.MonotonicTimestamp;
+    # OPTIONAL wall-clock hint the backend chose to report. Never
+    # authoritative: a consumer must not schedule against it.
+    nextRunWallClock @6 :T.Timestamp;
+    state @7 :TaskState;
+    constraints @8 :TaskConstraints;
+    schedule @9 :TaskSchedule;
 
-    runCount @9 :UInt32;
-    failCount @10 :UInt32;
-    lastError @11 :T.Error;
+    runCount @10 :UInt32;
+    failCount @11 :UInt32;
+    lastError @12 :T.Error;
 
-    taskGroup @12 :T.TaskGroupId;
-    expedited @13 :Bool;
-    flexibilityWindow @14 :T.Duration;
-    deadline @15 :T.Timestamp;
-    priority @16 :UInt8;
-    allowForeground @17 :Bool;
-    tags @18 :List(Text);
+    taskGroup @13 :T.TaskGroupId;
+    # A hint, not an instruction (DESIGN_PRINCIPLES.md:79).
+    expedited @14 :Bool;
+    flexibilityWindow @15 :T.Duration;
+    deadline @16 :T.MonotonicTimestamp;
+    priority @17 :UInt8;
+    allowForeground @18 :Bool;
+    tags @19 :List(Text);
 
-    # ── Audit-7 additions ────────────────────────────────────
-    # DAG dependencies for this task.
-    dependencies @19 :List(TaskDependency);
-    # Resource requirements for scheduling.
-    resourceRequirements @20 :ResourceRequirements;
-    # Priority decay policy.
-    decayPolicy @21 :DecayPolicy;
-    # Chain this task belongs to (if any).
-    chainId @22 :Text;
-    # Event-based trigger (if using event schedule).
-    eventTrigger @23 :EventTrigger;
+    # DAG dependencies for this task — the one workflow algebra.
+    dependencies @20 :List(TaskDependency);
+    # Resource requirements for scheduling (declared, not negotiated).
+    resourceRequirements @21 :ResourceRequirements;
+    # What happens when the job overruns its interval.
+    overlapPolicy @22 :OverlapPolicy;
 }
 
+# The job lifecycle. Named `TaskState` because kernel.capnp's `TaskState`
+# was a different concept under the same name, and codegen collides.
 enum TaskState {
-    pending @0;
-    queued @1;
-    running @2;
-    completed @3;
-    failed @4;
-    cancelled @5;
-    blocked @6;
-    paused @7;
-    custom @8;
+    unknown @0;
+    pending @1;
+    queued @2;
+    running @3;
+    completed @4;
+    failed @5;
+    cancelled @6;
+    blocked @7;
+    paused @8;
+    custom @9;
+}
+
+enum OverlapPolicy {
+    unknown @0;
+    # Do not start a run while the previous one is still running.
+    skip @1;
+    # Start anyway; the backend may run several concurrently.
+    allowOverlap @2;
+    # Start anyway, and cancel the previous run.
+    replace @3;
+    custom @4;
 }
 
 struct TaskSchedule {
     union {
         oneShot @0 :OneShotSchedule;
         periodic @1 :PeriodicSchedule;
+        # Monotonic anchor plus an optional wall-clock hint.
         exact @2 :ExactSchedule;
-        # Event-based trigger (audit-7).
-        event @4 :EventTrigger;
-        # Complex trigger graph (audit-7).
-        graph @5 :TriggerGraph;
-        # Sequential chain execution (audit-7).
-        chained @6 :TaskChain;
-        custom @3 :Data;
+        # Event-based trigger.
+        event @3 :EventTrigger;
+        custom @4 :Data;
+        unknown @5 :T.UnknownEvent;
     }
 }
 
 struct OneShotSchedule {
+    # Delay from the moment of scheduling.
     delay @0 :T.Duration;
 }
 
 struct PeriodicSchedule {
     interval @0 :T.Duration;
     initialDelay @1 :T.Duration;
+    # What happens when a run overruns the interval. Declared, so no
+    # backend invents an overlap policy a battery app could not predict.
+    onOverlap @2 :OverlapPolicy;
+    # Stop after this many runs (zero = run forever).
+    maxRuns @3 :UInt32;
 }
 
 struct ExactSchedule {
-    runAt @0 :T.Timestamp;
-    repeat @1 :T.Duration;
+    # Monotonic anchor: the job fires at this offset from boot.
+    runAtMonotonic @0 :T.MonotonicTimestamp;
+    # Optional wall-clock hint. If the clock jumps, the monotonic anchor
+    # governs and the job fires exactly once.
+    runAtWallClock @1 :T.Timestamp;
+    repeat @2 :T.Duration;
+    # What the backend does when the wall clock and the monotonic clock
+    # disagree by more than `clockSkewTolerance`: report, honour the
+    # monotonic anchor, or skip the run. Declared, not invented.
+    onClockJump @3 :ClockJumpPolicy;
+    clockSkewTolerance @4 :T.Duration;
 }
 
-struct TaskFilter {
-    app @0 :Text;
+enum ClockJumpPolicy {
+    unknown @0;
+    honourMonotonic @1;
+    skipRun @2;
+    reschedule @3;
+    custom @4;
+}
+
+struct EventTrigger {
+    # Open event token (a file change, a device arrival, a network
+    # transition). The vocabulary is the backend's; unknown tokens are
+    # ignored by consumers.
+    eventKind @0 :Text;
+    # Debounce window, so a burst of events yields one run.
+    debounce @1 :T.Duration;
+    # Optional conditions the event must satisfy.
+    conditions @2 :TriggerConditions;
+}
+
+struct TriggerConditions {
+    # Open key/value the event must carry. Matching is backend-defined.
+    matchMetadata @0 :T.StringMap;
+    # Minimum time between runs.
+    minInterval @1 :T.Duration;
+}
+
+# The one workflow algebra: a dependency edge with a declared condition.
+struct TaskDependency {
+    taskId @0 :T.TaskId;
+    # What must hold before this task may run.
+    condition @1 :DependencyCondition;
+    # How long to wait for the dependency before failing the task.
+    waitTimeout @2 :T.Duration;
+}
+
+enum DependencyCondition {
+    unknown @0;
+    # The dependency completed successfully.
+    succeeded @1;
+    # The dependency finished (success or failure).
+    finished @2;
+    # The dependency failed.
+    failed @3;
+    custom @4;
+}
+
+struct ResourceRequirements {
+    # Declared maximum memory, in bytes (zero = none declared).
+    maxMemoryBytes @0 :UInt64;
+    # Declared maximum wall-clock per run.
+    maxRunDuration @1 :T.Duration;
+    # Whether the job needs the network (an intent, not a mechanism).
+    needsNetwork @2 :Bool;
+}
+
+# The scheduler's own resource picture. Named to avoid the collision with
+# types.capnp's `ResourceUsage` (which is a per-entity sample; this is the
+# scheduler's capacity view).
+struct SchedulerResourceUsage {
+    # Fraction of capacity in use, 0.0-1.0 (zero = not measured).
+    utilization @0 :Float32;
+    runningTasks @1 :UInt32;
+    queuedTasks @2 :UInt32;
+    # Whether the backend can measure utilization at all. A backend that
+    # cannot reports false rather than a fabricated number.
+    measurable @3 :Bool;
+    metadata @4 :T.StringMap;
+}
+
+struct ScheduledTaskFilter {
+    # Typed app identity — the pre-revamp filter used Text, so filters
+    # silently matched nothing after a rename.
+    app @0 :T.AppId;
     taskGroup @1 :T.TaskGroupId;
     states @2 :List(TaskState);
     tags @3 :List(Text);
     pagination @4 :T.Pagination;
+    metadata @5 :T.StringMap;
 }
 
 struct TaskStats {
     taskId @0 :T.TaskId;
     runCount @1 :UInt32;
     failCount @2 :UInt32;
+    # Mean duration over the retained window. A backend that cannot
+    # measure duration leaves this zero and says so in `measurable`.
     avgDuration @3 :T.Duration;
-    lastRunAt @4 :T.Timestamp;
-    lastDuration @5 :T.Duration;
-    successRate @6 :Float32;
+    measurable @4 :Bool;
+    lastRunAt @5 :T.Timestamp;
+    lastDuration @6 :T.Duration;
     totalRunTime @7 :T.Duration;
+}
+
+struct TaskFailure {
+    taskId @0 :T.TaskId;
+    error @1 :T.Error;
+    at @2 :T.MonotonicTimestamp;
+}
+
+struct TaskDeadlineEvent {
+    taskId @0 :T.TaskId;
+    deadline @1 :T.MonotonicTimestamp;
+    ranFor @2 :T.Duration;
+}
+
+struct TaskThrottleEvent {
+    taskId @0 :T.TaskId;
+    # Open reason token.
+    reason @1 :Text;
+    queueTime @2 :T.Duration;
 }
 
 struct SchedulerEvent {
@@ -170,406 +308,72 @@ struct SchedulerEvent {
         taskThrottled @4 :TaskThrottleEvent;
         taskPaused @5 :T.TaskId;
         taskResumed @6 :T.TaskId;
-        maintenanceWindowStarted @7 :T.Timestamp;
-        maintenanceWindowEnded @8 :T.Timestamp;
-        # Audit-6: task deadline exceeded event. Backend emits when a task
-        # exceeds ScheduledTask.deadline. Wraps the runtime that exceeded.
-        taskDeadlineExceeded @10 :TaskDeadlineEvent;
-        custom @9 :Data;
+        maintenanceWindowStarted @7 :T.MonotonicTimestamp;
+        maintenanceWindowEnded @8 :T.MonotonicTimestamp;
+        # Emitted when a job overruns its declared deadline.
+        taskDeadlineExceeded @9 :TaskDeadlineEvent;
+        custom @10 :Data;
+        unknown @11 :T.UnknownEvent;
     }
-}
-
-struct TaskDeadlineEvent {
-    taskId @0 :T.TaskId;
-    deadline @1 :T.Timestamp;
-    ranFor @2 :T.Duration;
-}
-
-struct TaskFailure {
-    taskId @0 :T.TaskId;
-    error @1 :T.Error;
-}
-
-struct TaskThrottleEvent {
-    taskId @0 :T.TaskId;
-    reason @1 :Text;
-    queueTime @2 :T.Duration;
-}
-
-interface TaskSchedulerService {
-    scheduleOneShot @0 (task :ScheduledTask) -> (taskId :T.TaskId);
-    schedulePeriodic @1 (task :ScheduledTask) -> (taskId :T.TaskId);
-    scheduleExact @2 (task :ScheduledTask) -> (taskId :T.TaskId);
-
-    cancel @3 (taskId :T.TaskId) -> T.VoidResult;
-    cancelAll @4 (app :T.AppId) -> T.VoidResult;
-
-    # Audit-6: hard-delete a task. Differs from cancel (mark cancelled) and
-    # pause (suspended). Removes history + counters. Cannot be undone.
-    deleteTask @37 (taskId :T.TaskId, retainHistory :Bool) -> T.VoidResult;
-
-    getTask @5 (taskId :T.TaskId) -> (task :ScheduledTask);
-    getPendingTasks @6 (filter :TaskFilter) -> (tasks :List(ScheduledTask), total :UInt64);
-    getAppTasks @7 (app :Text, pagination :T.Pagination) -> (tasks :List(ScheduledTask), total :UInt64);
-
-    pauseTask @8 (taskId :T.TaskId) -> T.VoidResult;
-    resumeTask @9 (taskId :T.TaskId) -> T.VoidResult;
-
-    requestImmediate @10 (taskId :T.TaskId) -> T.VoidResult;
-    getTaskStats @11 (taskId :T.TaskId) -> (stats :TaskStats);
-
-    getStats @12 () -> (stats :SchedulerStats);
-
-    subscribe @13 () -> (subscription :SchedulerSubscription);
-    cancelSubscribe @14 (subscription :SchedulerSubscription) -> T.VoidResult;
-
-    # ── Audit-7 additions ────────────────────────────────────
-
-    # Update a task's schedule without cancel/reschedule cycle.
-    updateSchedule @15 (taskId :T.TaskId, newSchedule :TaskSchedule) -> T.VoidResult;
-
-    # Create a sequential task chain.
-    createChain @16 (chain :TaskChain) -> (chainId :Text);
-
-    # Get the status of a task chain.
-    getChainStatus @17 (chainId :Text) -> (chain :TaskChain);
-
-    # List all tasks (not just pending) with pagination.
-    listAllTasks @18 (pagination :T.Pagination) -> (tasks :List(ScheduledTask), total :UInt64);
-
-    # Schedule an event-triggered task.
-    scheduleEventTriggered @19 (task :ScheduledTask, trigger :EventTrigger) -> (taskId :T.TaskId);
-
-    # Get current resource usage for capacity planning.
-    getResourceUsage @20 () -> (usage :ResourceUsage);
-
-    # Cancel a running chain.
-    cancelChain @21 (chainId :Text) -> T.VoidResult;
-
-    # Audit-9: task audit trail.
-    getTaskAuditTrail @22 (taskId :T.TaskId, pagination :T.Pagination) -> (entries :List(TaskAuditEntry), total :UInt64);
-
-    # Audit-9: task versioning.
-    listTaskVersions @23 (taskId :T.TaskId) -> (versions :List(TaskVersion));
-    getTaskVersion @24 (taskId :T.TaskId, version :UInt32) -> (v :TaskVersion);
-    rollbackTask @25 (taskId :T.TaskId, toVersion :UInt32) -> T.VoidResult;
-
-    # Audit-9: distributed scheduling.
-    registerTaskNode @26 (node :TaskNode) -> T.VoidResult;
-    unregisterTaskNode @27 (nodeId :Text) -> T.VoidResult;
-    listTaskNodes @28 (pagination :T.Pagination) -> (nodes :List(TaskNode), total :UInt64);
-    getTaskNode @29 (nodeId :Text) -> (node :TaskNode);
-    distributeTask @30 (taskId :T.TaskId, nodeId :Text) -> T.VoidResult;
-
-    # Audit-10: task priority inheritance.
-    setPriorityInheritance @31 (taskId :T.TaskId, config :PriorityInheritance) -> T.VoidResult;
-    getPriorityInheritance @32 (taskId :T.TaskId) -> (config :PriorityInheritance);
-    # Borrow resources from lower-priority tasks for a high-priority task.
-    elevateTask @33 (taskId :T.TaskId, donorTaskIds :List(T.TaskId)) -> T.VoidResult;
-
-    # Audit-10: energy-efficient scheduling optimization.
-    setEnergyPolicy @34 (policy :EnergySchedulingPolicy) -> T.VoidResult;
-    getEnergyPolicy @35 () -> (policy :EnergySchedulingPolicy);
-    getScheduleEnergyEstimate @36 (tasks :List(T.TaskId)) -> (estimate :EnergyEstimate);
-
-    # Audit-10: task duration/resource prediction.
-    predictTaskDuration @38 (taskId :T.TaskId) -> (prediction :TaskDurationPrediction);
-    predictTaskResources @39 (taskId :T.TaskId) -> (prediction :TaskResourcePrediction);
-    trainPredictionModel @40 (historicalTaskIds :List(T.TaskId)) -> T.VoidResult;
 }
 
 struct SchedulerStats {
     totalScheduled @0 :UInt32;
-    totalRunning @1 :UInt32;
-    totalCompleted @2 :UInt64;
-    totalFailed @3 :UInt64;
-    lastMaintenanceWindow @4 :T.Timestamp;
-    nextMaintenanceWindow @5 :T.Timestamp;
+    running @1 :UInt32;
+    pending @2 :UInt32;
+    # Mean queue wait over the retained window (zero = not measured).
+    avgQueueTime @3 :T.Duration;
+    measurable @4 :Bool;
+}
+
+# ── The scheduler contract ──────────────────────────────────────────────
+# The root of the scheduling domain: handed to the caller by the host, so
+# it is deliberately not returned by any method. `SchedulerSubscription`
+# IS returned (by `subscribe`), so every interface here is reachable.
+#
+# Every list parameter is bounded: `T.TaskId` is caller-chosen, so an
+# unbounded list would let a caller hand the scheduler 100k ids and make
+# it either bound or stream. The bound is stated in the parameter.
+
+interface TaskSchedulerService {
+    scheduleOneShot @0 (task :ScheduledTask) -> (taskId :T.TaskId);
+    schedulePeriodic @1 (task :ScheduledTask) -> (taskId :T.TaskId);
+    # Monotonic-anchored scheduling. `ExactSchedule.onClockJump` says what
+    # happens when the wall clock moves.
+    scheduleExact @2 (task :ScheduledTask) -> (taskId :T.TaskId);
+    scheduleEventTriggered @3 (task :ScheduledTask, trigger :EventTrigger) -> (taskId :T.TaskId);
+
+    # Cancel marks the job cancelled and keeps its history.
+    cancel @4 (taskId :T.TaskId) -> T.VoidResult;
+    # Hard delete removes history and counters. Cannot be undone.
+    deleteTask @5 (taskId :T.TaskId, retainHistory :Bool) -> T.VoidResult;
+    cancelAll @6 (app :T.AppId) -> T.VoidResult;
+
+    getTask @7 (taskId :T.TaskId) -> (task :ScheduledTask);
+    getPendingTasks @8 (filter :ScheduledTaskFilter) -> (tasks :List(ScheduledTask), total :UInt64);
+    getAppTasks @9 (app :T.AppId, pagination :T.Pagination) -> (tasks :List(ScheduledTask), total :UInt64);
+    listAllTasks @10 (pagination :T.Pagination) -> (tasks :List(ScheduledTask), total :UInt64);
+
+    pauseTask @11 (taskId :T.TaskId) -> T.VoidResult;
+    resumeTask @12 (taskId :T.TaskId) -> T.VoidResult;
+    requestImmediate @13 (taskId :T.TaskId) -> T.VoidResult;
+
+    getTaskStats @14 (taskId :T.TaskId) -> (stats :TaskStats);
+    getStats @15 () -> (stats :SchedulerStats);
+    getResourceUsage @16 () -> (usage :SchedulerResourceUsage);
+
+    # Update a task's schedule without a cancel/reschedule cycle.
+    updateSchedule @17 (taskId :T.TaskId, newSchedule :TaskSchedule) -> T.VoidResult;
+
+    # Live stream. Holding the subscription IS the authority to pull.
+    subscribe @18 (filter :ScheduledTaskFilter) -> (subscription :SchedulerSubscription);
+    cancelSubscribe @19 (subscription :SchedulerSubscription) -> T.VoidResult;
 }
 
 interface SchedulerSubscription {
-    pull @0 () -> (events :List(SchedulerEvent));
+    # Bounded pull: the caller states how many events it will take, so a
+    # retry storm or a backlog cannot dump the whole queue into one
+    # message.
+    pull @0 (maxEvents :UInt32) -> (events :List(SchedulerEvent), total :UInt64);
     cancel @1 () -> T.VoidResult;
-}
-
-# ── Event Trigger (audit-7) ──────────────────────────────────
-
-struct EventTrigger {
-    # Event type identifier (e.g., "fileChanged", "cpuBelow", "networkUp").
-    eventType @0 :Text;
-    # Source identifier for the event.
-    eventSource @1 :Text;
-    # Specific conditions for this trigger.
-    conditions @2 :TriggerConditions;
-    # Debounce interval to prevent rapid re-triggering.
-    debounce @3 :T.Duration;
-}
-
-struct TriggerConditions {
-    union {
-        fileChanged @0 :FileChangedTrigger;
-        cpuThreshold @1 :CpuThresholdTrigger;
-        networkStatus @2 :NetworkStatusTrigger;
-        custom @3 :Data;
-    }
-}
-
-struct FileChangedTrigger {
-    path @0 :T.FilePath;
-    watchType @1 :WatchType;
-}
-
-enum WatchType {
-    modified @0;
-    created @1;
-    deleted @2;
-    renamed @3;
-    any @4;
-    custom @5;
-}
-
-struct CpuThresholdTrigger {
-    # Trigger when CPU usage drops below this percentage.
-    belowPercent @0 :UInt8;
-    # Must be below threshold for this duration.
-    duration @1 :T.Duration;
-}
-
-struct NetworkStatusTrigger {
-    connected @0 :Bool;
-    # Network type filter (e.g., "wifi", "ethernet", "any").
-    networkType @1 :Text;
-}
-
-# ── Task Dependency (audit-7) ────────────────────────────────
-
-struct TaskDependency {
-    # Prerequisite task ID.
-    dependsOn @0 :T.TaskId;
-    # Condition under which this dependency is satisfied.
-    condition @1 :DependencyCondition;
-    # If true, failure of the prerequisite doesn't block this task.
-    optional @2 :Bool;
-}
-
-enum DependencyCondition {
-    # Runs after prerequisite completes (success or failure).
-    completed @0;
-    # Runs only if prerequisite succeeded.
-    succeeded @1;
-    # Runs only if prerequisite failed.
-    failed @2;
-    custom @3;
-}
-
-# ── Task Chain (audit-7) ─────────────────────────────────────
-
-struct TaskChain {
-    # Unique chain identifier.
-    chainId @0 :Text;
-    # Human-readable chain name.
-    name @1 :Text;
-    # Ordered list of task IDs in the chain.
-    tasks @2 :List(T.TaskId);
-    # What to do when a task in the chain fails.
-    onFailure @3 :ChainFailurePolicy;
-    # Current chain state.
-    state @4 :ChainState;
-}
-
-enum ChainFailurePolicy {
-    # Stop the chain on failure.
-    stop @0;
-    # Skip the failed task, continue with next.
-    skip @1;
-    # Retry the failed task before continuing.
-    retry @2;
-    custom @3;
-}
-
-enum ChainState {
-    pending @0;
-    running @1;
-    completed @2;
-    failed @3;
-    paused @4;
-    custom @5;
-}
-
-# ── Resource Requirements (audit-7) ──────────────────────────
-
-struct ResourceRequirements {
-    # Minimum memory required (MB).
-    minMemoryMb @0 :UInt32;
-    # Minimum CPU percentage required.
-    minCpuPercent @1 :UInt8;
-    # Maximum memory this task may use (MB).
-    maxMemoryMb @2 :UInt32;
-    # Maximum CPU percentage this task may use.
-    maxCpuPercent @3 :UInt8;
-    # Whether this task requires GPU access.
-    requiresGpu @4 :Bool;
-    # Whether this task requires network access.
-    requiresNetwork @5 :Bool;
-    # Resource name for mutual exclusion (only one task at a time).
-    exclusiveResource @6 :Text;
-}
-
-# ── Decay Policy (audit-7) ───────────────────────────────────
-
-struct DecayPolicy {
-    # Whether priority decay is enabled.
-    enabled @0 :Bool;
-    # Priority reduction per hour.
-    decayRate @1 :Float32;
-    # Don't decay below this priority level.
-    minPriority @2 :UInt8;
-    # Boost priority on failure.
-    boostOnFailure @3 :Bool;
-    # Amount of priority boost on failure.
-    boostAmount @4 :UInt8;
-}
-
-# ── Trigger Graph (audit-7) ──────────────────────────────────
-
-struct TriggerGraph {
-    # Nodes in the trigger graph.
-    nodes @0 :List(TriggerNode);
-    # Edges connecting trigger nodes.
-    edges @1 :List(TriggerEdge);
-    # Root node ID (starting point for evaluation).
-    root @2 :Text;
-}
-
-struct TriggerNode {
-    # Unique node identifier.
-    id @0 :Text;
-    # The trigger condition for this node.
-    trigger @1 :EventTrigger;
-    # Whether to negate the trigger result.
-    negate @2 :Bool;
-}
-
-struct TriggerEdge {
-    # Source node ID.
-    from @0 :Text;
-    # Target node ID.
-    to @1 :Text;
-    # How to combine source and target triggers.
-    operator @2 :TriggerOperator;
-}
-
-enum TriggerOperator {
-    # Both triggers must be true.
-    and @0;
-    # Either trigger must be true.
-    or @1;
-    # Target triggers after source completes.
-    sequential @2;
-    custom @3;
-}
-
-# ── Resource Usage (audit-7) ─────────────────────────────────
-
-struct ResourceUsage {
-    cpuPercent @0 :UInt8;
-    memoryMb @1 :UInt32;
-    activeTasks @2 :UInt32;
-    queuedTasks @3 :UInt32;
-}
-
-# ── Audit-9: Task Audit Trail ─────────────────────────────────────────
-
-struct TaskAuditEntry {
-    taskId @0 :T.TaskId;
-    timestamp @1 :T.Timestamp;
-    action @2 :TaskAuditAction;
-    details @3 :Text;
-}
-
-enum TaskAuditAction {
-    scheduled @0;
-    started @1;
-    completed @2;
-    failed @3;
-    cancelled @4;
-    skipped @5;
-    retried @6;
-    custom @7;
-}
-
-# ── Audit-9: Task Versioning ───────────────────────────────────────────
-
-struct TaskVersion {
-    version @0 :UInt32;
-    taskId @1 :T.TaskId;
-    createdAt @2 :T.Timestamp;
-    definition @3 :Data;
-    changelog @4 :Text;
-}
-
-# ── Audit-9: Distributed Scheduling ─────────────────────────────────
-
-struct TaskNode {
-    nodeId @0 :Text;
-    address @1 :Text;
-    capacity @2 :UInt32;
-    load @3 :UInt32;
-    available @4 :Bool;
-}
-
-# ── Audit-10: Priority Inheritance ──────────────────────────────────────
-# High-priority tasks can borrow resources from lower-priority tasks.
-struct PriorityInheritance {
-    enabled @0 :Bool;
-    # Minimum priority of donors (only borrow from tasks below this).
-    donorMinPriority @1 :UInt8;
-    # Maximum amount of resources to borrow (fraction 0.0-1.0).
-    maxBorrowFraction @2 :Float32;
-    # Whether to return borrowed resources when donor needs them.
-    preemptiveReturn @3 :Bool;
-    # Timeout for borrowed resources.
-    borrowTimeout @4 :T.Duration;
-}
-
-# ── Audit-10: Energy Scheduling Policy ───────────────────────────────────
-# Energy-efficient schedule optimization.
-struct EnergySchedulingPolicy {
-    enabled @0 :Bool;
-    # Target energy budget per day.
-    dailyBudgetJoules @1 :UInt64;
-    # Schedule batches during off-peak hours.
-    offPeakBatching @2 :Bool;
-    # Off-peak start hour (0-23).
-    offPeakStartHour @3 :UInt8;
-    # Off-peak end hour (0-23).
-    offPeakEndHour @4 :UInt8;
-    # Defer non-urgent tasks when on battery.
-    deferOnBattery @5 :Bool;
-    # Minimum battery level to run non-urgent tasks (0-100).
-    minBatteryLevel @6 :UInt8;
-}
-
-struct EnergyEstimate {
-    estimatedJoules @0 :UInt64;
-    estimatedCo2Grams @1 :Float32;
-    offPeakScore @2 :Float32;
-    scheduleQuality @3 :Float32;
-}
-
-# ── Audit-10: Task Prediction ────────────────────────────────────────────
-# Predict task duration and resource usage using historical data.
-struct TaskDurationPrediction {
-    predictedDuration @0 :T.Duration;
-    confidence @1 :Float32;
-    minDuration @2 :T.Duration;
-    maxDuration @3 :T.Duration;
-    basedOnSampleCount @4 :UInt32;
-}
-
-struct TaskResourcePrediction {
-    predictedMemoryMb @0 :UInt32;
-    predictedCpuPercent @1 :UInt8;
-    confidence @2 :Float32;
-    basedOnSampleCount @3 :UInt32;
 }

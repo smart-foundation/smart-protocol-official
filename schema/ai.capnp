@@ -341,12 +341,23 @@ struct ToolInvocation {
     annotations @3 :T.StringMap;
 }
 
+# A union, not parallel fields: `success = false` with a nil `error` used
+# to be representable, leaving a consumer with a failure and no cause.
+# The same file gets this right everywhere else (StreamStatus, AIEvent);
+# this was the one place a failure could be swallowed.
 struct ToolOutcome {
     request @0 :RequestId;
-    success @1 :Bool;
-    result  @2 :Artifact;
-    error   @3 :T.Error;
+    union {
+        success @1 :ToolOutcomeSuccess;
+        unknown @2 :T.UnknownEvent;
+        error   @3 :T.Error;
+    }
     custom  @4 :Data;
+}
+
+struct ToolOutcomeSuccess {
+    result @0 :Artifact;
+    custom @1 :Data;
 }
 
 interface ToolRegistry {
@@ -392,6 +403,17 @@ struct AgentMessage {
     replyTo     @5 :RequestId;
 }
 
+# A refused, crashed or unfilled agent turn is representable on the wire.
+# Returning a bare AgentMessage forced every consumer to ask "did this
+# fail, or did the agent say nothing?" of an empty replyTo/artifact.
+struct AgentSendResult {
+    union {
+        reply   @0 :AgentMessage;
+        error   @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
 struct AgentGroupSpec {
     name        @0 :Text;
     members     @1 :List(AgentId);
@@ -410,7 +432,7 @@ struct AgentFilter {
 interface AgentService {
     spawn      @0 (agent :AgentDeclaration) -> (agent :AgentId);
     terminate  @1 (agent :AgentId, graceful :Bool) -> T.VoidResult;
-    send       @2 (message :AgentMessage) -> (reply :AgentMessage);
+    send       @2 (message :AgentMessage) -> (result :AgentSendResult);
     describe   @3 (agent :AgentId) -> (descriptor :AgentDescriptor);
     list       @4 (filter :AgentFilter, page :T.Pagination)
              -> (agents :List(AgentDescriptor), total :UInt64);
@@ -530,11 +552,6 @@ interface ConversationService {
 # at is monotonic, so ordering survives clock adjustment. sequence supports
 # dedup and gap detection.
 
-struct UnknownEvent {
-    typeId  @0 :UInt64;
-    payload @1 :Data;
-}
-
 struct AIEvent {
     union {
         request       @0 :Artifact;
@@ -543,14 +560,19 @@ struct AIEvent {
         conversation  @3 :Artifact;
         knowledge     @4 :Artifact;
         notice        @5 :T.Warning;
-        unknown       @6 :UnknownEvent;
+        unknown       @6 :T.UnknownEvent;
     }
     at       @7 :T.MonotonicTimestamp;
     sequence @8 :UInt64;
 }
 
 interface AISubscription {
-    pull  @0 () -> (events :List(AIEvent));
+    # maxEvents is caller-driven backpressure, the same discipline
+    # ArtifactStream.pull @0 (maxBytes :UInt32) applies to byte streams:
+    # the producer may never push faster than the consumer pulls. The
+    # caller controls the bound; zero means "one event" so a consumer
+    # cannot accidentally ask for an unbounded batch by leaving it unset.
+    pull  @0 (maxEvents :UInt32) -> (events :List(AIEvent));
     cancel @1 () -> T.VoidResult;
 }
 

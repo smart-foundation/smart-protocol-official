@@ -544,10 +544,17 @@ struct AccessEvent {
         # Audit-7: session revoked (timeout, remote admin, policy).
         sessionRevoked @13 :AccessSession;
         # Audit-9: recovery flow state change (initiated, code submitted, completed, failed).
-        recoveryStateChange @15 :RecoveryStateChangeEvent;
+        recoveryStateChange @14 :RecoveryStateChangeEvent;
         # Audit-9: backup credential rotated.
-        backupRotated @16 :BackupRotatedEvent;
-        custom @14 :Data;
+        backupRotated @15 :BackupRotatedEvent;
+        # Forward compatibility. This arm was issued at @14 in the pre-revamp
+        # file, AFTER `recoveryStateChange @15` and `backupRotated @16`, which
+        # is a declaration-order defect: Cap'n Proto keys on the ordinal, so
+        # the wire is unchanged, but a reader scanning the file cannot see
+        # which arm is the terminator. Re-issued to the tail so the union
+        # reads in ordinal order (validator E13). The two Audit-9 arms move
+        # from @15/@16 to @14/@15 for the same reason.
+        custom @16 :Data;
     }
 }
 

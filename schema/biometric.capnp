@@ -1,93 +1,104 @@
 @0xa1b2c3d4e5f60054;
 
+
 # ═══════════════════════════════════════════════════════════════════════
 # Biometric - fingerprint, face, iris, voice, and multi-modal auth.
 #
 # This schema handles biometric hardware interaction: sensor enumeration,
 # template enrollment, authentication, and crypto-binding. Auth
-# orchestration lives in auth.capnp; this schema provides the biometric
-# capability.
+# orchestration lives in auth.capnp; device lock, MFA state machine and
+# credential recovery live in access.capnp.
 #
-# All IDs are typed (T.BiometricId). All durations use T.Duration.
-# All errors use T.Error. All timestamps use T.Timestamp.
+# ── FOUR DEFECTS, FIXED ────────────────────────────────────────────────
+#
+# 1. MODALITY AND SENSOR WERE CLOSED VOCABULARIES. `BiometricModality`
+#    named fingerprint/face/iris/voice/gesture/vein/retina/gait/keystroke/
+#    ear — R5 names "platform biometric specifics" explicitly, and the
+#    Audit-7 additions were themselves a technology snapshot. 2046
+#    hardware (DNA, brainwave, odour, a behavioural fusion sensor, a
+#    camera-based vein/pulse system) mapped to `custom` carrying nothing,
+#    and the value is consumed by BiometricPrompt.allowedModalities,
+#    MultiModalAuth.requiredModalities, BiometricAuthConfig.
+#    allowedModalities and isModalityAvailable, so an undescribed
+#    modality could not even be requested. Modality is an open token now;
+#    the security-relevant fact (SecurityLevel) stays typed.
+#
+# 2. ONE ID FOR TWO NAMESPACES. T.BiometricId was used for both hardware
+#    sensors and enrolled templates, while the promoted
+#    T.BiometricTemplateId sat unused. `getAvailability` returns hardware
+#    and `getEnrolled` returns templates, both keyed by the same type, so
+#    nothing on the wire distinguished them and BiometricAuthOutcome's templateId
+#    could be either. Hardware keeps T.BiometricId; every template
+#    reference is T.BiometricTemplateId.
+#
+# 3. THE AUTH RESULT COULD NOT SAY WHY. `BiometricAuthOutcome` was a bare enum
+#    with no payload — `failed` and `error` were indistinguishable, the
+#    reason existed nowhere on the wire, and the subscription had no
+#    terminator, so a consumer could not tell an ended stream from a
+#    slow one. It carries a payload and a `done` flag now.
+#
+# 4. THE TOKEN VERIFIER RETURNED A BARE BOOL. `verifyToken` could not
+#    distinguish "invalid" from "could not verify" (unknown algorithm,
+#    malformed token, hardware failure).
+#
+# ── THE ALGORITHM FIELD IS AN OPEN TOKEN ────────────────────────────────
+#
+# `SigningAlgorithm` was a third crypto vocabulary in the batch, in a
+# required position, on a struct whose own comment said "for crypto
+# agility" — the exact opposite of what a closed enum delivers. A 2046
+# signature scheme had `custom` carrying nothing, so a verifier reading
+# `BiometricToken.algorithm` could not know what to verify. It is now an
+# open token drawn from crypto.capnp's published vocabulary.
+#
+# ── THE SENSOR AXES ARE DECLARED ───────────────────────────────────────
+#
+# `SensorLocation` and `SensorSubtype` had overlapping members
+# (location.rearCamera vs subtype.camera), so an implementer had to
+# decide which axis a rear camera belonged to and a consumer filtering on
+# one axis missed devices recorded on the other. The split rule is now
+# declared — location is WHERE the transducer sits, subtype is WHAT KIND
+# of transducer it is — and both are open tokens.
+#
+# Zero-cost posture, kept: no inline bulk payloads, getEnrolled is
+# paginated, and the BiometricEvent union carries a custom variant.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
 
 # ── Modality ─────────────────────────────────────────────────────────────
-
-enum BiometricModality {
-    fingerprint @0;
-    face @1;
-    iris @2;
-    voice @3;
-    # Audit-7 additions: emerging biometric modalities
-    gesture @5;       # Behavioral biometric (typing, walking patterns)
-    vein @6;          # Palm/finger vein pattern
-    retina @7;        # Retinal scan
-    gait @8;          # Walking pattern recognition
-    keystroke @9;     # Typing pattern biometric
-    ear @10;          # Ear shape biometric
-    custom @4;
-}
+# Open token; see the CONFORMANCE TOKENS at the bottom of this file.
 
 # ── Hardware Info ─────────────────────────────────────────────────────────
 
 struct BiometricHardware {
+    # Hardware sensors keep T.BiometricId.
     id @0 :T.BiometricId;
-    modality @1 :BiometricModality;
+    # Modality, as an open token.
+    modality @1 :Text;
     name @2 :Text;
     securityLevel @3 :SecurityLevel;
     maxTemplates @4 :UInt32;
     falseAcceptRate @5 :Float32;
     falseRejectRate @6 :Float32;
-    # Audit-7: typed sensor location replacing bare Text.
-    location @7 :SensorLocation;
-    # Audit-7: typed sensor subtype replacing bare Text.
-    sensorType @8 :SensorSubtype;
-    # Whether the sensor can detect liveness.
+    # WHERE the transducer sits, as an open token.
+    location @7 :Text;
+    # WHAT KIND of transducer it is, as an open token. The split rule
+    # between the two axes is declared above; a rear camera is
+    # location = "rear-camera", sensorType = "camera", and a consumer
+    # filtering on either axis now sees the same device.
+    sensorType @8 :Text;
     livenessDetection @9 :Bool;
-    # Hardware revision.
     revision @10 :Text;
-    # Audit-7: hardware health monitoring.
     health @11 :BiometricHealth;
-}
-
-# Audit-7: typed sensor locations replacing bare Text.
-enum SensorLocation {
-    display @0;           # Under-display sensor (fingerprint)
-    sideButton @1;        # Side-mounted sensor
-    rearCamera @2;        # Rear camera (face recognition)
-    frontCamera @3;       # Front camera (face recognition)
-    topEdge @4;           # Top-mounted sensor
-    bottomEdge @5;        # Bottom-mounted sensor
-    underDisplay @6;      # Under-display optical sensor
-    externalUsb @7;       # External USB biometric device
-    wearable @8;          # Wearable device sensor
-    custom @9;
-}
-
-# Audit-7: typed sensor subtypes replacing bare Text.
-enum SensorSubtype {
-    optical @0;           # Optical sensor (under-display fingerprint)
-    capacitive @1;        # Capacitive sensor (traditional fingerprint)
-    ultrasonic @2;        # Ultrasonic sensor (under-display fingerprint)
-    tof @3;               # Time-of-flight sensor (depth sensing)
-    iris @4;              # Iris scanner
-    camera @5;            # Camera-based sensor (face recognition)
-    microphone @6;        # Microphone-based sensor (voice biometric)
-    pressure @7;          # Pressure-sensitive sensor
-    thermal @8;           # Thermal imaging sensor
-    radar @9;             # Radar sensor (gesture recognition)
-    lidar @10;            # LiDAR sensor (3D scanning)
-    custom @11;
+    parameters @12 :T.StringMap;
 }
 
 enum SecurityLevel {
-    weak @0;
-    balanced @1;
-    strong @2;
-    custom @3;
+    unspecified @0;   # Sentinel: an unset level is not "weak"
+    weak @1;
+    balanced @2;
+    strong @3;
+    custom @4;
 }
 
 # ── Availability ─────────────────────────────────────────────────────────
@@ -99,26 +110,19 @@ struct BiometricAvailability {
     isEnrolled @3 :Bool;
     hardwarePresent @4 :Bool;
     error @5 :T.Error;
-    # Current failed attempts across all modalities.
     failedAttempts @6 :UInt32;
-    # Lockout state (when failedAttempts >= max).
-    lockout @7 :LockoutInfo;
-    # Whether biometric is currently locked out.
+    lockout @7 :BiometricLockoutInfo;
     isLockedOut @8 :Bool;
 }
 
-struct LockoutInfo {
-    # Remaining attempts before lockout (0 = locked out).
+struct BiometricLockoutInfo {
     remainingAttempts @0 :UInt32;
-    # When the current lockout expires (if timed).
     lockoutExpiresAt @1 :T.Timestamp;
-    # Total failed attempts in this streak.
     failedAttemptCount @2 :UInt32;
-    # Type of lockout.
-    kind @3 :LockoutKind;
+    kind @3 :BiometricLockoutKind;
 }
 
-enum LockoutKind {
+enum BiometricLockoutKind {
     none @0;
     permanent @1;
     timed @2;
@@ -128,186 +132,182 @@ enum LockoutKind {
 
 # ── Authentication ───────────────────────────────────────────────────────
 
-struct AuthPrompt {
+# ONE prompt policy. `BiometricPrompt`, `BiometricAuthConfig` and
+# `MultiModalAuth` used to carry the same knobs (allowedModalities,
+# timeout, challenge, maxAttempts) with no precedence declared — two
+# knobs for one policy inside one file. The two duplicates are deleted;
+# the multi-modal fields live here.
+struct BiometricPrompt {
     title @0 :Text;
     subtitle @1 :Text;
     negativeButtonText @2 :Text;
-    allowedModalities @3 :List(BiometricModality);
+    # Modalities allowed, as open tokens.
+    allowedModalities @3 :List(Text);
     requireConfirmation @4 :Bool;
     allowDeviceCredential @5 :Bool;
     timeout @6 :T.Duration;
-    # Require a specific template ID (for app-specific auth).
-    templateId @7 :T.BiometricId;
+    # Require a specific template (for app-specific auth).
+    templateId @7 :T.BiometricTemplateId;
     # Crypto-binding: challenge to sign into the token.
     challenge @8 :Data;
-    # Audit-7: per-app auth configuration.
-    authConfig @9 :BiometricAuthConfig;
-    # Audit-7: multi-modal authentication requirements.
-    multiModal @10 :MultiModalAuth;
-}
 
-# Audit-7: per-app biometric authentication configuration.
-struct BiometricAuthConfig {
-    # Modalities allowed for this authentication.
-    allowedModalities @0 :List(BiometricModality);
-    # Whether user confirmation is required after biometric match.
-    requireConfirmation @1 :Bool;
-    # Whether device credential (PIN/pattern) can be used as fallback.
-    allowDeviceCredential @2 :Bool;
-    # Authentication timeout.
-    timeout @3 :T.Duration;
-    # Challenge for crypto-binding.
-    challenge @4 :Data;
-    # Maximum number of attempts before lockout.
-    maxAttempts @5 :UInt32;
-}
-
-# Audit-7: multi-modal authentication (N-of-M policy).
-struct MultiModalAuth {
-    # Required modalities (all must succeed).
-    requiredModalities @0 :List(BiometricModality);
+    # ── Multi-modal policy (was the separate MultiModalAuth struct) ──
+    # Modalities that must all succeed (open tokens).
+    requiredModalities @9 :List(Text);
     # Combine strategy: all must pass, any must pass, best quality wins.
-    combineStrategy @1 :MultiModalStrategy;
-    # Timeout for the multi-modal challenge.
-    timeout @2 :T.Duration;
-    # Number of modalities that must succeed (for anyOf strategy).
-    requiredCount @3 :UInt32;
+    combineStrategy @10 :MultiModalStrategy;
+    # Number of modalities that must succeed (for the any strategy).
+    requiredCount @11 :UInt32;
+    # Maximum number of attempts before lockout.
+    maxAttempts @12 :UInt32;
 }
 
 enum MultiModalStrategy {
-    all @0;     # All required modalities must succeed
-    any @1;     # Any one of the required modalities must succeed
-    best @2;    # Best quality match wins
-    custom @3;
+    unspecified @0;   # Sentinel: an unset strategy is not "all"
+    all @1;
+    any @2;
+    best @3;
+    custom @4;
 }
 
-# Audit-7: hardware health monitoring.
+# ── Hardware health monitoring ───────────────────────────────────────────
 struct BiometricHealth {
-    # Whether the sensor is functioning normally.
     sensorOk @0 :Bool;
-    # When the sensor was last calibrated.
     lastCalibration @1 :T.Timestamp;
-    # When the next calibration is due (null = not scheduled).
     calibrationDue @2 :T.Timestamp;
-    # False accept rate (lower = more secure).
     falseAcceptRate @3 :Float32;
-    # False reject rate (lower = more convenient).
     falseRejectRate @4 :Float32;
-    # Total number of sensor failures.
     failureCount @5 :UInt32;
-    # Last error message (if any).
     lastError @6 :Text;
+    parameters @7 :T.StringMap;
 }
 
-struct AuthAttempt {
-    # When the authentication attempt completed.
+struct BiometricAuthAttempt {
     timestamp @0 :T.Timestamp;
-    # Whether it succeeded.
     success @1 :Bool;
-    # Remaining attempts (present after a failed attempt).
     remainingAttempts @2 :UInt32;
-    # Which modality authenticated (or was attempted).
-    modality @3 :BiometricModality;
-    # Template used (if known).
-    templateId @4 :T.BiometricId;
-    # Quality score of the match (0.0 - 1.0).
+    # Modality, as an open token.
+    modality @3 :Text;
+    # Template used (if known) — the template namespace, not hardware.
+    templateId @4 :T.BiometricTemplateId;
     quality @5 :Float32;
+    metadata @6 :T.StringMap;
 }
 
-enum AuthResult {
-    success @0;
-    failed @1;
-    error @2;
-    cancelled @3;
-    timeout @4;
-    lockout @5;
-    deviceCredential @6;
-    custom @7;
+# The outcome of one authentication, WITH its cause. Previously a bare
+# enum, so `failed` and `error` were indistinguishable and the reason
+# existed nowhere on the wire.
+struct BiometricAuthOutcome {
+    union {
+        success @0 :BiometricAuthSuccess;
+        failed @1 :BiometricAuthFailure;
+        error @2 :T.Error;
+        cancelled @3 :Void;
+        timeout @4 :Void;
+        lockout @5 :BiometricLockoutInfo;
+        # Forward compatibility for an outcome this schema does not name.
+        custom @6 :Data;
+    }
+}
+
+struct BiometricAuthSuccess {
+    token @0 :BiometricToken;
+    attempt @1 :BiometricAuthAttempt;
+    metadata @2 :T.StringMap;
+}
+
+struct BiometricAuthFailure {
+    # Open token naming the failure class (see the CONFORMANCE TOKENS).
+    reason @0 :Text;
+    attempt @1 :BiometricAuthAttempt;
+    remainingAttempts @2 :UInt32;
+    error @3 :T.Error;
+    metadata @4 :T.StringMap;
 }
 
 # ── Template ──────────────────────────────────────────────────────────────
 
-# Audit-9: typed signing algorithm replacing bare Text for crypto agility.
-enum SigningAlgorithm {
-    hmacSha256 @0;
-    hmacSha384 @1;
-    hmacSha512 @2;
-    ecdsaP256 @3;
-    ecdsaP384 @4;
-    ed25519 @5;
-    rsa2048 @6;
-    rsa4096 @7;
-    custom @8;
-}
-
-# Audit-9: structured template version for migration (major.minor).
+# Structured template version for migration (major.minor).
 struct TemplateVersion {
-    # Major version (breaking changes in template format).
     major @0 :UInt32;
-    # Minor version (backward-compatible additions).
     minor @1 :UInt32;
-    # Patch version (bug fixes, no format changes).
     patch @2 :UInt32;
 }
 
-# Audit-9: multi-phrase voice enrollment profile with noise profiling.
+# Multi-phrase voice enrollment profile with noise profiling.
 struct VoiceEnrollmentProfile {
-    # Enrollment phrases (multiple for robustness).
     phrases @0 :List(Text);
-    # Ambient noise level during enrollment (0.0 = silent, 1.0 = loud).
     enrollmentNoiseLevel @1 :Float32;
-    # Whether noise profiling was performed.
     noiseProfiled @2 :Bool;
-    # Background noise profile (spectral fingerprint).
+    # Background noise profile (spectral fingerprint) — small and opaque.
     noiseProfile @3 :Data;
-    # Voice activity detection threshold used during enrollment.
     vadThreshold @4 :Float32;
-    # Whether far-field enrollment was used.
     farField @5 :Bool;
+    parameters @6 :T.StringMap;
 }
 
 struct BiometricTemplate {
-    id @0 :T.BiometricId;
-    modality @1 :BiometricModality;
+    # Templates get their own identity: T.BiometricTemplateId, not
+    # T.BiometricId, so a sensor id and a template id can never be
+    # crossed.
+    id @0 :T.BiometricTemplateId;
+    modality @1 :Text;
     name @2 :Text;
     enrolledAt @3 :T.Timestamp;
-    # Last successful authentication.
     lastUsedAt @4 :T.Timestamp;
-    # How many times this template authenticated.
     useCount @5 :UInt64;
-    # Which hardware sensor enrolled this.
+    # Which hardware sensor enrolled this — the hardware namespace.
     hardwareId @6 :T.BiometricId;
-    # Face-specific: enrolled with liveness detection.
     hasLiveness @7 :Bool;
-    # Voice-specific: phrase hash used during enrollment.
     voicePhraseHash @8 :Data;
-    # Audit-9: structured template version for migration.
     version @9 :TemplateVersion;
-    # Audit-9: whether the template is encrypted at rest.
     encryptedAtRest @10 :Bool;
-    # Audit-9: voice-specific enrollment profile (null for non-voice modalities).
     voiceProfile @11 :VoiceEnrollmentProfile;
+    metadata @12 :T.StringMap;
 }
 
 # ── Biometric Token (crypto-binding) ─────────────────────────────────────
 
 struct BiometricToken {
-    # HMAC of the challenge using the biometric-derived key.
     signature @0 :Data;
-    # Algorithm used to produce the signature (for crypto agility).
-    algorithm @1 :SigningAlgorithm;
-    # Which modality was used.
-    modality @2 :BiometricModality;
-    # Template that produced this token.
-    templateId @3 :T.BiometricId;
-    # Server-side challenge that was signed.
+    # Algorithm, as an open token drawn from crypto.capnp's vocabulary,
+    # so a 2046 scheme is nameable and a verifier knows what it is
+    # verifying. The previous closed enum was a third crypto vocabulary
+    # in a batch that already had two.
+    algorithm @1 :Text;
+    modality @2 :Text;
+    # Template that produced this token — the template namespace.
+    templateId @3 :T.BiometricTemplateId;
     challenge @4 :Data;
-    # Expiry (wall clock; token is only valid until this time).
     expiresAt @5 :T.Timestamp;
-    # Whether the device credential was used as fallback.
     usedDeviceCredential @6 :Bool;
-    # Issued at timestamp.
     issuedAt @7 :T.Timestamp;
+    parameters @8 :T.StringMap;
+}
+
+# A verification outcome that can say WHY, not just "no". Previously a
+# bare Bool, so "invalid" and "could not verify" were the same answer.
+struct BiometricTokenResult {
+    union {
+        valid @0 :ValidToken;
+        invalid @1 :InvalidToken;
+        error @2 :T.Error;
+        custom @3 :Data;
+    }
+}
+
+struct ValidToken {
+    templateId @0 :T.BiometricTemplateId;
+    algorithm @1 :Text;
+    expiresAt @2 :T.Timestamp;
+    metadata @3 :T.StringMap;
+}
+
+struct InvalidToken {
+    # Open token naming the failure class (see the CONFORMANCE TOKENS).
+    reason @0 :Text;
+    error @1 :T.Error;
+    metadata @2 :T.StringMap;
 }
 
 # ── Service ───────────────────────────────────────────────────────────────
@@ -316,44 +316,57 @@ interface BiometricService {
     getAvailability @0 () -> (availability :BiometricAvailability);
 
     # Authenticate and receive a signed token (optional crypto-binding).
-    authenticate @1 (prompt :AuthPrompt)
-                  -> (subscription :AuthSubscription);
+    authenticate @1 (prompt :BiometricPrompt)
+                  -> (subscription :BiometricAuthSubscription);
 
     # Get enrolled templates.
     getEnrolled @2 (pagination :T.Pagination) -> (templates :List(BiometricTemplate), totalCount :UInt32);
 
     # Enroll a new template.
-    enroll @3 (modality :BiometricModality, name :Text) -> (subscription :EnrollSubscription);
+    enroll @3 (modality :Text, name :Text) -> (subscription :EnrollSubscription);
 
     # Remove a template.
-    remove @4 (templateId :T.BiometricId) -> T.VoidResult;
+    remove @4 (templateId :T.BiometricTemplateId) -> T.VoidResult;
 
     # Remove all templates.
     removeAll @5 () -> T.VoidResult;
 
     # Check if a specific modality is available.
-    isModalityAvailable @6 (modality :BiometricModality) -> (available :Bool);
+    isModalityAvailable @6 (modality :Text) -> (available :Bool);
 
     # Verify a biometric token from a previous authenticate call.
-    verifyToken @7 (token :BiometricToken) -> (valid :Bool);
+    verifyToken @7 (token :BiometricToken) -> (result :BiometricTokenResult);
 
     # Subscribe to biometric events (enrollment progress, lockout changes).
     subscribe @8 () -> (subscription :BiometricEventSubscription);
     pull @9 (subscription :BiometricEventSubscription) -> (events :List(BiometricEvent));
     cancel @10 (subscription :BiometricEventSubscription) -> T.VoidResult;
 
-    # Audit-9: enroll voice with multi-phrase profile and noise profiling.
+    # Enroll voice with multi-phrase profile and noise profiling.
     enrollVoice @11 (name :Text, profile :VoiceEnrollmentProfile) -> (subscription :EnrollSubscription);
 
-    # Audit-9: get template version compatibility matrix.
-    getTemplateCompatibility @12 (fromVersion :TemplateVersion, toVersion :TemplateVersion) -> (compatible :Bool, migrationRequired :Bool);
+    # Get template version compatibility.
+    #
+    # Declared semantics: `migrationRequired = true` means the backend
+    # will migrate this template ON NEXT USE, transparently. There is no
+    # in-place migration method, so a caller that requires an immediate
+    # migration MUST remove and re-enroll. The version scheme itself:
+    # a MAJOR bump is breaking (the template can no longer be matched),
+    # a MINOR bump is backward-compatible (the old matcher still
+    # matches), a PATCH changes no matching behaviour. Previously none of
+    # this was declared, so a backend reporting migrationRequired = true
+    # left the caller with nothing to call.
+    getTemplateCompatibility @12 (fromVersion :TemplateVersion, toVersion :TemplateVersion)
+        -> (compatible :Bool, migrationRequired :Bool, breakingChange :Bool);
 
-    # Audit-9: declare encryption-at-rest status for a template.
-    setTemplateEncryption @13 (templateId :T.BiometricId, encrypted :Bool) -> T.VoidResult;
+    # Declare encryption-at-rest status for a template.
+    setTemplateEncryption @13 (templateId :T.BiometricTemplateId, encrypted :Bool) -> T.VoidResult;
 }
 
-interface AuthSubscription {
-    pull @0 () -> (result :AuthResult, attempt :AuthAttempt);
+interface BiometricAuthSubscription {
+    # `done` is a STRUCTURAL TERMINATOR: a consumer can now tell an
+    # ended stream from a slow one, which the previous shape could not.
+    pull @0 () -> (result :BiometricAuthOutcome, attempt :BiometricAuthAttempt, done :Bool);
     cancel @1 () -> T.VoidResult;
 }
 
@@ -363,45 +376,32 @@ interface EnrollSubscription {
 }
 
 struct EnrollProgress {
-    # Progress percentage (0-100).
     percent @0 :UInt32;
     step @1 :EnrollStep;
-    templateId @2 :T.BiometricId;
-    # Remaining steps.
+    templateId @2 :T.BiometricTemplateId;
     remainingSteps @3 :UInt32;
 }
 
 enum EnrollStep {
     waitingForSensor @0;
     partialEnrollment @1;
-    captureComplete @5;
-    processing @6;
-    qualityCheck @7;
-    templateStored @8;
-    complete @2;
-    failed @3;
-    custom @4;
+    captureComplete @2;
+    processing @3;
+    qualityCheck @4;
+    templateStored @5;
+    complete @6;
+    failed @7;
+    custom @8;
 }
 
-# Audit-7: structured liveness detection result.
+# Structured liveness detection result.
 struct LivenessCheck {
-    # Whether liveness check passed.
     passed @0 :Bool;
-    # Method used for liveness detection.
-    method @1 :LivenessMethod;
-    # Confidence score (0.0 - 1.0).
+    # Method, as an open token.
+    method @1 :Text;
     confidence @2 :Float32;
-    # When the liveness check was performed.
     timestamp @3 :T.Timestamp;
-}
-
-enum LivenessMethod {
-    blink @0;          # Blink detection (front camera)
-    depth @1;          # Depth sensing (ToF sensor)
-    texture @2;        # Texture analysis (spoofing detection)
-    motion @3;         # Motion detection (natural movement)
-    challenge @4;      # Challenge-response (random prompt)
-    custom @5;
+    parameters @4 :T.StringMap;
 }
 
 # ── Events ───────────────────────────────────────────────────────────────
@@ -418,18 +418,19 @@ struct BiometricEvent {
         templateEnrolled @2 :TemplateEvent;
         templateRemoved @3 :TemplateEvent;
         hardwareChanged @4 :HardwareChangedEvent;
-        # Audit-7: new event types for richer event stream
-        templateUpdated @6 :TemplateEvent;
-        livenessFailure @7 :LivenessCheck;
-        hardwareError @8 :HardwareErrorEvent;
-        calibrationDue @9 :CalibrationDueEvent;
-        custom @5 :Data;
+        templateUpdated @5 :TemplateEvent;
+        livenessFailure @6 :LivenessCheck;
+        hardwareError @7 :HardwareErrorEvent;
+        calibrationDue @8 :CalibrationDueEvent;
+        custom @9 :Data;
     }
 }
 
 # Audit-7: hardware error event.
 struct HardwareErrorEvent {
     hardwareId @0 :T.BiometricId;
+    # Error code, as an open token, so a consumer can branch on the
+    # class rather than parse free text.
     errorCode @1 :Text;
     description @2 :Text;
     timestamp @3 :T.Timestamp;
@@ -444,13 +445,13 @@ struct CalibrationDueEvent {
 }
 
 struct LockoutEvent {
-    lockout @0 :LockoutInfo;
+    lockout @0 :BiometricLockoutInfo;
     timestamp @1 :T.Timestamp;
 }
 
 struct TemplateEvent {
-    templateId @0 :T.BiometricId;
-    modality @1 :BiometricModality;
+    templateId @0 :T.BiometricTemplateId;
+    modality @1 :Text;
     timestamp @2 :T.Timestamp;
 }
 
@@ -458,3 +459,59 @@ struct HardwareChangedEvent {
     hardware @0 :List(BiometricHardware);
     timestamp @1 :T.Timestamp;
 }
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Today's spellings for the open tokens above (modalities, sensor types,
+# sensor locations, token failure classes). Nothing requires them; an
+# unrecognized token MUST be ignored rather than rejected, so 2046
+# hardware is requestable and reportable the day a backend ships it —
+# no schema amendment, and no `custom` slot that carries nothing.
+# ══════════════════════════════════════════════════════════════════════
+
+const modalityFingerprint :Text = "fingerprint";
+const modalityFace        :Text = "face";
+const modalityIris        :Text = "iris";
+const modalityVoice       :Text = "voice";
+const modalityGesture     :Text = "gesture";
+const modalityVein        :Text = "vein";
+const modalityRetina      :Text = "retina";
+const modalityGait        :Text = "gait";
+const modalityKeystroke   :Text = "keystroke";
+const modalityEar         :Text = "ear";
+
+const sensorTypeOptical     :Text = "optical";
+const sensorTypeCapacitive  :Text = "capacitive";
+const sensorTypeUltrasonic  :Text = "ultrasonic";
+const sensorTypeTof         :Text = "tof";
+const sensorTypeIris        :Text = "iris";
+const sensorTypeCamera      :Text = "camera";
+const sensorTypeMicrophone  :Text = "microphone";
+const sensorTypePressure    :Text = "pressure";
+const sensorTypeThermal     :Text = "thermal";
+const sensorTypeRadar       :Text = "radar";
+const sensorTypeLidar       :Text = "lidar";
+
+const sensorLocationDisplay      :Text = "display";
+const sensorLocationSideButton   :Text = "side-button";
+const sensorLocationRearCamera   :Text = "rear-camera";
+const sensorLocationFrontCamera  :Text = "front-camera";
+const sensorLocationTopEdge      :Text = "top-edge";
+const sensorLocationBottomEdge   :Text = "bottom-edge";
+const sensorLocationUnderDisplay :Text = "under-display";
+const sensorLocationExternalUsb  :Text = "external-usb";
+const sensorLocationWearable     :Text = "wearable";
+
+const livenessBlink    :Text = "blink";
+const livenessDepth    :Text = "depth";
+const livenessTexture  :Text = "texture";
+const livenessMotion   :Text = "motion";
+const livenessChallenge :Text = "challenge";
+
+const tokenFailureExpired           :Text = "expired";
+const tokenFailureMalformed         :Text = "malformed";
+const tokenFailureUnknownAlgorithm  :Text = "unknown-algorithm";
+const tokenFailureWrongChallenge    :Text = "wrong-challenge";
+const tokenFailureRevoked           :Text = "revoked";
+const tokenFailureUnsupported       :Text = "unsupported";

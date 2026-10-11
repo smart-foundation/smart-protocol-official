@@ -1,202 +1,168 @@
 @0xa1b2c3d4e5f60018;
 
+# ═══════════════════════════════════════════════════════════════════════
+# Process — process lifecycle, observation and memory inspection.
+#
+# ── WHAT WAS DELETED, AND WHY ──────────────────────────────────────────
+#
+#   * `ProcessCredentials { uid, gid, suid, sgid, euid, egid }` — the
+#     POSIX credential model verbatim. A capability kernel has no uid;
+#     it had to fabricate six numbers that mean nothing. Replaced by an
+#     execution context that reports the isolation boundary and the
+#     capability references the process holds.
+#   * `getCgroupInfo` / `setCgroupResource` / `CgroupInfo` — a Linux
+#     mechanism named in the contract. Declared limits travel as the
+#     canonical `T.Quota`, which is platform-neutral and already existed.
+#   * `ProcessCapability { name, granted, inherited, permitted,
+#     effective }` — Linux capabilities(7) as a protocol type, i.e. a
+#     second access-control model beside capability.capnp. "The
+#     capability system IS the access control mechanism"
+#     (DESIGN_PRINCIPLES.md:399).
+#   * `ProcessState` / `ThreadState` with `zombie` and `defunct` —
+#     replaced by the canonical `T.ExecutionState`, shared with the
+#     kernel. An actor runtime has no zombie and must not be forced to
+#     emit one.
+#   * `ProcessResourceType` (cpuTime, fileDescriptors, nice,
+#     coreDumpSize …) — RLIMIT_* vocabulary, replaced by T.Quota.
+#   * `ProcessSandboxConfig { droppedCapabilities, keptCapabilities,
+#     readOnlyPaths, maskedPaths }` — a sandbox contract that duplicates
+#     sandbox.capnp, with Linux capability names as free text.
+#   * `getSchedulingPolicy` / `setSchedulingPolicy` + `SchedulingPolicy`
+#     (normal/batch/fifo/rr/deadline) — Linux scheduling classes.
+#     TIMELESSNESS.md:84 rules scheduler machinery KEEPS OUT; a caller
+#     expresses intent with the priority hint in the spawn spec.
+#   * `getAffinity` / `setAffinity` / `getNumaNode` / `listNumaNodes` —
+#     CPU masks and topology introspection are backend internals.
+#   * `kill` — signal delivery authority is signal.capnp's
+#     `SignalService.send`, the only interface with a typed delivery
+#     result. Three permission checks became one.
+#   * `getContainerInfo` / `getWasmInfo` — a 2020 deployment topology and
+#     one runtime's internals in an eternal contract.
+#   * the migration block (`getMigrationConfig` … `cancelMigration`) —
+#     live migration between hosts as process-contract methods.
+#   * raw `UInt64` pids and `UInt8` state codes in the supervision
+#     block — typed to T.ProcessId / T.FailureReport / T.EntityState.
+#
+# ── THE READ-MEMORY CONTRACT ───────────────────────────────────────────
+#
+# `readMemory` returns a T.DataHandle and MAY return a torn view of a
+# region that the target is concurrently writing: the backend decides
+# between stopping the target, snapshotting, or best-effort, and reports
+# which it did in `MemoryRead.consistency`. A portable debugger is
+# written against that declaration, not against a hope.
+#
+# Authority is the interface reference: holding the `Process` reference
+# (or, for inspection, an `attach`-derived one) is the authority. No
+# per-method token (R3).
+# ═══════════════════════════════════════════════════════════════════════
+
 using T = import "types.capnp";
 
-# ═══════════════════════════════════════════════════════════════════════
-# Process - process lifecycle, introspection, memory access.
-#
-# Improvements beyond the original schema:
-#   - T.SignalKind replaces raw Int32 signal numbers (no POSIX assumptions).
-#   - T.ExitStatus union replaces raw Int32 exit code.
-#   - T.Duration for timeoutMs (was raw UInt64).
-#   - T.UserId for user identification (no POSIX UID).
-#   - T.ThreadId for thread identification.
-#   - Subscription cancel method added.
-#   - Pagination on listProcesses, getThreads, getMemoryMap (audit-3).
-#   - Custom variant on ProcessState.
-#   - ThreadState enum replaces bare Text for thread state.
-#   - wait() zero-timeout semantics documented (audit-3).
-#   - listProcesses returns total count for pagination (audit-4).
-# ═══════════════════════════════════════════════════════════════════════
-
 interface Process {
-    listProcesses @0 (filter :ProcessFilter, pagination :T.Pagination) -> (processes :List(ProcessInfo), total :UInt32);
+    # Bounded listing and lookup.
+    listProcesses @0 (filter :ProcessFilter, page :T.Pagination) -> (processes :List(ProcessInfo), total :UInt64);
     getProcess @1 (pid :T.ProcessId) -> (info :ProcessInfo);
 
-    spawn @2 (command :Text, args :List(Text), env :T.StringMap, workingDir :Text) -> (pid :T.ProcessId);
-    kill @3 (pid :T.ProcessId, signal :T.SignalKind) -> T.VoidResult;
-    # Wait for a process to exit. If timeout is zero, returns immediately
-    # with current exit status (does not block). If process has not exited
-    # and timeout is non-zero, blocks until exit or timeout.
-    wait @4 (pid :T.ProcessId, timeout :T.Duration) -> (exitStatus :T.ExitStatus);
+    # Create a process. The image is an opaque reference the backend
+    # resolves; the protocol names no path, no format, no loader.
+    spawn @2 (spec :ProcessSpawnSpec) -> (pid :T.ProcessId);
 
-    getEnvironment @5 (pid :T.ProcessId) -> (env :T.StringMap);
-    setEnvironment @6 (pid :T.ProcessId, env :T.StringMap) -> T.VoidResult;
+    # Wait for a process to exit. Zero timeout returns immediately with
+    # the current status (does not block); non-zero blocks until exit or
+    # timeout.
+    wait @3 (pid :T.ProcessId, timeout :T.Duration) -> (exitStatus :T.ExitStatus);
 
-    subscribeProcess @7 (pid :T.ProcessId) -> (subscription :ProcessSubscription);
+    getEnvironment @4 (pid :T.ProcessId) -> (env :T.StringMap);
+    setEnvironment @5 (pid :T.ProcessId, env :T.StringMap) -> T.VoidResult;
 
-    getThreads @8 (pid :T.ProcessId, pagination :T.Pagination) -> (threads :List(ThreadInfo), total :UInt32);
-    getMemoryMap @9 (pid :T.ProcessId, pagination :T.Pagination) -> (regions :List(MemoryRegion), total :UInt32);
+    # Observation. Holding the subscription IS the authority to pull.
+    subscribeProcess @6 (pid :T.ProcessId) -> (subscription :ProcessSubscription);
+    # Exit observation, for callers that want the notification rather than
+    # a poll loop. Same subscription shape, same authority model.
+    subscribeDeath @7 (pid :T.ProcessId) -> (subscription :ExitNotificationSubscription);
+    getProcessStatus @8 (pid :T.ProcessId) -> (status :ProcessStatus);
 
-    attach @10 (pid :T.ProcessId) -> T.VoidResult;
-    detach @11 (pid :T.ProcessId) -> T.VoidResult;
-    readMemory @12 (pid :T.ProcessId, address :UInt64, size :UInt64) -> (data :Data);
-    writeMemory @13 (pid :T.ProcessId, address :UInt64, data :Data) -> T.VoidResult;
+    getThreads @9 (pid :T.ProcessId, page :T.Pagination) -> (threads :List(ThreadInfo), total :UInt64);
+    getMemoryMap @10 (pid :T.ProcessId, page :T.Pagination) -> (regions :List(MemoryMapEntry), total :UInt64);
 
-    # Aggregate process statistics for the system or a specific user.
-    getStats @14 (user :T.UserId) -> (stats :ProcessStats);
+    # Inspection. `attach` grants the calling process the right to read
+    # and write the target's memory; holding the attached reference is
+    # the authority for readMemory/writeMemory, so no token is passed.
+    attach @11 (pid :T.ProcessId) -> T.VoidResult;
+    detach @12 (pid :T.ProcessId) -> T.VoidResult;
+    readMemory @13 (pid :T.ProcessId, address :UInt64, size :UInt64) -> (read :MemoryRead);
+    writeMemory @14 (pid :T.ProcessId, address :UInt64, data :T.DataHandle) -> T.VoidResult;
 
-    # ─── Process Groups (Job Control) ──────────────────────────
+    # Aggregate statistics.
+    getStats @15 (user :T.UserId) -> (stats :ProcessStats);
+    getAccounting @16 (pid :T.ProcessId) -> (usage :T.ResourceUsage);
+    getResourceAccounting @17 (pid :T.ProcessId, duration :T.Duration) -> (window :ResourceAccountingWindow);
 
-    # List process groups.
-    listProcessGroups @15 (page :T.Pagination) -> (groups :List(ProcessGroup), total :UInt32);
+    # ── Process groups ──────────────────────────────────────────
+    listProcessGroups @18 (page :T.Pagination) -> (groups :List(ProcessGroup), total :UInt64);
+    getProcessGroup @19 (groupId :T.ProcessGroupId) -> (group :ProcessGroup);
+    createProcessGroup @20 (name :Text) -> (groupId :T.ProcessGroupId);
+    addToGroup @21 (groupId :T.ProcessGroupId, pid :T.ProcessId) -> T.VoidResult;
+    removeFromGroup @22 (groupId :T.ProcessGroupId, pid :T.ProcessId) -> T.VoidResult;
+    setForegroundGroup @23 (groupId :T.ProcessGroupId) -> T.VoidResult;
 
-    # Get process group info.
-    getProcessGroup @16 (groupId :T.ProcessId) -> (group :ProcessGroup);
+    # ── Declared limits ─────────────────────────────────────────
+    # Platform-neutral quota, one contract for init, service and process.
+    getResourceLimits @24 (pid :T.ProcessId) -> (limits :T.Quota);
+    setResourceLimit @25 (pid :T.ProcessId, limit :T.Quota) -> T.VoidResult;
 
-    # Create a new process group.
-    createProcessGroup @17 (name :Text) -> (groupId :T.ProcessId);
+    # ── Execution context ───────────────────────────────────────
+    # What the process is: its isolation boundary and the capability
+    # references it holds. Replaces the POSIX credential struct.
+    getExecutionContext @26 (pid :T.ProcessId) -> (context :ExecutionContext);
+    setExecutionContext @27 (pid :T.ProcessId, context :ExecutionContext) -> T.VoidResult;
 
-    # Add a process to a group.
-    addToGroup @18 (groupId :T.ProcessId, pid :T.ProcessId) -> T.VoidResult;
+    # ── Process tree ────────────────────────────────────────────
+    # `maxDepth` 0 = this process only; 1 = direct children; the largest
+    # UInt32 = the whole tree. Depth is the caller's bound, so a deep
+    # tree cannot arrive unbounded.
+    getProcessTree @28 (pid :T.ProcessId, maxDepth :UInt32) -> (tree :ProcessTree);
 
-    # Remove a process from a group.
-    removeFromGroup @19 (groupId :T.ProcessId, pid :T.ProcessId) -> T.VoidResult;
+    # ── Supervision ─────────────────────────────────────────────
+    # Process-level supervision, typed throughout. Service supervision
+    # (restart graphs, service policies) is init.capnp's contract.
+    registerSupervisor @29 (supervisor :T.ProcessId, target :T.ProcessId) -> (handle :T.ProcessGroupId);
+    reportProcessFailure @30 (pid :T.ProcessId, report :T.FailureReport) -> T.VoidResult;
+    respawnProcess @31 (pid :T.ProcessId) -> (respawned :T.ProcessId);
+    getProcessRespawnStatus @32 (pid :T.ProcessId) -> (status :RespawnStatus);
+    exitProcess @33 (reason :T.FailureReport) -> T.VoidResult;
 
-    # Set foreground process group (for terminal job control).
-    setForegroundGroup @20 (groupId :T.ProcessId) -> T.VoidResult;
-
-    # ─── Resource Limits ───────────────────────────────────────
-
-    # Get resource limits for a process.
-    getResourceLimits @21 (pid :T.ProcessId) -> (limits :List(ResourceLimit));
-
-    # Set resource limits for a process.
-    setResourceLimit @22 (pid :T.ProcessId, limit :ResourceLimit) -> T.VoidResult;
-
-    # ─── Scheduling ────────────────────────────────────────────
-
-    # Get scheduling policy for a process.
-    getSchedulingPolicy @23 (pid :T.ProcessId) -> (policy :SchedulingPolicy, priority :Int32);
-
-    # Set scheduling policy for a process.
-    setSchedulingPolicy @24 (pid :T.ProcessId, policy :SchedulingPolicy, priority :Int32) -> T.VoidResult;
-
-    # ─── Capabilities ──────────────────────────────────────────
-
-    # Get capabilities for a process.
-    getCapabilities @25 (pid :T.ProcessId) -> (capabilities :List(ProcessCapability));
-
-    # Grant a capability to a process.
-    grantCapability @26 (pid :T.ProcessId, capability :ProcessCapability) -> T.VoidResult;
-
-    # Revoke a capability from a process.
-    revokeCapability @27 (pid :T.ProcessId, capabilityName :Text) -> T.VoidResult;
-
-    # ─── Process Accounting ─────────────────────────────────────
-
-    # Get detailed process accounting (CPU time, I/O, page faults).
-    getAccounting @28 (pid :T.ProcessId) -> (accounting :ProcessAccounting);
-
-    # ─── Container / WASM Context ──────────────────────────────
-
-    # Get container context for a process (if running in container).
-    getContainerInfo @29 (pid :T.ProcessId) -> (info :ContainerInfo);
-
-    # Get WASM process info (if running as WASM).
-    getWasmInfo @30 (pid :T.ProcessId) -> (info :WasmProcessInfo);
-
-    # ─── Process Sandbox ───────────────────────────────────────
-
-    # Get sandbox configuration for a process.
-    getSandboxConfig @31 (pid :T.ProcessId) -> (config :ProcessSandboxConfig);
-
-    # Set sandbox configuration for a process.
-    setSandboxConfig @32 (pid :T.ProcessId, config :ProcessSandboxConfig) -> T.VoidResult;
-
-    # ─── Process Tree ──────────────────────────────────────────
-
-    # Get parent-child process tree.
-    getProcessTree @33 (pid :T.ProcessId, maxDepth :UInt32) -> (tree :ProcessTree);
-
-    # ─── Audit-9: Process Tracing ─────────────────────────────
-    setTraceConfig @34 (pid :T.ProcessId, config :ProcessTraceConfig) -> T.VoidResult;
-    getTraceConfig @35 (pid :T.ProcessId) -> (config :ProcessTraceConfig);
-    setBreakpoint @36 (pid :T.ProcessId, breakpoint :Breakpoint) -> (id :UInt64);
-    removeBreakpoint @37 (pid :T.ProcessId, id :UInt64) -> T.VoidResult;
-    listBreakpoints @38 (pid :T.ProcessId) -> (breakpoints :List(Breakpoint));
-    setWatchpoint @39 (pid :T.ProcessId, watchpoint :Watchpoint) -> (id :UInt64);
-    removeWatchpoint @40 (pid :T.ProcessId, id :UInt64) -> T.VoidResult;
-    listWatchpoints @41 (pid :T.ProcessId) -> (watchpoints :List(Watchpoint));
-    stepProcess @42 (pid :T.ProcessId) -> T.VoidResult;
-    continueProcess @43 (pid :T.ProcessId) -> T.VoidResult;
-
-    # ─── Audit-9: Process Exit Notification ─────────────────────
-    subscribeExit @44 (pid :T.ProcessId) -> (subscription :ExitNotificationSubscription);
-    getExitNotification @45 (pid :T.ProcessId) -> (notification :ExitNotification);
-
-    # ─── Audit-9: Process Affinity and NUMA ─────────────────────
-    getAffinity @46 (pid :T.ProcessId) -> (affinity :ProcessAffinity);
-    setAffinity @47 (pid :T.ProcessId, affinity :ProcessAffinity) -> T.VoidResult;
-    getNumaNode @48 (nodeId :UInt32) -> (info :NumaNodeInfo);
-    listNumaNodes @49 (pagination :T.Pagination) -> (nodes :List(NumaNodeInfo), total :UInt32);
-
-    # ─── Audit-9: Cgroup Integration ─────────────────────────────
-    getCgroupInfo @50 (pid :T.ProcessId) -> (info :CgroupInfo);
-    setCgroupResource @51 (pid :T.ProcessId, info :CgroupInfo) -> T.VoidResult;
-
-    # ─── Audit-9: Security Context ───────────────────────────────
-    getSecurityContext @52 (pid :T.ProcessId) -> (context :ProcessSecurityContext);
-    setSecurityContext @53 (pid :T.ProcessId, context :ProcessSecurityContext) -> T.VoidResult;
-
-    # ─── Audit-9: Resource Accounting Time-Series ─────────────────
-    getResourceAccounting @54 (pid :T.ProcessId, duration :T.Duration)
-        -> (window :ResourceAccountingWindow);
-
-    # ─── Audit-10: Process Migration ──────────────────────────────
-    getMigrationConfig @55 (pid :T.ProcessId) -> (config :ProcessMigrationConfig);
-    setMigrationConfig @56 (pid :T.ProcessId, config :ProcessMigrationConfig) -> T.VoidResult;
-    initiateMigration @57 (pid :T.ProcessId, targetHost :Text) -> (migrationId :UInt64);
-    getMigrationStatus @58 (migrationId :UInt64) -> (status :MigrationStatus);
-    cancelMigration @59 (migrationId :UInt64) -> T.VoidResult;
-
-    # Audit-5: Process Respawn
-    registerSupervisor @60 (pid :UInt64) -> (handle :UInt64);
-    superviseProcess @61 (supervisorHandle :UInt64, targetPid :UInt64) -> (result :T.VoidResult);
-    reportProcessFailure @62 (pid :UInt64, report :Data) -> (result :T.VoidResult);
-    respawnProcess @63 (pid :UInt64) -> (result :T.VoidResult);
-    getProcessRespawnStatus @64 (pid :UInt64) -> (state :UInt8, attempts :UInt32);
-
-    # ═══ Kernel Lifecycle Primitives (audit-005 Step 1) ═════════════
-    # subscribeDeath: forward DeathEvent for a pid to a channel.
-    # exitProcess: clean self-exit with typed FailureReport reason.
-    # getProcessStatus: query current status of a process.
-    subscribeDeath @65 (pid :T.ProcessId, channelId :UInt32) -> (handle :UInt64);
-    exitProcess @66 (reason :T.FailureReport) -> (result :T.VoidResult);
-    getProcessStatus @67 (pid :T.ProcessId) -> (status :ProcessStatus);
+    # ── Inspection: breakpoints and stepping ────────────────────
+    # The debugger's loop is poll-shaped by nature; these are its
+    # primitives, not an OS hot path.
+    setBreakpoint @34 (pid :T.ProcessId, breakpoint :Breakpoint) -> (id :T.BreakpointId);
+    removeBreakpoint @35 (pid :T.ProcessId, id :T.BreakpointId) -> T.VoidResult;
+    listBreakpoints @36 (pid :T.ProcessId) -> (breakpoints :List(Breakpoint));
+    setWatchpoint @37 (pid :T.ProcessId, watchpoint :Watchpoint) -> (id :T.BreakpointId);
+    removeWatchpoint @38 (pid :T.ProcessId, id :T.BreakpointId) -> T.VoidResult;
+    listWatchpoints @39 (pid :T.ProcessId) -> (watchpoints :List(Watchpoint));
+    stepProcess @40 (pid :T.ProcessId) -> T.VoidResult;
+    continueProcess @41 (pid :T.ProcessId) -> T.VoidResult;
 }
 
-struct ProcessStats {
-    totalProcesses @0 :UInt32;
-    running @1 :UInt32;
-    sleeping @2 :UInt32;
-    stopped @3 :UInt32;
-    zombie @4 :UInt32;
-    # Total CPU usage across all processes (0.0-1.0 per core, so 4.0 = 4 cores fully utilized).
-    totalCpuUsage @5 :Float32;
-    # Total memory usage in bytes across all processes.
-    totalMemoryUsage @6 :UInt64;
+struct ProcessSpawnSpec {
+    # Opaque image reference: an app id, a manifest name, or a
+    # boot-loader-provided image handle. Backend-resolved.
+    imageRef @0 :Text;
+    args @1 :List(Text);
+    env @2 :T.StringMap;
+    workingDir @3 :Text;
+    # A hint, not an instruction (DESIGN_PRINCIPLES.md:79).
+    priorityHint @4 :Int8;
+    # Declared isolation boundary.
+    isolation @5 :T.IsolatedScope;
+    # Declared quota.
+    quota @6 :T.Quota;
+    # Open metadata the backend understands.
+    metadata @7 :T.StringMap;
 }
 
-interface ProcessSubscription {
-    pull @0 () -> (info :ProcessInfo);
-    cancel @1 () -> T.VoidResult;
-}
-
-interface ExitNotificationSubscription {
-    pull @0 () -> (notification :ExitNotification);
-    cancel @1 () -> T.VoidResult;
-}
+# ── Observation ─────────────────────────────────────────────────────────
 
 struct ProcessInfo {
     pid @0 :T.ProcessId;
@@ -204,7 +170,7 @@ struct ProcessInfo {
     name @2 :Text;
     command @3 :Text;
     args @4 :List(Text);
-    state @5 :ProcessState;
+    state @5 :T.ExecutionState;
     # CPU usage as fraction 0.0-1.0 (0.5 = 50% of one core).
     cpuUsage @6 :Float32;
     # Current memory usage in bytes.
@@ -212,223 +178,126 @@ struct ProcessInfo {
     threads @8 :UInt32;
     startTime @9 :T.Timestamp;
     user @10 :T.UserId;
-}
-
-enum ProcessState {
-    running @0;
-    sleeping @1;
-    waiting @2;
-    stopped @3;
-    zombie @4;
-    defunct @5;
-    custom @6;
+    # Groups this process belongs to.
+    groups @11 :List(T.ProcessGroupId);
 }
 
 struct ProcessFilter {
     name @0 :Text;
-    state @1 :ProcessState;
+    state @1 :T.ExecutionState;
     user @2 :T.UserId;
-    # Filter by minimum CPU usage (0.0-1.0). Processes below this threshold are excluded.
+    # Filter by minimum CPU usage (0.0-1.0). Processes below this
+    # threshold are excluded.
     minCpuUsage @3 :Float32;
-    # Filter by minimum memory usage in bytes. Processes below this threshold are excluded.
+    # Filter by minimum memory usage in bytes.
     minMemoryUsage @4 :UInt64;
+}
+
+struct ProcessStatus {
+    pid @0 :T.ProcessId;
+    name @1 :Text;
+    state @2 :T.ExecutionState;
+    exitStatus @3 :T.ExitStatus;
+    uptime @4 :T.Duration;
+    memoryBytes @5 :UInt64;
+    cpuTime @6 :T.Duration;
+    lastFailure @7 :T.FailureReport;
+}
+
+struct ProcessStats {
+    totalProcesses @0 :UInt32;
+    active @1 :UInt32;
+    blocked @2 :UInt32;
+    suspended @3 :UInt32;
+    terminated @4 :UInt32;
+    # Total CPU usage across all processes (0.0-1.0 per core, so 4.0 = 4
+    # cores fully utilized).
+    totalCpuUsage @5 :Float32;
+    # Total memory usage in bytes across all processes.
+    totalMemoryUsage @6 :UInt64;
 }
 
 struct ThreadInfo {
     id @0 :T.ThreadId;
     name @1 :Text;
-    state @2 :ThreadState;
+    state @2 :T.ExecutionState;
     # CPU usage as fraction 0.0-1.0.
     cpuUsage @3 :Float32;
 }
 
-enum ThreadState {
-    running @0;
-    sleeping @1;
-    waiting @2;
-    stopped @3;
-    custom @4;
-}
-
-struct MemoryRegion {
+struct MemoryMapEntry {
     start @0 :UInt64;
     end @1 :UInt64;
     perms @2 :T.MemoryPerms;
     name @3 :Text;
+    # Which image or handle backs this region, if any (opaque).
+    backing @4 :Text;
+    metadata @5 :T.StringMap;
 }
 
-# ─── Process Groups (Job Control) ─────────────────────────────
+# A read of a process's memory. `consistency` says WHICH GUARANTEE the
+# backend gave, so a debugger does not have to assume one.
+struct MemoryRead {
+    # The bytes, zero-copy.
+    data @0 :T.DataHandle;
+    # Open token naming the consistency the backend provided:
+    # "stopped" (target halted for the read), "snapshot" (copy taken
+    # atomically at some instant), "bestEffort" (target kept running and
+    # the view may be torn), or a backend's own word. An unrecognised
+    # value MUST be treated as "bestEffort".
+    consistency @1 :Text;
+    # True when the region changed while being read.
+    torn @2 :Bool;
+    metadata @3 :T.StringMap;
+}
+
+struct ExecutionContext {
+    pid @0 :T.ProcessId;
+    # The isolation boundary this process runs in.
+    isolation @1 :T.IsolatedScope;
+    # Capability references this process holds, reported not checked
+    # here — capability.capnp is the authority contract.
+    capabilities @2 :List(T.CapabilityHandle);
+    # Declared quota, if any.
+    quota @3 :T.Quota;
+    # Open metadata: what the backend chose to report.
+    metadata @4 :T.StringMap;
+}
 
 struct ProcessGroup {
-    groupId @0 :T.ProcessId;
-    sessionId @1 :UInt64;
-    name @2 :Text;
-    processes @3 :List(T.ProcessId);
+    groupId @0 :T.ProcessGroupId;
+    name @1 :Text;
+    processes @2 :List(T.ProcessId);
+    # The session this group belongs to. NOTE: this is the process-group
+    # session (a job-control concept), which is not the user session in
+    # session.capnp and not the handshake session in system.capnp. The
+    # types are all T.SessionId because they are all opaque handles; the
+    # meanings are per-domain and no consumer may move one into another.
+    sessionId @3 :T.SessionId;
     foreground @4 :Bool;
 }
-
-# ─── Resource Limits ──────────────────────────────────────────
-
-# ProcessResourceType (distinct from sandbox.capnp ResourceType).
-enum ProcessResourceType {
-    cpuTime @0;
-    memorySize @1;
-    fileDescriptors @2;
-    processes @3;
-    fileSize @4;
-    coreDumpSize @5;
-    nice @6;
-    realTimePriority @7;
-    custom @8;
-}
-
-struct ResourceLimit {
-    resource @0 :ProcessResourceType;
-    soft @1 :UInt64;
-    hard @2 :UInt64;
-}
-
-# ─── Scheduling ───────────────────────────────────────────────
-
-enum SchedulingPolicy {
-    normal @0;
-    batch @1;
-    idle @2;
-    fifo @3;
-    rr @4;
-    deadline @5;
-    custom @6;
-}
-
-# ─── Capabilities ─────────────────────────────────────────────
-
-struct ProcessCapability {
-    name @0 :Text;
-    granted @1 :Bool;
-    inherited @2 :Bool;
-    permitted @3 :Bool;
-    effective @4 :Bool;
-}
-
-# ─── Process Accounting ───────────────────────────────────────
-
-struct ProcessAccounting {
-    userTime @0 :T.Duration;
-    systemTime @1 :T.Duration;
-    ioReadBytes @2 :UInt64;
-    ioWriteBytes @3 :UInt64;
-    pageFaults @4 :UInt64;
-    contextSwitches @5 :UInt64;
-}
-
-# ─── Container Context ────────────────────────────────────────
-
-struct ContainerInfo {
-    containerId @0 :Text;
-    isolation @1 :T.IsolatedScope;
-}
-
-# ─── WASM Process Info ────────────────────────────────────────
-
-struct WasmProcessInfo {
-    instanceId @0 :Text;
-    memoryPages @1 :UInt32;
-    tableSize @2 :UInt32;
-    exportedFunctions @3 :List(Text);
-    importedFunctions @4 :List(Text);
-}
-
-# ─── Process Sandbox Configuration ────────────────────────────
-
-struct ProcessSandboxConfig {
-    isolation @0 :T.IsolatedScope;
-    droppedCapabilities @1 :List(Text);
-    keptCapabilities @2 :List(Text);
-    readOnlyPaths @3 :List(Text);
-    maskedPaths @4 :List(Text);
-}
-
-# ─── Process Tree ─────────────────────────────────────────────
 
 struct ProcessTree {
     pid @0 :T.ProcessId;
     name @1 :Text;
-    state @2 :ProcessState;
+    state @2 :T.ExecutionState;
     children @3 :List(ProcessTree);
 }
 
-# ─── Process Tracing (Audit-9) ────────────────────────────────────────
-struct ProcessTraceConfig {
-    enableBreakpoints @0 :Bool;
-    enableWatchpoints @1 :Bool;
-    traceSignals @2 :Bool;
-    traceSyscalls @3 :Bool;
-}
-
-struct Breakpoint {
-    id @0 :UInt64;
-    address @1 :UInt64;
-    enabled @2 :Bool;
-    condition @3 :Text;
-}
-
-struct Watchpoint {
-    id @0 :UInt64;
-    address @1 :UInt64;
-    size @2 :UInt32;
-    read @3 :Bool;
-    write @4 :Bool;
-    enabled @5 :Bool;
-}
-
-# ─── Process Exit Notification (Audit-9) ─────────────────────────────
-struct ExitNotification {
+struct RespawnStatus {
     pid @0 :T.ProcessId;
-    exitStatus @1 :T.ExitStatus;
-    signal @2 :T.SignalKind;
-    coreDumpFlag @3 :Bool;
-    timestamp @4 :T.Timestamp;
-    duration @5 :T.Duration;
+    # Lifecycle state of the last respawn attempt.
+    state @1 :T.EntityState;
+    attempts @2 :UInt32;
+    # The failure that triggered the most recent respawn.
+    lastFailure @3 :T.FailureReport;
+    # Whether a fallback path is currently active.
+    fallbackActive @4 :Bool;
+    metadata @5 :T.StringMap;
 }
 
-# ─── Process Affinity and NUMA (Audit-9) ─────────────────────────────
-struct ProcessAffinity {
-    pid @0 :T.ProcessId;
-    cpuMask @1 :UInt64;
-    numaNode @2 :UInt32;
-    cpuCount @3 :UInt32;
-}
+# ── Accounting time series ──────────────────────────────────────────────
 
-struct NumaNodeInfo {
-    nodeId @0 :UInt32;
-    memorySize @1 :UInt64;
-    availableMemory @2 :UInt64;
-    distance @3 :List(UInt32);
-}
-
-# ─── Process Cgroup Integration (Audit-9) ────────────────────────────
-struct CgroupInfo {
-    isolation @0 :T.IsolatedScope;
-    quota @1 :T.Quota;
-}
-
-# ─── Process Security Context (Audit-9) ──────────────────────────────
-struct ProcessSecurityContext {
-    pid @0 :T.ProcessId;
-    isolation @1 :T.IsolatedScope;
-    credentials @2 :ProcessCredentials;
-}
-
-struct ProcessCredentials {
-    uid @0 :UInt32;
-    gid @1 :UInt32;
-    suid @2 :UInt32;
-    sgid @3 :UInt32;
-    euid @4 :UInt32;
-    egid @5 :UInt32;
-}
-
-# ─── Resource Accounting Time-Series (Audit-9) ────────────────────────
 struct ResourceAccountingEntry {
     timestamp @0 :T.Timestamp;
     cpuUsage @1 :Float32;
@@ -441,59 +310,50 @@ struct ResourceAccountingWindow {
     pid @0 :T.ProcessId;
     interval @1 :T.Duration;
     entries @2 :List(ResourceAccountingEntry);
+    # True when the window was truncated by the backend's retention.
+    truncated @3 :Bool;
 }
 
-# ─── Process Migration (Audit-10) ────────────────────────────────────────
-# Live migration of process state between hosts.
-struct ProcessMigrationConfig {
+# ── Breakpoints ─────────────────────────────────────────────────────────
+
+struct Breakpoint {
+    id @0 :T.BreakpointId;
+    address @1 :UInt64;
+    enabled @2 :Bool;
+    # Open condition token, backend-interpreted.
+    condition @3 :Text;
+}
+
+struct Watchpoint {
+    id @0 :T.BreakpointId;
+    address @1 :UInt64;
+    size @2 :UInt32;
+    read @3 :Bool;
+    write @4 :Bool;
+    enabled @5 :Bool;
+}
+
+# ── Events ──────────────────────────────────────────────────────────────
+
+interface ProcessSubscription {
+    # Bounded pull.
+    pull @0 (maxInfos :UInt32) -> (info :ProcessInfo);
+    cancel @1 () -> T.VoidResult;
+}
+
+interface ExitNotificationSubscription {
+    # Bounded pull.
+    pull @0 (maxNotifications :UInt32) -> (notification :ExitNotification);
+    cancel @1 () -> T.VoidResult;
+}
+
+struct ExitNotification {
     pid @0 :T.ProcessId;
-    # Whether migration is allowed.
-    enabled @1 :Bool;
-    # Maximum downtime tolerance during migration.
-    maxDowntime @2 :T.Duration;
-    # Whether to preserve memory contents (vs. re-execute).
-    preserveMemory @3 :Bool;
-    # Whether to preserve open network connections.
-    preserveConnections @4 :Bool;
-    # Pre-migration checkpoint interval.
-    checkpointInterval @5 :T.Duration;
-}
-
-struct MigrationStatus {
-    migrationId @0 :UInt64;
-    pid @1 :T.ProcessId;
-    state @2 :MigrationState;
-    progress @3 :Float32;
-    sourceHost @4 :Text;
-    targetHost @5 :Text;
-    startedAt @6 :T.Timestamp;
-    completedAt @7 :T.Timestamp;
-    bytesTransferred @8 :UInt64;
-    totalBytes @9 :UInt64;
-}
-
-enum MigrationState {
-    notMigrating @0;
-    preparing @1;
-    checkpointing @2;
-    transferring @3;
-    recovering @4;
-    completed @5;
-    failed @6;
-    cancelled @7;
-}
-
-# ═══ Process Status (audit-005 Step 1) ═══════════════════════════════
-# Returned by getProcessStatus. Provides a snapshot of a process's
-# current state and lifecycle metadata.
-
-struct ProcessStatus {
-    pid         @0 :T.ProcessId;
-    name        @1 :Text;
-    state       @2 :ProcessState;
-    exitStatus  @3 :T.ExitStatus;
-    uptimeNs    @4 :UInt64;
-    memoryBytes @5 :UInt64;
-    cpuTimeNs   @6 :UInt64;
-    lastFailure @7 :T.FailureReport;
+    exitStatus @1 :T.ExitStatus;
+    signal @2 :T.SignalKind;
+    coreDumpFlag @3 :Bool;
+    timestamp @4 :T.Timestamp;
+    duration @5 :T.Duration;
+    # The failure report the process left behind, if any.
+    report @6 :T.FailureReport;
 }

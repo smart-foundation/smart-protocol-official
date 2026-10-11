@@ -1,142 +1,170 @@
 @0xa1b2c3d4e5f6001b;
 
-using T = import "types.capnp";
+# ═══════════════════════════════════════════════════════════════════════
+# App - application lifecycle and information.
+#
+# WHAT THIS IS
+#   The runtime view of applications: what is running, what state it is in,
+#   what it is using, and how to talk to it. This schema owns LIFECYCLE;
+#   catalog metadata lives in appindex.capnp and bundle self-description
+#   lives in manifest.capnp.
+#
+# THE PARALLEL AUTHORITY MODEL IS DELETED
+#   This file used to run a second authority system beside capability.capnp:
+#   `AppPermission.permission :Text` — free strings like "access.camera" —
+#   plus `delegatePermission`, `checkDelegationAuth`, `listDelegationAuthorizations`
+#   and `getPermissionDelegations`. That is five methods and four structs
+#   implementing permission strings, app-to-app delegation and an
+#   authorisation record, all of which capability.capnp already defines with
+#   attenuation, revocation and audit — and the string model is the only one
+#   of the two that is NOT revocable. Two authority systems that must agree
+#   forever, exactly at the layer where disagreeing is catastrophic.
+#   Deleted. What an app DECLARES it needs is read from its Manifest as
+#   `CapabilityRequirement { target, operations }` — the model manifest.capnp
+#   already got right — and whether it may use it is a capability decision.
+#
+# WHAT ELSE WAS DELETED
+#   - `openFile` — the same signature as `openWith`, so a client could not
+#     tell which one the backend honoured. `openWith` stays.
+#   - `checkForUpdate` and `AppUpdateNotification`: package.capnp already
+#     runs the whole update lifecycle with a richer model, and app updates
+#     had two homes with different shapes.
+#   - The health surface (`getHealth`, `subscribeHealth`, `AppHealth`,
+#     `MemoryTrend`, `AppHealthEvent`): resource monitoring is
+#     `T.ResourceUsage` plus a diagnostics service. Health-as-bool-plus-prose
+#     invited every backend to define "healthy" differently.
+#   - The crash-recovery surface (`setCrashRecoveryPolicy`,
+#     `getCrashRecoveryPolicy`, `CrashRecoveryPolicy`): a THIRD restart
+#     policy beside init.capnp's and types.capnp's, which already contradict
+#     each other. App restart policy belongs with the service-lifecycle
+#     owner, not with the running-app listing. Recorded in the batch report.
+#   - `AppResourceLimits`: replaced by `T.Quota`, the protocol's one quota
+#     primitive. Its `allowBackground`/`allowNetwork` booleans were authority
+#     flags, which is a capability decision and never a struct field.
+#   - `AppLaunchMode` (singleInstance/multiInstance/singleTask/singleTop):
+#     Android Activity launch modes. `singleTask` and `singleTop` are
+#     `FLAG_ACTIVITY_*` names, and a non-Android shell has no "task" or "top
+#     instance" to emulate. `maxInstances` covers the real question.
+#   - The legacy `AppMessage.type :Text` beside `typedType :AppMessageType`:
+#     the drift already happened once in this struct, and nothing external
+#     consumes the legacy field.
+#
+# WHAT WAS FIXED
+#   - `getAppInfo`, `getAppState` and the app listing return results with
+#     not-found and error. A queried id for an uninstalled app used to arrive
+#     as a zero-valued struct — name "", lifecycle `stopped` — indistinguishable
+#     from a stopped installed app.
+#   - `AppIcon` and `FileRef` now come from appindex.capnp: one definition,
+#     one `T.DataHandle` icon, instead of identical-and-drifted twins.
+#   - `AppMessagePayload.data` is a buffer reference: a share-sheet payload is
+#     document-sized.
+#   - Cross-app messaging has a REPLY PATH. `AppMessage.correlationId` is
+#     caller-chosen and echoed on the response, which arrives as a
+#     `messageReceived` event. `expectResponse`/`responseTimeout` existed with
+#     no way to receive the answer.
+#   - `instanceId` is a `AppInstanceRef` union, not a `UInt32` with a
+#     sentinel: instance 0 and "not an instance app" were the same number.
+#
+# WHAT IS DELIBERATELY OPAQUE
+#   App identity (`T.AppId`), process identity (`T.ProcessId`), and the AppId
+#   issuance rule. THE ISSUANCE RULE, stated so no backend guesses: app
+#   identity is allocated by the appindex at install time and SURVIVES
+#   upgrade and reinstall of the same manifest; a different manifest is a
+#   different app. appindex, app and package now assume one owner of
+#   identity instead of one each.
+# ═══════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════
-# App - application lifecycle and information
-#
-# Manages running apps: query, open resources, focus, minimize, close,
-# and subscribe to lifecycle events. This schema owns lifecycle; package
-# metadata lives in package.capnp. The two schemas reference each other
-# via T.AppId and T.PackageId.
-#
-# All file/resource references use typed unions, not raw filesystem paths.
-# Exit status uses T.ExitStatus, not raw integers.
-#
-# Audit-7 enhancements (zero-cost, info-density):
-#   - AppSuspendReason/AppResumeReason: typed lifecycle triggers
-#   - AppInstance: multi-instance tracking
-#   - AppCommunication: cross-app messaging
-#   - AppResourceLimits: resource constraints per app
-#   - AppPermission: per-app permission listing
-#   - RunningAppInfo enriched with lifecycle details
-# ═══════════════════════════════════════════════════════════════════════
+using T = import "types.capnp";
+using AI = import "appindex.capnp";
+using M = import "manifest.capnp";
 
 interface AppService {
     # List running apps with optional filter.
-    getRunningApps @0 (filter :AppFilter, pagination :T.Pagination)
-                   -> (apps :List(RunningAppInfo), totalCount :UInt32);
+    getRunningApps @0 (filter :RunningAppFilter, pagination :T.Pagination)
+                   -> (apps :List(RunningAppInfo), total :UInt64);
 
-    # Open a file/resource in an app.
-    openFile @1 (resource :FileRef, appId :T.AppId) -> T.VoidResult;
+    # Open a file/resource in a specific app.
+    openWith @1 (resource :AI.FileRef, appId :T.AppId) -> T.VoidResult;
 
     # Open a URL/deep-link.
     openUrl @2 (url :T.Uri) -> T.VoidResult;
 
-    # Open a file with a specific app.
-    openWith @3 (resource :FileRef, appId :T.AppId) -> T.VoidResult;
-
     # Set focus to an app.
-    setActive @4 (appId :T.AppId) -> T.VoidResult;
+    setActive @3 (appId :T.AppId) -> T.VoidResult;
 
     # Minimize an app.
-    minimizeApp @5 (appId :T.AppId) -> T.VoidResult;
+    minimizeApp @4 (appId :T.AppId) -> T.VoidResult;
 
     # Close an app.
-    closeApp @6 (appId :T.AppId) -> T.VoidResult;
+    closeApp @5 (appId :T.AppId) -> T.VoidResult;
 
-    # Get detailed info for an app.
-    getAppInfo @7 (appId :T.AppId) -> (info :AppDetailedInfo);
+    # Get the catalog record plus runtime extras for an app.
+    getAppInfo @6 (appId :T.AppId) -> (result :AppDetailsResult);
 
     # Get lifecycle state of an app.
-    getAppState @8 (appId :T.AppId) -> (state :AppLifecycle);
+    getAppState @7 (appId :T.AppId) -> (result :LifecycleResult);
 
     # Subscribe to app lifecycle events.
-    subscribe @9 () -> (subscription :AppSubscription);
-    pull @10 (subscription :AppSubscription) -> (events :List(AppEvent));
-    cancel @11 (subscription :AppSubscription) -> T.VoidResult;
+    subscribe @8 () -> (subscription :AppSubscription);
+    pull @9 (maxEvents :UInt32) -> (events :List(AppEvent));
+    cancel @10 (subscription :AppSubscription) -> T.VoidResult;
 
     # Get resource usage for a running app.
-    getResourceUsage @12 (appId :T.AppId) -> (usage :T.ResourceUsage);
+    getResourceUsage @11 (appId :T.AppId) -> (usage :T.ResourceUsage);
 
-    # Audit-7: send a message to another app (cross-app communication).
-    sendMessage @13 (appId :T.AppId, message :AppMessage) -> T.VoidResult;
+    # Send a message to another app (cross-app communication).
+    sendMessage @12 (appId :T.AppId, message :AppMessage) -> T.VoidResult;
 
-    # Audit-7: list instances of a multi-instance app.
-    listInstances @14 (appId :T.AppId, pagination :T.Pagination)
-                  -> (instances :List(AppInstance), totalCount :UInt32);
+    # List instances of a multi-instance app.
+    listInstances @13 (appId :T.AppId, pagination :T.Pagination)
+                  -> (instances :List(AppInstance), total :UInt64);
 
-    # Audit-7: set resource limits for an app.
-    setResourceLimits @15 (appId :T.AppId, limits :AppResourceLimits) -> T.VoidResult;
+    # Resource limits for an app. T.Quota is the protocol's one quota
+    # primitive, and declaring "this app gets 512MB max" is a real external
+    # contract between the app and the resource provider.
+    setResourceLimits @14 (appId :T.AppId, limits :T.Quota) -> T.VoidResult;
+    getResourceLimits @15 (appId :T.AppId) -> (limits :T.Quota);
 
-    # Audit-7: get resource limits for an app.
-    getResourceLimits @16 (appId :T.AppId) -> (limits :AppResourceLimits);
+    # The capabilities this app declares, read from its Manifest. Declaring
+    # is not granting: whether it may use one is a capability decision.
+    listCapabilities @16 (appId :T.AppId, pagination :T.Pagination)
+                     -> (requirements :List(M.CapabilityRequirement), total :UInt64);
 
-    # Audit-7: list permissions declared by an app.
-    listPermissions @17 (appId :T.AppId, pagination :T.Pagination)
-                    -> (permissions :List(AppPermission), totalCount :UInt32);
-
-    # Audit-8: check for app updates (false positive: app_update.capnp belongs here).
-    checkForUpdate @18 (appId :T.AppId) -> (notification :AppUpdateNotification);
-
-    # Audit-8: delegate a permission from one app to another (e.g., app A grants camera access to app B).
-    delegatePermission @19 (fromAppId :T.AppId, toAppId :T.AppId, permission :Text) -> T.VoidResult;
-
-    # Audit-8: get app health status (periodic health checks beyond crash events).
-    getHealth @20 (appId :T.AppId) -> (health :AppHealth);
-
-    # Audit-8: restart an app (full restart, not hot-reload).
-    restartApp @21 (appId :T.AppId) -> T.VoidResult;
-
-    # Audit-9: subscribe to app health change events.
-    subscribeHealth @22 () -> (subscription :HealthSubscription);
-
-    # Audit-9: get permission delegation history for an app.
-    getPermissionDelegations @23 (appId :T.AppId, pagination :T.Pagination)
-                                 -> (delegations :List(PermissionDelegationEntry), totalCount :UInt32);
-
-    # Audit-9: configure crash recovery policy for an app.
-    setCrashRecoveryPolicy @24 (appId :T.AppId, policy :CrashRecoveryPolicy) -> T.VoidResult;
-    getCrashRecoveryPolicy @25 (appId :T.AppId) -> (policy :CrashRecoveryPolicy);
-
-    # Audit-10: check whether a delegation from fromAppId to toAppId is authorized.
-    checkDelegationAuth @26 (fromAppId :T.AppId, toAppId :T.AppId, permission :Text)
-                        -> (authorized :Bool, reason :Text);
-
-    # Audit-10: list active delegation authorizations for an app.
-    listDelegationAuthorizations @27 (appId :T.AppId, pagination :T.Pagination)
-                                  -> (authorizations :List(PermissionDelegationAuthorization), totalCount :UInt32);
+    # Restart an app (full restart, not hot-reload).
+    restartApp @17 (appId :T.AppId) -> T.VoidResult;
 }
 
-# Audit-9: subscription for app health change events.
-interface HealthSubscription {
-    pull @0 () -> (events :List(AppHealthEvent));
-    cancel @1 () -> T.VoidResult;
-}
+# ── Results ───────────────────────────────────────────────────
 
-# ── Resource References ───────────────────────────────────────────────
-
-struct FileRef {
+struct AppDetailsResult {
     union {
-        path @0 :Text;
-        uri @1 :Text;
-        fileId @2 :T.FileId;
-        custom @3 :Data;
+        info    @0 :AppDetailedInfo;
+        error   @1 :T.Error;
+        unknown @2 :Void;
     }
 }
 
-# ── Running App ───────────────────────────────────────────────────────
+struct LifecycleResult {
+    union {
+        lifecycle @0 :AppLifecycle;
+        error     @1 :T.Error;
+        unknown   @2 :Void;
+    }
+}
+
+# ── Running App ───────────────────────────────────────────────
 
 struct RunningAppInfo {
     appId @0 :T.AppId;
     windowId @1 :T.WindowId;
-    name @2 :Text;
+    # The catalog record, so name/icon/version have one home.
+    info @2 :AI.AppInfo;
+    # Opaque process reference. A window system with no per-window process
+    # leaves it unset; there is no sentinel number to invent.
     pid @3 :T.ProcessId;
     resourceUsage @4 :T.ResourceUsage;
-    # Audit-7 additions:
     lifecycle @5 :AppLifecycle;
-    # Which instance this is (for multi-instance apps).
-    instanceId @6 :UInt32;
+    instance @6 :AI.AppInstanceRef;
     # When the app was launched.
     launchedAt @7 :T.Timestamp;
     # Whether the app is in the foreground.
@@ -145,173 +173,52 @@ struct RunningAppInfo {
     focused @9 :Bool;
 }
 
-# ── Detailed App Info ─────────────────────────────────────────────────
+# ── Detailed App Info ─────────────────────────────────────────
+# The catalog record plus runtime extras — "AppDetailedInfo IS AppInfo" was
+# the audit's shape and it is now literal.
 
 struct AppDetailedInfo {
-    appId @0 :T.AppId;
-    packageId @1 :T.PackageId;
-    name @2 :Text;
-    version @3 :T.Version;
-    description @4 :Text;
-    icon @5 :AppIcon;
-    categories @6 :List(AppCategory);
-    source @7 :AppSource;
-    installed @8 :Bool;
-    running @9 :Bool;
-    # Audit-7 additions:
-    # Launch mode (single-instance, multi-instance, single-task).
-    launchMode @10 :AppLaunchMode;
+    # Everything descriptive comes from the index.
+    info @0 :AI.AppInfo;
+    running @1 :Bool;
+    lifecycle @2 :AppLifecycle;
+    pid @3 :T.ProcessId;
+    resourceUsage @4 :T.ResourceUsage;
     # Whether the app supports being suspended.
-    supportsSuspend @11 :Bool;
+    supportsSuspend @5 :Bool;
     # Whether the app supports receiving messages.
-    supportsMessaging @12 :Bool;
-    # Maximum number of instances (0 = unlimited).
-    maxInstances @13 :UInt32;
+    supportsMessaging @6 :Bool;
+    # Maximum number of instances (0 = unlimited). This, not an activity
+    # launch mode, is the real declaration.
+    maxInstances @7 :UInt32;
     # SDK version the app was built against.
-    sdkVersion @14 :T.Version;
-    # Audit-9: crash recovery policy for this app.
-    crashRecoveryPolicy @15 :CrashRecoveryPolicy;
+    sdkVersion @8 :T.Version;
 }
 
-struct AppIcon {
-    data @0 :Data;
-    mimeType @1 :Text;
-    width @2 :UInt32;
-    height @3 :UInt32;
-}
-
-enum AppSource {
-    builtin @0;
-    store @1;
-    sideloaded @2;
-    web @3;
-    unknown @4;
-    custom @5;
-}
-
-enum AppCategory {
-    system @0;
-    productivity @1;
-    games @2;
-    media @3;
-    development @4;
-    utilities @5;
-    accessibility @6;
-    communication @7;
-    education @8;
-    health @9;
-    finance @10;
-    social @11;
-    custom @12;
-}
-
-# ── App Lifecycle ─────────────────────────────────────────────────────
+# ── App Lifecycle ─────────────────────────────────────────────
+# RUNTIME state. Install state is appindex.capnp's `AppState`.
 
 enum AppLifecycle {
-    stopped @0;
-    starting @1;
-    running @2;
-    paused @3;
-    stopping @4;
-    crashed @5;
-    # Audit-7 additions:
-    suspended @6;       # App is suspended (resource-constrained)
-    background @7;      # App is running but not in foreground
-    custom @8;
+    # Absent means the backend decides; it must never mean a
+    # specific paradigm value.
+    any @0;
+    stopped @1;
+    starting @2;
+    running @3;
+    paused @4;
+    stopping @5;
+    crashed @6;
+    suspended @7;
+    background @8;
+    custom @9;
 }
 
-# Audit-7: launch mode for multi-instance behavior.
-enum AppLaunchMode {
-    singleInstance @0;   # Only one instance allowed
-    multiInstance @1;    # Multiple instances allowed
-    singleTask @2;       # One task, reuse existing instance
-    singleTop @3;        # Reuse top instance if same task
-    custom @4;
-}
+# ── App Instance (multi-instance) ────────────────────────────
 
-# Audit-7: suspend reason.
-enum AppSuspendReason {
-    userRequest @0;       # User explicitly suspended the app
-    memoryPressure @1;    # System needs memory
-    idle @2;              # App idle for too long
-    policy @3;            # Policy-based suspension
-    background @4;        # Moved to background
-    custom @5;
-}
-
-# Audit-7: resume reason.
-enum AppResumeReason {
-    userRequest @0;       # User explicitly resumed
-    notification @1;      # Incoming notification
-    timer @2;             # Timer fired
-    pushMessage @3;       # Push message received
-    backgroundTask @4;    # Background task completion
-    custom @5;
-}
-
-# Audit-8: typed message categories for cross-app communication.
-# Replaces bare Text in AppMessage.type with a structured enum.
-enum AppMessageType {
-    query @0;             # Request information from another app
-    command @1;           # Request an action from another app
-    event @2;             # Notify about a state change
-    share @3;             # Share data/content with another app
-    deeplink @4;          # Trigger a deep-link in another app
-    custom @5;
-}
-
-# Audit-8: app crash recovery options.
-enum CrashRecoveryPolicy {
-    none @0;              # No automatic recovery
-    restart @1;           # Restart the app automatically
-    restartWithBackoff @2; # Restart with exponential backoff
-    notifyUser @3;        # Notify user and wait for action
-    custom @4;
-}
-
-# Audit-8: app update notification.
-struct AppUpdateNotification {
-    appId @0 :T.AppId;
-    currentVersion @1 :T.Version;
-    availableVersion @2 :T.Version;
-    # Whether the update is critical (security or stability).
-    critical @3 :Bool;
-    # Human-readable changelog summary.
-    changelog @4 :Text;
-    # When the update became available.
-    availableAt @5 :T.Timestamp;
-}
-
-# Audit-8: app health status for monitoring beyond crash events.
-struct AppHealth {
-    # Whether the app is responsive.
-    responsive @0 :Bool;
-    # Last health check timestamp.
-    lastCheck @1 :T.Timestamp;
-    # Error rate (0.0-1.0) over the monitoring window.
-    errorRate @2 :Float32;
-    # Memory usage trend (increasing, stable, decreasing).
-    memoryTrend @3 :MemoryTrend;
-    # Whether the app is healthy overall.
-    healthy @4 :Bool;
-    # Optional health message.
-    message @5 :Text;
-}
-
-# Audit-8: memory usage trend for health monitoring.
-enum MemoryTrend {
-    stable @0;
-    increasing @1;
-    decreasing @2;
-    spike @3;
-    custom @4;
-}
-
-# ── App Instance (multi-instance) ────────────────────────────────────
-
-# Audit-7 addition: tracks individual instances of multi-instance apps.
 struct AppInstance {
     appId @0 :T.AppId;
+    # Server-issued by this service; never 0, so it cannot be confused with
+    # "not an instance".
     instanceId @1 :UInt32;
     pid @2 :T.ProcessId;
     windowId @3 :T.WindowId;
@@ -325,92 +232,67 @@ struct AppInstance {
     label @7 :Text;
 }
 
-# ── Cross-App Communication ──────────────────────────────────────────
+# ── Cross-App Communication ──────────────────────────────────
 
-# Audit-7 addition: typed message for cross-app communication.
+# Typed message categories for cross-app communication.
+enum AppMessageType {
+    # Absent means the backend decides; it must never mean a
+    # specific paradigm value.
+    unspecified @0;
+    query @1;     # Request information from another app
+    command @2;   # Request an action from another app
+    event @3;     # Notify about a state change
+    share @4;     # Share data/content with another app
+    deeplink @5;  # Trigger a deep-link in another app
+    custom @6;
+}
+
 struct AppMessage {
-    # Audit-10: typed message type (typed union replacing bare Text).
-    typedType @4 :AppMessageType;
-    # Legacy message type (for backward compatibility with consumers expecting Text).
-    type @0 :Text;
+    typedType @0 :AppMessageType;
     # Message payload.
     payload @1 :AppMessagePayload;
     # Whether a response is expected.
     expectResponse @2 :Bool;
     # Timeout for response (zero = fire-and-forget).
     responseTimeout @3 :T.Duration;
+    # Caller-chosen correlation key. A response arrives as a
+    # `messageReceived` event whose `correlationId` echoes this value. It
+    # exists because `expectResponse` used to have no way to be answered.
+    correlationId @4 :Text;
 }
 
 struct AppMessagePayload {
     union {
         text @0 :Text;
-        data @1 :Data;
+        # Document-sized share-sheet payloads travel as buffer references.
+        data @1 :T.DataHandle;
         json @2 :Text;
-        custom @3 :Data;
+        custom @3 :T.StringMap;
+        unknown @4 :Void;
     }
 }
 
-# ── Resource Limits ──────────────────────────────────────────────────
+# ── Filter ────────────────────────────────────────────────────
 
-# Audit-7 addition: resource constraints per app. Allows setting and
-# querying limits on CPU, memory, network, and storage usage.
-struct AppResourceLimits {
-    # Maximum memory bytes (0 = unlimited).
-    maxMemoryBytes @0 :UInt64;
-    # Maximum CPU time per second (0 = unlimited).
-    maxCpuTimeMs @1 :UInt32;
-    # Maximum network bytes per second (0 = unlimited).
-    maxNetworkBytesPerSec @2 :UInt64;
-    # Maximum storage bytes (0 = unlimited).
-    maxStorageBytes @3 :UInt64;
-    # Maximum number of open file descriptors (0 = unlimited).
-    maxOpenFiles @4 :UInt32;
-    # Maximum number of child processes (0 = unlimited).
-    maxChildProcesses @5 :UInt32;
-    # Whether the app can run in the background.
-    allowBackground @6 :Bool;
-    # Whether the app can access the network.
-    allowNetwork @7 :Bool;
-}
-
-# ── App Permission ────────────────────────────────────────────────────
-
-# Audit-7 addition: per-app permission listing. Apps declare what
-# permissions they need; the system grants or denies them.
-struct AppPermission {
-    # Permission identifier (e.g. "access.camera", "access.microphone").
-    permission @0 :Text;
-    # Human-readable name.
-    name @1 :Text;
-    # Description of why the permission is needed.
-    description @2 :Text;
-    # Whether the permission is currently granted.
-    granted @3 :Bool;
-    # Whether the permission is required (app won't work without it).
-    required @4 :Bool;
-    # Whether the user can revoke this permission.
-    revocable @5 :Bool;
-}
-
-# ── Filter ────────────────────────────────────────────────────────────
-
-struct AppFilter {
+struct RunningAppFilter {
     name @0 :Text;
-    category @1 :AppCategory;
+    # Open tokens — the one app taxonomy, published in appindex.capnp.
+    category @1 :Text;
     installed @2 :T.BoolFilter;
     running @3 :T.BoolFilter;
     minMemoryBytes @4 :UInt64;
     maxMemoryBytes @5 :UInt64;
-    # Audit-7 additions:
-    source @6 :AppSource;
+    source @6 :Text;
     foreground @7 :T.BoolFilter;
+    # Runtime lifecycle only. Install state is appindex.capnp's `AppState`.
     lifecycle @8 :AppLifecycle;
+    metadata @9 :T.StringMap;
 }
 
-# ── Events ────────────────────────────────────────────────────────────
+# ── Events ────────────────────────────────────────────────────
 
 interface AppSubscription {
-    pull @0 () -> (events :List(AppEvent));
+    pull @0 (maxEvents :UInt32) -> (events :List(AppEvent));
     cancel @1 () -> T.VoidResult;
 }
 
@@ -420,17 +302,12 @@ struct AppEvent {
         closed @1 :AppClosedEvent;
         stateChanged @2 :AppStateChangedEvent;
         crashed @3 :AppCrashEvent;
-        # Audit-7 additions:
         suspended @4 :AppSuspendEvent;
         resumed @5 :AppResumeEvent;
         messageReceived @6 :AppMessageEvent;
         instanceCreated @7 :AppInstanceEvent;
         instanceDestroyed @8 :AppInstanceEvent;
-        # Audit-8 additions:
-        updateAvailable @9 :AppUpdateNotification;
-        healthChanged @10 :AppHealthEvent;
-        permissionDelegated @11 :AppPermissionDelegatedEvent;
-        custom @12 :Data;
+        unknown @9 :T.UnknownEvent;
     }
 }
 
@@ -438,15 +315,14 @@ struct AppLaunchedEvent {
     appId @0 :T.AppId;
     pid @1 :T.ProcessId;
     timestamp @2 :T.Timestamp;
-    # Audit-7: instance ID for multi-instance apps.
-    instanceId @3 :UInt32;
+    instance @3 :AI.AppInstanceRef;
 }
 
 struct AppClosedEvent {
     appId @0 :T.AppId;
     exitStatus @1 :T.ExitStatus;
     timestamp @2 :T.Timestamp;
-    instanceId @3 :UInt32;
+    instance @3 :AI.AppInstanceRef;
 }
 
 struct AppStateChangedEvent {
@@ -463,21 +339,18 @@ struct AppCrashEvent {
     timestamp @3 :T.Timestamp;
 }
 
-# Audit-7 addition: suspend event.
 struct AppSuspendEvent {
     appId @0 :T.AppId;
     reason @1 :AppSuspendReason;
     timestamp @2 :T.Timestamp;
 }
 
-# Audit-7 addition: resume event.
 struct AppResumeEvent {
     appId @0 :T.AppId;
     reason @1 :AppResumeReason;
     timestamp @2 :T.Timestamp;
 }
 
-# Audit-7 addition: message received event.
 struct AppMessageEvent {
     fromAppId @0 :T.AppId;
     toAppId @1 :T.AppId;
@@ -485,53 +358,28 @@ struct AppMessageEvent {
     timestamp @3 :T.Timestamp;
 }
 
-# Audit-7 addition: instance created/destroyed event.
 struct AppInstanceEvent {
     appId @0 :T.AppId;
-    instanceId @1 :UInt32;
+    instance @1 :AI.AppInstanceRef;
     timestamp @2 :T.Timestamp;
 }
 
-# Audit-8 addition: health status changed event.
-struct AppHealthEvent {
-    appId @0 :T.AppId;
-    previous @1 :AppHealth;
-    current @2 :AppHealth;
-    timestamp @3 :T.Timestamp;
+# Lifecycle trigger reasons. Open tokens would be over-engineering here: each
+# is a small, genuinely closed set of causes with `custom` for the rest.
+enum AppSuspendReason {
+    userRequest @0;
+    memoryPressure @1;
+    idle @2;
+    policy @3;
+    background @4;
+    custom @5;
 }
 
-# Audit-8 addition: permission delegated event.
-struct AppPermissionDelegatedEvent {
-    fromAppId @0 :T.AppId;
-    toAppId @1 :T.AppId;
-    permission @2 :Text;
-    timestamp @3 :T.Timestamp;
-}
-
-# Audit-9: permission delegation audit trail entry.
-struct PermissionDelegationEntry {
-    id @0 :Text;
-    fromAppId @1 :T.AppId;
-    toAppId @2 :T.AppId;
-    permission @3 :Text;
-    timestamp @4 :T.Timestamp;
-    granted @5 :Bool;
-}
-
-# Audit-10: permission delegation authorization record.
-struct PermissionDelegationAuthorization {
-    id @0 :Text;
-    fromAppId @1 :T.AppId;
-    toAppId @2 :T.AppId;
-    permission @3 :Text;
-    # When this authorization was created.
-    createdAt @4 :T.Timestamp;
-    # When this authorization expires (null = no expiry).
-    expiresAt @5 :T.Timestamp;
-    # Maximum number of times this delegation can be used (0 = unlimited).
-    maxUses @6 :UInt32;
-    # Number of times this delegation has been used so far.
-    usedCount @7 :UInt32;
-    # Whether this authorization is currently active.
-    active @8 :Bool;
+enum AppResumeReason {
+    userRequest @0;
+    notification @1;
+    timer @2;
+    pushMessage @3;
+    backgroundTask @4;
+    custom @5;
 }

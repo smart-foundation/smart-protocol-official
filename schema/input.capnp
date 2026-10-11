@@ -12,6 +12,20 @@ using T = import "types.capnp";
 #
 # Improvements (audit-5):
 #   - BindingScope.seatId changed from bare Text to T.SeatId (Rule 2).
+#
+# ── THE KEY-CODE DOMAIN (published, not frozen) ──────────────────────────
+# T.KeyCode.code is a USB HID keyboard/usage-page-0x07 usage id: the one
+# code space that is already published, stable across every keyboard ever
+# shipped, and independent of any OS's private numbering (Linux KEY_*,
+# macOS kVK_*, Windows VK_*). A backend translates its native scancode to
+# the HID usage; a consumer translates back. It is NOT an enum in this
+# file, because a 2046 keyboard may carry a usage this revision has never
+# seen — the code space is open by construction and needs no ordinal.
+#
+# The raw, untranslated event travels as KeyboardEvent.scancode (PS/2
+# set-1 make code or USB HID usage) with KeyboardEvent.text as the
+# translated Unicode. Emulation (emulateKey) takes T.KeyCode; observation
+# (subscribeInputEvents) delivers both. One value space, published here.
 # ═══════════════════════════════════════════════════════════════════════
 
 interface Input {
@@ -36,8 +50,8 @@ interface Input {
     # ── Devices & subkinds ──
     listDevices @13 (page :T.Pagination) -> (devices :List(InputDevice));
     getDevice @14 (deviceId :T.DeviceId) -> (device :InputDevice);
-    subscribeDevices @15 (filter :DeviceFilter) -> (subscription :DeviceSubscription);
-    pullDevices @16 (subscription :DeviceSubscription) -> (events :List(DeviceEvent));
+    subscribeDevices @15 (filter :InputDeviceFilter) -> (subscription :InputDeviceSubscription);
+    pullDevices @16 (subscription :InputDeviceSubscription) -> (events :List(DeviceEvent));
 
     getGamepads @17 () -> (gamepads :List(GamepadState));
     subscribeGamepads @18 () -> (subscription :GamepadSubscription);
@@ -65,8 +79,8 @@ interface Input {
     isGrabbed @31 () -> (grabbed :Bool, surfaceId :T.SurfaceId);
 
     # ── Biometrics ──
-    listBiometricsTemplates @32 (modality :BiometricModality, page :T.Pagination) -> (templates :List(BiometricTemplate));
-    enrollBiometric @33 (modality :BiometricModality, name :Text) -> (template :BiometricTemplate);
+    listBiometricsTemplates @32 (modality :BiometricModality, page :T.Pagination) -> (templates :List(InputBiometricTemplate));
+    enrollBiometric @33 (modality :BiometricModality, name :Text) -> (template :InputBiometricTemplate);
     removeBiometric @34 (templateId :T.BiometricTemplateId) -> T.VoidResult;
 
     # ── Gestures (system-wide) ──
@@ -85,7 +99,7 @@ interface Input {
     getCabinAttentionInfo @45 (deviceId :T.DeviceId) -> (info :CabinAttentionInfo);
 
     # ── Audit-9: extended input event subscription ──
-    subscribeInputEvents @46 (filter :DeviceFilter) -> (subscription :InputEventSubscription);
+    subscribeInputEvents @46 (filter :InputDeviceFilter) -> (subscription :InputEventSubscription);
     pullInputEvents @47 (subscription :InputEventSubscription) -> (events :List(InputEvent));
 
     # Audit-10: input event replay/macro for recording and replaying sequences.
@@ -119,7 +133,7 @@ interface IdleSubscription {
     pull @0 () -> (idleTime :T.Duration);
     cancel @1 () -> T.VoidResult;
 }
-interface DeviceSubscription {
+interface InputDeviceSubscription {
     pull @0 () -> (events :List(DeviceEvent));
     cancel @1 () -> T.VoidResult;
 }
@@ -146,7 +160,7 @@ struct KeyboardLayout {
 struct InputDevice {
     id @0 :T.DeviceId;
     name @1 :Text;
-    kind @2 :DeviceKind;
+    kind @2 :InputDeviceKind;
     # Whether the device is currently enabled.
     enabled @3 :Bool = true;
     # Vendor identifier (USB/PCI vendor, or backend-specific).
@@ -161,7 +175,7 @@ struct InputDevice {
     backendSpecific @8 :T.StringMap;
 }
 
-enum DeviceKind {
+enum InputDeviceKind {
     keyboard @0;
     pointer @1;
     touchpad @2;
@@ -190,16 +204,22 @@ enum DeviceKind {
     custom @24;
 }
 
-struct DeviceFilter {
-    kinds @0 :List(DeviceKind);
+struct InputDeviceFilter {
+    kinds @0 :List(InputDeviceKind);
     vendorId @1 :UInt16;
     productId @2 :UInt16;
     onlyEnabled @3 :Bool = true;
-    # Capacities — devices must advertise all listed in this set.
-    requireCapabilities @4 :List(Text);
-    # Audit-9: typed capability flags. Use instead of requireCapabilities
-    # for type-safe capability filtering.
-    requireCapabilityFlags @5 :List(InputCapability);
+    # Audit-9: typed capability flags — the single capability-filter
+    # mechanism. The former open Text list (`requireCapabilities`) is
+    # deleted: a capability is a typed reference, not a name string, and
+    # two filters that disagree on spelling cannot both be right.
+    requireCapabilityFlags @4 :List(InputCapability);
+}
+
+# Unknown values are ignored, never rejected (ai.capnp:43-47).
+struct UnknownInputEvent {
+    typeId @0 :UInt64;
+    payload @1 :Data;
 }
 
 struct DeviceEvent {
@@ -209,6 +229,7 @@ struct DeviceEvent {
         enabled @2 :EnabledChange;
         battery @3 :BatteryChange;
         upgraded @4 :InputDevice;
+        unknown @5 :UnknownInputEvent;
     }
 }
 
@@ -320,14 +341,23 @@ struct KeyTrigger {
     holdable @3 :Bool = false;
 }
 
+# What to invoke when a binding triggers.
+#
+# `runCommand` is deliberately absent: a binding is a persistent, unattended
+# action, and executing a command string from it is an unauthenticated
+# remote-code-execution path (the exact anti-pattern ai.capnp:324-327
+# removed from ToolRegistry.invoke). A key binding may address a surface,
+# an intent, or a haptic waveform — all typed references. Anything that
+# needs to run code must hold a capability for it, which a binding is not.
 struct KeyAction {
     union {
-        runCommand @0 :Text;
-        sendUri @1 :Text;
-        activateSurface @2 :T.SurfaceId;
-        invokeIntent @3 :IntentReference;
-        triggerHaptic @4 :HapticWaveform;
-        custom @5 :T.StringMap;
+        # A URI to open. T.Uri, not Text: the value is parsed, compared and
+        # resolved by consumers.
+        sendUri @0 :T.Uri;
+        activateSurface @1 :T.SurfaceId;
+        invokeIntent @2 :IntentReference;
+        triggerHaptic @3 :HapticWaveform;
+        custom @4 :T.StringMap;
     }
 }
 
@@ -354,7 +384,7 @@ enum BiometricModality {
     custom @4;
 }
 
-struct BiometricTemplate {
+struct InputBiometricTemplate {
     id @0 :T.BiometricTemplateId;
     modality @1 :BiometricModality;
     name @2 :Text;
@@ -548,7 +578,7 @@ struct SpatialInputEvent {
     # 2D screen-space position.
     position @1 :T.Vec2;
     # 3D pose (position + rotation) in world space.
-    pose @2 :SpatialPose;
+    pose @2 :T.SpatialPose;
     confidence @3 :Float32;
     timestamp @4 :T.Timestamp;
 }
@@ -562,12 +592,6 @@ enum SpatialInputKind {
     custom @5;
 }
 
-struct SpatialPose {
-    position @0 :T.Vec3;
-    rotation @1 :T.Quaternion;
-    velocity @2 :T.Vec3;
-    angularVelocity @3 :T.Vec3;
-}
 
 # ── Digital Crown (Watch) ─────────────────────────────────────
 
@@ -661,7 +685,7 @@ struct AmplitudePoint {
 # ── Input Capability Enumeration ──────────────────────────────
 
 # Typed capability flags for input devices. Replaces the bare
-# Text convention in DeviceFilter.requireCapabilities.
+# Text convention in InputDeviceFilter.requireCapabilities.
 enum InputCapability {
     keyboard @0;
     mouse @1;
@@ -683,21 +707,66 @@ enum InputCapability {
 }
 
 # ── Input Event Subscription (Audit-9) ────────────────────────────
-# Typed event subscription for extended input modalities.
-# Exposes EyeTrackingEvent, BrainInputEvent, SpatialInputEvent,
-# DigitalCrownEvent, and CabinAttentionEvent via subscription
-# instead of requiring polling via get*Info methods.
-
-# Union of all extended input events.
+# Typed event subscription for input events.
+#
+# ── THE MODALITY RULE (R1) ───────────────────────────────────────────
+# This union is CLOSED only to the modalities the contract knows today:
+# keyboard and pointer (the two every OS has), plus the extended
+# modalities modelled below. The future does not wait for an ordinal:
+# anything not yet invented rides in `custom @N :Data`, and a consumer
+# that does not recognise it skips it (ai.capnp:43-47) rather than
+# failing. A keyboard and a pointer MUST be expressible; a brain
+# interface and a future modality are equally expressible with no
+# schema change. That is the whole test.
 struct InputEvent {
     union {
-        eyeTracking @0 :EyeTrackingEvent;
-        brainInput @1 :BrainInputEvent;
-        spatialInput @2 :SpatialInputEvent;
-        digitalCrown @3 :DigitalCrownEvent;
-        cabinAttention @4 :CabinAttentionEvent;
-        custom @5 :Data;
+        keyboard @0 :KeyboardEvent;
+        pointer @1 :PointerEvent;
+        eyeTracking @2 :EyeTrackingEvent;
+        brainInput @3 :BrainInputEvent;
+        spatialInput @4 :SpatialInputEvent;
+        digitalCrown @5 :DigitalCrownEvent;
+        cabinAttention @6 :CabinAttentionEvent;
+        custom @7 :Data;
     }
+}
+
+# One keystroke. `scancode` is the raw PS/2 set-1 make code (or USB HID
+# usage code from a USB keyboard). `text` is the translated Unicode
+# codepoint (empty for non-printable keys and modifier-only events).
+# Modifiers reflect state at the time of the event.
+#
+# Both halves are carried because they are different facts: the scancode
+# is what the hardware sent, the codepoint is what the active layout made
+# of it. A consumer that re-decodes needs the scancode; one that types
+# needs the text. Neither is derivable from the other without the layout.
+struct KeyboardEvent {
+    scancode @0 :UInt16;
+    pressed @1 :Bool;
+    text @2 :Text;
+    modifiers @3 :T.ModifierState;
+    deviceId @4 :T.DeviceId;
+    metadata @5 :T.StringMap;
+}
+
+# One pointer event: motion, button state, and scroll. The two halves
+# (absolute position, relative delta) are both carried because a touchpad
+# reports deltas and a tablet reports absolutes, and a consumer cannot
+# derive one from the other.
+struct PointerEvent {
+    deviceId @0 :T.DeviceId;
+    # Absolute position in the surface's coordinate space, when the
+    # device reports one (tablet, touchscreen). Zero when not reported.
+    position @1 :T.Vec2i;
+    hasPosition @2 :Bool;
+    # Relative motion since the previous event (mouse, trackball).
+    delta @3 :T.Vec2i;
+    hasDelta @4 :Bool;
+    # Buttons currently held; bit i = button i+1 (0 = none).
+    buttons @5 :UInt32;
+    # Scroll wheel / pan. (0,0) when no scroll occurred.
+    scroll @6 :T.Vec2;
+    modifiers @7 :T.ModifierState;
 }
 
 interface InputEventSubscription {

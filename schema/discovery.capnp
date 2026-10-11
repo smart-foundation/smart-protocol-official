@@ -3,531 +3,214 @@
 # ═══════════════════════════════════════════════════════════════════════
 # Discovery — service registration and lookup.
 #
-# Zero-backend-assumption IPC contract for service discovery. No mDNS,
-# DNS-SD, or platform-specific registry assumed. The backend decides
-# the discovery mechanism; the protocol defines the contract.
+# Zero-backend-assumption contract for service discovery. No mDNS, no
+# DNS-SD, no platform-specific registry is assumed; the backend decides
+# the mechanism. The protocol defines the contract: register a
+# descriptor, look it up, watch it change, and know what state it is
+# really in.
 #
-# Improvements (audit):
-#   - DiscoverySubscription has cancel() for explicit teardown.
-#   - DiscoveryEvent union has custom variant for forward compatibility.
-#   - ServiceCategory has other variant for forward compatibility.
-#   - ServiceState has other variant for forward compatibility.
-#   - ServiceDescriptor.registeredAt, expireAt, tags.
-#   - VersionInfo.succeededBy for upgrade lifecycle.
-#   - update method for unified partial updates.
+# ── AUTHORITY ───────────────────────────────────────────────────────────
 #
-# Audit-7 improvements:
-#   - ServiceHealth struct for detailed health metrics.
-#   - HealthStatus enum for granular health beyond ServiceState.
-#   - ServiceEndpoint struct for structured endpoints (replaces List(Text)).
-#   - ServiceDependency struct for dependency graph.
-#   - DeprecationInfo struct for graceful deprecation workflow.
-#   - ServiceAttestation struct for cryptographic attestation.
-#   - ServiceVersionCheck for version compatibility.
-#   - HealthSubscription for health change notifications.
-#   - Richer DiscoveryFilter with trust level, attestation, health.
+# Lookup is ungated: a caller can learn what exists before it holds any
+# authority (the ai.capnp rule — acquire-to-discover must not deadlock).
+# Registration is gated once, at acquisition, through `Discovery.registry`:
+# holding the returned `DiscoveryRegistry` reference IS the authority to
+# register, deregister, update and deprecate. No method takes a token.
+# The pre-revamp file let any caller register any service name, which on
+# a single device is a hijack vector.
 #
-# Audit-9 improvements:
-#   - ServiceSLA struct for uptime/latency/error rate commitments.
-#   - ServiceCost struct for per-request pricing, compute/storage costs.
-#   - ServiceCanary for gradual rollout with traffic splitting.
-#   - CircuitBreaker struct for automatic failure detection.
-#   - RetryPolicy for configurable retry behavior per service.
-#   - ServiceGeoDistribution for multi-region deployment.
-#   - ServiceChangelog for version history and event timeline.
+# ── THE SERVICE-MESH HALF, DELETED ─────────────────────────────────────
+#
+# The pre-revamp body embedded an enterprise service mesh beside the
+# registry: per-request pricing, on-call rotations, canary traffic
+# splitting, circuit breakers with HTTP retryable status codes,
+# multi-region geo-distribution, changelogs and cluster health. One line
+# contradicted the file's own header directly — `RetryPolicy
+# .retryableStatusCodes :List(UInt16)`, commented "HTTP status codes
+# that trigger retry", frozen into a contract that promises "no
+# platform-specific registry assumed".
+#
+# All of it is gone. None of it exists on a single device, which is this
+# protocol's core audience, and each field forced every backend to carry
+# (and fake) 2015 org-chart and 2016 datacenter vocabulary. Deleted with
+# it: `ServiceCost`, `ServiceOwnership`, `ServiceCanary`,
+# `CircuitBreaker`, `CircuitState`, `RetryPolicy`,
+# `ServiceGeoDistribution`, `ServiceRegion`, `ServiceChangelog`,
+# `ChangelogEntry`, `ChangelogType`, `ClusterHealth`, `Liveness` +
+# `heartbeat`.
+#
+# ── WHAT WAS IMPORTED FROM THE WORKING TREE ────────────────────────────
+#
+# The runtime-health block (`ServiceHealth`, `resolve` with `present`,
+# `getRuntimeHealth`, `listRuntimeHealth`, `listQuarantined`) is a real,
+# consumed contract: it answers "what is this service doing right now",
+# which is a different question from "what did the last probe say". A
+# service can pass every probe and be quarantined after a fault storm —
+# and reporting only the probe result is how a broken system looks fine.
+# `reason` is populated whenever the state is not `online`; an empty
+# reason with a non-online state is a producer bug and a client should
+# render "unknown".
+#
+# ── HOMES, UNIFIED ─────────────────────────────────────────────────────
+#
+# `ServiceDependency` is declared HERE and imported by service.capnp
+# (which had its own copy with a different shape). `ServiceCost`,
+# `ServiceSla` and their duplicates in service.capnp are deleted, not
+# relocated: pricing and uptime commitments are datacenter vocabulary,
+# not an OS contract. The health *result* type is `ServiceHealth`,
+# declared here, also imported by service.capnp. System/component health
+# (a different question) is diagnostics.capnp's `HealthStatus`.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using Diag = import "diagnostics.capnp";
+using import "capability.capnp".Capability;
 
-# ── Service Category ────────────────────────────────────────────────────
-
-enum ServiceCategory {
-    other @0;
-    media @1;
-    network @2;
-    system @3;
-    storage @4;
-    input @5;
-    display @6;
-    audio @7;
-    security @8;
-    communication @9;
-    application @10;
-    data @11;
-    messaging @12;
-    location @13;
-    iot @14;
-    # Backend-specific service category.
-    custom @15;
-}
-
-# ── Service Descriptor ───────────────────────────────────────────────────
+# ── Descriptor ──────────────────────────────────────────────────────────
 
 struct ServiceDescriptor {
     id @0 :T.ServiceId;
     name @1 :Text;
-    category @2 :ServiceCategory;
+    # Open category token ("media", "network", "storage", or a 2046 one).
+    # Unknown tokens are ignored by consumers, never rejected.
+    category @2 :Text;
     version @3 :VersionInfo;
     state @4 :ServiceState;
     # Structured endpoint addresses.
     endpoints @5 :List(ServiceEndpoint);
     metadata @6 :T.StringMap;
-    # Required capability names (stringly-typed — backend interprets).
-    requiredCaps @7 :List(Text);
-    # Required capability IDs (typed — preferred over requiredCaps).
-    requiredCapabilityIds @11 :List(T.CapabilityId);
-
+    # Capability ids a caller needs before using this service. Typed
+    # references only: the pre-revamp `requiredCaps :List(Text)` beside
+    # this field was a second, stringly-typed authority path that had to
+    # agree with it forever.
+    requiredCapabilityIds @7 :List(T.CapabilityId);
     # When this service was registered.
     registeredAt @8 :T.Timestamp;
-    # Optional expiry for transient registrations.
+    # Optional expiry for transient registrations. An expired
+    # registration is filtered out of `lookup` and `getServiceByScope`,
+    # emits an `expired` event first, and is then auto-deregistered — so a
+    # consumer never reads a stale descriptor as live.
     expireAt @9 :T.Timestamp;
-    # Tags for flexible categorization beyond category.
+    # Tags for flexible categorisation beyond category.
     tags @10 :List(Text);
-    # Deprecation metadata (empty = not deprecated).
-    deprecation @12 :DeprecationInfo;
-    # Service attestation (empty = not attested).
-    attestation @13 :ServiceAttestation;
-    # Service ownership information.
-    ownership @14 :ServiceOwnership;
-    # Service SLA commitments (empty = no SLA).
-    sla @15 :ServiceSla;
-    # Service cost information.
-    cost @16 :ServiceCost;
-    # Canary deployment configuration.
-    canary @17 :ServiceCanary;
-    # Circuit breaker configuration.
-    circuitBreaker @18 :CircuitBreaker;
-    # Retry policy for client requests.
-    retryPolicy @19 :RetryPolicy;
-    # Geo-distribution across regions.
-    geoDistribution @20 :ServiceGeoDistribution;
-    # Version history and event timeline.
-    changelog @21 :ServiceChangelog;
+    # Deprecation metadata (absent = not deprecated).
+    deprecation @11 :DeprecationInfo;
+    # Attestation, if the service published one.
+    attestation @12 :ServiceAttestation;
 }
 
 struct VersionInfo {
     version @0 :T.Version;
     # Minimum backward-compatible version.
     minCompatible @1 :T.Version;
-    # The version that replaces this one (empty = no replacement).
+    # The version that replaces this one (zero = no replacement).
     succeededBy @2 :T.Version;
 }
 
 enum ServiceState {
-    online @0;
-    offline @1;
-    degraded @2;
-    starting @3;
-    maintenance @4;
-    other @5;
-    # Backend-specific service state.
+    unknown @0;
+    online @1;
+    offline @2;
+    degraded @3;
+    starting @4;
+    maintenance @5;
     custom @6;
 }
 
-# ── Structured Endpoint ────────────────────────────────────────────────
-
+# A structured endpoint. The transport is an OPEN token: this file names
+# no protocol, and a 2046 transport needs no ordinal.
 struct ServiceEndpoint {
-    # Endpoint address (backend-decided format: IPC names, TCP host:port, etc.).
-    address @0 :Text;
-    # Load-balancing weight (higher = more traffic).
-    weight @1 :UInt32;
-    # Priority (lower = preferred).
+    # Open transport token ("capnp", "rest", "grpc", or a 2046 one).
+    transport @0 :Text;
+    # Transport address in the transport's own vocabulary.
+    address @1 :Text;
+    # Priority among the service's endpoints (lower = preferred).
     priority @2 :UInt32;
-    # Whether this endpoint is healthy.
-    healthy @3 :Bool;
-    # Transport protocol (e.g., "tcp", "udp", "unix", "ipc").
-    protocol @4 :Text;
-    # Endpoint metadata.
-    metadata @5 :T.StringMap;
+    metadata @3 :T.StringMap;
 }
 
-# ── Health Status ───────────────────────────────────────────────────────
-
-enum HealthStatus {
-    healthy @0;
-    degraded @1;
-    unhealthy @2;
-    unknown @3;
-    custom @4;
-}
+# ── Runtime health ──────────────────────────────────────────────────────
+# The lifecycle question, as distinct from diagnostics' probe question.
+# Both are real and they diverge.
 
 struct ServiceHealth {
-    # Service this health info belongs to.
     serviceId @0 :T.ServiceId;
-    # Health status.
-    status @1 :HealthStatus;
-    # Latency percentiles.
-    latencyP50 @2 :T.Duration;
-    latencyP95 @3 :T.Duration;
-    latencyP99 @4 :T.Duration;
-    # Error rate (0.0 = none, 1.0 = all errors).
-    errorRate @5 :Float32;
-    # Throughput in requests per second.
-    throughputRps @6 :UInt64;
-    # When this health check was performed.
-    lastChecked @7 :T.Timestamp;
+    # Current lifecycle state as discovery sees it.
+    state @1 :ServiceState;
+    # Why, whenever state is not `online`. Never a placeholder.
+    reason @2 :Text;
+    # Running but not permitted to serve. A quarantined service still
+    # holds a handler slot and consumes resources, which is exactly why
+    # it needs its own field.
+    quarantined @3 :Bool;
+    # How long the service has been in this state, in microseconds, as
+    # measured by whoever observed the transition. `sinceValid` false
+    # means no transition has been observed, NOT "it changed zero
+    # microseconds ago".
+    sinceUs @4 :UInt64;
+    sinceValid @5 :Bool;
+    # The last probe result. Distinct from `state`: a service can be
+    # `online` and failing its probe.
+    lastCheckPassed @6 :Bool;
+    lastCheckAt @7 :T.Timestamp;
+    # Faults taken since the service was last started. Never reset by a
+    # passing probe — only a restart resets it. This is the counter a
+    # quarantine threshold is measured against.
+    faultCount @8 :UInt64;
+    # Consecutive faults, for "is it flapping". Always ≤ faultCount.
+    consecutiveFaults @9 :UInt32;
+    # Restarts since last start.
+    restarts @10 :UInt32;
 }
 
-# ── Service Dependency ──────────────────────────────────────────────────
+# ── Dependencies, deprecation, attestation ──────────────────────────────
+# The canonical dependency type: imported by service.capnp rather than
+# declared a second time with a different shape.
 
 struct ServiceDependency {
     # Service that is depended upon.
     serviceId @0 :T.ServiceId;
-    # The dependency type.
     dependencyType @1 :DependencyType;
-    # Version constraint (e.g., ">=1.0.0").
+    # Version constraint, as an open token (e.g. ">=1.0.0").
     versionConstraint @2 :Text;
     # Whether this dependency is currently satisfied.
     satisfied @3 :Bool;
 }
 
 enum DependencyType {
-    required @0;
-    optional @1;
-    custom @2;
-}
-
-# ── Deprecation Info ────────────────────────────────────────────────────
-
-struct DeprecationInfo {
-    # When this service was marked deprecated.
-    deprecatedAt @0 :T.Timestamp;
-    # When this service will be removed (sunset).
-    sunsetAt @1 :T.Timestamp;
-    # The service that replaces this one (empty = no replacement).
-    replacedBy @2 :T.ServiceId;
-    # Human-readable reason for deprecation.
-    reason @3 :Text;
-}
-
-# ── Service Attestation ─────────────────────────────────────────────────
-
-struct ServiceAttestation {
-    # When this attestation was performed.
-    attestedAt @0 :T.Timestamp;
-    # Cryptographic attestation data (e.g., signed hash).
-    attestationData @1 :T.HashOutput;
-    # Whether the attestation has been verified.
-    verified @2 :Bool;
-    # Attestation type (e.g., "tpm", "sgx", "cosigning").
-    attestationType @3 :Text;
-}
-
-# ── Service Ownership ───────────────────────────────────────────────────
-
-struct ServiceOwnership {
-    # Team or group that owns this service.
-    team @0 :Text;
-    # Contact email for the owner.
-    contactEmail @1 :Text;
-    # On-call rotation identifier.
-    oncallRotation @2 :Text;
-}
-
-# ── Service Version Check ───────────────────────────────────────────────
-
-struct ServiceVersionCheck {
-    # Service being checked.
-    serviceId @0 :T.ServiceId;
-    # Client's version.
-    clientVersion @1 :T.Version;
-    # Whether the client version is compatible.
-    compatible @2 :Bool;
-    # Minimum required version.
-    minRequired @3 :T.Version;
-    # Latest available version.
-    latestAvailable @4 :T.Version;
-}
-
-# ── Service SLA ─────────────────────────────────────────────────────────
-
-struct ServiceSla {
-    # Uptime guarantee as a fraction (0.999 = 99.9%).
-    uptimeGuarantee @0 :Float32;
-    # Maximum latency commitment in milliseconds.
-    maxLatencyMs @1 :UInt32;
-    # Error rate budget as a fraction (0.001 = 0.1%).
-    errorRateBudget @2 :Float32;
-    # Whether SLA is currently being met.
-    met @3 :Bool;
-    # Last SLA check timestamp.
-    lastChecked @4 :T.Timestamp;
-}
-
-# ── Service Cost ─────────────────────────────────────────────────────────
-
-struct ServiceCost {
-    # Per-request pricing (empty = free).
-    perRequestPrice @0 :Float32;
-    # Currency code.
-    currency @1 :Text;
-    # Compute cost per minute.
-    computeCostPerMin @2 :Float32;
-    # Storage cost per GB.
-    storageCostPerGb @3 :Float32;
-    # Free tier included units.
-    freeTierUnits @4 :UInt64;
-}
-
-# ── Service Canary Deployment ────────────────────────────────────────────
-
-struct ServiceCanary {
-    # Traffic percentage routed to canary (0-100).
-    canaryWeight @0 :UInt8;
-    # Whether canary is active.
-    active @1 :Bool;
-    # Canary health status.
-    health @2 :HealthStatus;
-    # Number of successful canary requests.
-    successCount @3 :UInt64;
-    # Number of failed canary requests.
-    failureCount @4 :UInt64;
-}
-
-# ── Circuit Breaker ───────────────────────────────────────────────────────
-
-struct CircuitBreaker {
-    # Failure threshold before opening circuit.
-    failureThreshold @0 :UInt32;
-    # Success threshold to close circuit.
-    successThreshold @1 :UInt32;
-    # Timeout in seconds before half-open attempt.
-    timeoutSeconds @2 :UInt32;
-    # Current circuit state.
-    state @3 :CircuitState;
-    # Consecutive failures.
-    consecutiveFailures @4 :UInt32;
-    # Consecutive successes.
-    consecutiveSuccesses @5 :UInt32;
-}
-
-enum CircuitState {
-    closed @0;
-    open @1;
-    halfOpen @2;
+    unknown @0;
+    required @1;
+    optional @2;
     custom @3;
 }
 
-# ── Retry Policy ──────────────────────────────────────────────────────────
-
-struct RetryPolicy {
-    # Maximum retry attempts.
-    maxAttempts @0 :UInt32;
-    # Base delay between retries.
-    baseDelay @1 :T.Duration;
-    # Maximum delay cap.
-    maxDelay @2 :T.Duration;
-    # Backoff multiplier.
-    backoffMultiplier @3 :Float32;
-    # Whether to use jitter.
-    jitter @4 :Bool;
-    # HTTP status codes that trigger retry.
-    retryableStatusCodes @5 :List(UInt16);
+struct DeprecationInfo {
+    # When this service was deprecated.
+    deprecatedAt @0 :T.Timestamp;
+    # What replaces it (zero = nothing).
+    succeededBy @1 :T.ServiceId;
+    # Human-readable reason.
+    reason @2 :Text;
 }
 
-# ── Service Geo-Distribution ──────────────────────────────────────────────
-
-struct ServiceGeoDistribution {
-    # Regions where this service is deployed.
-    regions @0 :List(ServiceRegion);
-    # Primary region.
-    primaryRegion @1 :Text;
-    # Failover region.
-    failoverRegion @2 :Text;
+struct ServiceAttestation {
+    # Attestation type as an OPEN token ("tpm", "sgx", "cosigning", or a
+    # 2046 one) — this file already used the open pattern correctly.
+    attestationType @0 :Text;
+    # The attestation bytes, opaque and zero-copy.
+    proof @1 :T.DataHandle;
+    verifiedAt @2 :T.Timestamp;
+    # Whether the attestation was verified against a trust root.
+    verified @3 :Bool;
 }
 
-struct ServiceRegion {
-    # Region identifier (e.g., "us-east-1", "eu-west-2").
-    region @0 :Text;
-    # Number of replicas in this region.
-    replicas @1 :UInt16;
-    # Whether this region is currently healthy.
-    healthy @2 :Bool;
-}
-
-# ── Service Changelog ──────────────────────────────────────────────────────
-
-struct ServiceChangelog {
-    # Chronological entries.
-    entries @0 :List(ChangelogEntry);
-}
-
-struct ChangelogEntry {
-    # When this change was made.
-    timestamp @0 :T.Timestamp;
-    # Semantic version after this change.
-    version @1 :T.Version;
-    # Change type.
-    type @2 :ChangelogType;
-    # Human-readable description.
-    description @3 :Text;
-    # Author or service that made the change.
-    author @4 :Text;
-}
-
-enum ChangelogType {
-    added @0;
-    changed @1;
-    deprecated @2;
-    removed @3;
-    fixed @4;
-    security @5;
-    custom @6;
-}
-
-# ── Discovery Filter ────────────────────────────────────────────────────
-
-struct DiscoveryFilter {
-    name @0 :Text;
-    category @1 :ServiceCategory;
-    search @2 :Text;
-    states @3 :List(ServiceState);
-    requiredMetadata @4 :List(Text);
-    tags @5 :List(Text);
-    page @6 :T.Pagination;
-    # Minimum trust level for results.
-    minTrustLevel @7 :Text;
-    # Only return attested services.
-    requireAttestation @8 :Bool;
-    # Filter by health status.
-    healthStatus @9 :HealthStatus;
-    # Exclude deprecated services.
-    excludeDeprecated @10 :Bool;
-}
-
-# ── Service ─────────────────────────────────────────────────────────────
-
-interface DiscoveryService {
-    register @0 (descriptor :ServiceDescriptor) -> T.VoidResult;
-    deregister @1 (serviceId :T.ServiceId) -> T.VoidResult;
-
-    # Unified partial update — any field may be set.
-    update @7 (serviceId :T.ServiceId, patch :ServicePatch) -> T.VoidResult;
-
-    # Partial updates (kept for specific semantics).
-    updateState @2 (serviceId :T.ServiceId, state :ServiceState) -> T.VoidResult;
-    updateMetadata @3 (serviceId :T.ServiceId, metadata :T.StringMap) -> T.VoidResult;
-    updateEndpoints @8 (serviceId :T.ServiceId, endpoints :List(ServiceEndpoint)) -> T.VoidResult;
-
-    lookup @4 (filter :DiscoveryFilter) -> (services :List(ServiceDescriptor), total :UInt64);
-
-    get @5 (serviceId :T.ServiceId) -> (descriptor :ServiceDescriptor);
-
-    subscribe @6 (filter :DiscoveryFilter) -> (subscription :DiscoverySubscription);
-
-    # ── Service Health ──
-    getServiceHealth @9 (serviceId :T.ServiceId) -> (health :ServiceHealth);
-    subscribeServiceHealth @10 (serviceId :T.ServiceId) -> (subscription :HealthSubscription);
-
-    # ── Service Dependencies ──
-    getServiceDependencies @11 (serviceId :T.ServiceId, pagination :T.Pagination)
-                           -> (dependencies :List(ServiceDependency), total :UInt64);
-    getDependents @12 (serviceId :T.ServiceId, pagination :T.Pagination)
-                   -> (dependents :List(ServiceDependency), total :UInt64);
-
-    # ── Deprecation ──
-    deprecateService @13 (serviceId :T.ServiceId, info :DeprecationInfo) -> T.VoidResult;
-    sunsetService @14 (serviceId :T.ServiceId) -> T.VoidResult;
-    listDeprecatedServices @15 (pagination :T.Pagination)
-                           -> (services :List(ServiceDescriptor), total :UInt64);
-
-    # ── Version Checking ──
-    checkVersionCompatibility @16 (serviceId :T.ServiceId, clientVersion :T.Version)
-                              -> (check :ServiceVersionCheck);
-
-    # ── Version Negotiation ──
-    negotiateVersion @17 (serviceId :T.ServiceId, clientVersion :T.Version,
-                          constraints :List(VersionConstraint))
-                     -> (result :VersionNegotiationResult);
-
-    # ── Health Aggregation ──
-    getClusterHealth @18 (serviceIds :List(T.ServiceId))
-                     -> (health :ClusterHealth);
-
-    # ── Dependency Graph Traversal ──
-    getDependencyGraph @19 (serviceId :T.ServiceId, depth :UInt32)
-                       -> (graph :DependencyGraph);
-
-    # Heartbeat — services signal liveness.
-    heartbeat @20 (serviceId :T.ServiceId, liveness :Liveness) -> T.VoidResult;
-
-    # Change feed — push-style subscription for service events.
-    changeFeed @21 (filter :DiscoveryFilter, scope :T.IsolatedScope) -> (subscription :DiscoverySubscription);
-
-    # Set scope boundary — discovery respects isolation tiers.
-    setScopeBoundary @22 (scopeId :UInt64, allowedCategories :List(ServiceCategory)) -> T.VoidResult;
-
-    # Lookup by scope — quarantined services see only their tier.
-    getServiceByScope @23 (scope :T.IsolatedScope, pagination :T.Pagination) -> (services :List(ServiceDescriptor), total :UInt64);
-}
-
-# ── Version Negotiation ────────────────────────────────────────────────
-
-struct VersionConstraint {
-    # Minimum version required.
-    minVersion @0 :T.Version;
-    # Maximum version allowed (empty = no upper bound).
-    maxVersion @1 :T.Version;
-    # Whether exact version match is required.
-    exactMatch @2 :Bool;
-}
-
-struct VersionNegotiationResult {
-    # Whether negotiation succeeded.
-    success @0 :Bool;
-    # Agreed-upon version.
-    agreedVersion @1 :T.Version;
-    # Available versions if negotiation failed.
-    availableVersions @2 :List(T.Version);
-    # Reason for failure (if any).
-    reason @3 :Text;
-}
-
-# ── Cluster Health ─────────────────────────────────────────────────────
-
-struct ClusterHealth {
-    # Per-service health.
-    services @0 :List(ServiceHealth);
-    # Aggregate status (healthy if all healthy, degraded if any degraded, unhealthy if any unhealthy).
-    aggregateStatus @1 :HealthStatus;
-    # Total services in cluster.
-    totalServices @2 :UInt32;
-    # Healthy service count.
-    healthyCount @3 :UInt32;
-    # Degraded service count.
-    degradedCount @4 :UInt32;
-    # Unhealthy service count.
-    unhealthyCount @5 :UInt32;
-}
-
-# ── Dependency Graph ───────────────────────────────────────────────────
-
-struct DependencyGraph {
-    # Root service.
-    rootServiceId @0 :T.ServiceId;
-    # All nodes in the graph (root + transitive dependencies).
-    nodes @1 :List(DependencyGraphNode);
-    # All edges in the graph.
-    edges @2 :List(DependencyGraphEdge);
-    # Maximum depth traversed.
-    depthReached @3 :UInt32;
-}
-
-struct DependencyGraphNode {
+struct ServiceVersionCheck {
     serviceId @0 :T.ServiceId;
-    # Depth from root (0 = root).
-    depth @1 :UInt32;
-    # Health status of this node.
-    health @2 :HealthStatus;
-    # Whether this node is reachable from root.
-    reachable @3 :Bool;
-}
-
-struct DependencyGraphEdge {
-    fromServiceId @0 :T.ServiceId;
-    toServiceId @1 :T.ServiceId;
-    dependencyType @2 :DependencyType;
-    satisfied @3 :Bool;
+    clientVersion @1 :T.Version;
+    compatible @2 :Bool;
+    # The version the caller should use instead (zero = none).
+    recommendedVersion @3 :T.Version;
+    reason @4 :Text;
 }
 
 struct ServicePatch {
@@ -536,15 +219,112 @@ struct ServicePatch {
     metadata @2 :T.StringMap;
     expireAt @3 :T.Timestamp;
     tags @4 :List(Text);
-    # Fields to explicitly unset by name.
-    clearFields @5 :List(Text);
     # Deprecation update.
-    deprecation @6 :DeprecationInfo;
+    deprecation @5 :DeprecationInfo;
+    # Fields to explicitly unset, by name.
+    clearFields @6 :List(Text);
+}
+
+# ── Filter ──────────────────────────────────────────────────────────────
+
+struct DiscoveryFilter {
+    name @0 :Text;
+    # Open category token (empty = all).
+    category @1 :Text;
+    search @2 :Text;
+    states @3 :List(ServiceState);
+    requiredMetadata @4 :List(Text);
+    tags @5 :List(Text);
+    page @6 :T.Pagination;
+    # Only return services whose runtime health is at least this state.
+    healthState @7 :Diag.HealthState;
+    # Exclude deprecated services.
+    excludeDeprecated @8 :Bool;
+    # Restrict to this isolation scope.
+    scope @9 :T.IsolatedScope;
+}
+
+# ── The discovery contract ──────────────────────────────────────────────
+# The root of the discovery domain: handed to the caller by the host, so
+# it is deliberately not returned by any method. `DiscoveryRegistry` IS
+# returned (by `registry`), and `DiscoverySubscription` by `subscribe`.
+
+interface Discovery {
+    # ── Ungated: discovery is open, so a caller can learn before it acts ──
+    # Bounded lookup.
+    lookup @0 (filter :DiscoveryFilter) -> (services :List(ServiceDescriptor), total :UInt64);
+    get @1 (serviceId :T.ServiceId) -> (descriptor :ServiceDescriptor);
+
+    # Resolve a name to a descriptor. Returns `present` rather than an
+    # error when the name is unknown: a service that has not started yet
+    # is not a failure to answer the question, it is the answer.
+    resolve @2 (name :Text) -> (descriptor :ServiceDescriptor, present :Bool);
+
+    # Watch registrations change. Holding the subscription IS the
+    # authority to pull.
+    subscribe @3 (filter :DiscoveryFilter) -> (subscription :DiscoverySubscription);
+
+    # Runtime health of one service, as opposed to the descriptor's
+    # declared `state`.
+    getRuntimeHealth @4 (serviceId :T.ServiceId) -> (health :ServiceHealth);
+    # Runtime health of every registered service.
+    listRuntimeHealth @5 (pagination :T.Pagination) -> (services :List(ServiceHealth), total :UInt64);
+    # Services running but quarantined from serving. Distinct from
+    # offline: these still hold a handler slot and consume resources.
+    listQuarantined @6 (pagination :T.Pagination) -> (services :List(ServiceHealth), total :UInt64);
+
+    # Dependencies, from the canonical type.
+    getServiceDependencies @7 (serviceId :T.ServiceId, pagination :T.Pagination)
+                          -> (dependencies :List(ServiceDependency), total :UInt64);
+    getDependents @8 (serviceId :T.ServiceId, pagination :T.Pagination)
+                 -> (dependents :List(ServiceDependency), total :UInt64);
+
+    # Deprecated services.
+    listDeprecatedServices @9 (pagination :T.Pagination)
+                          -> (services :List(ServiceDescriptor), total :UInt64);
+
+    # Version compatibility (ABI-level negotiation is abi.capnp's
+    # `negotiate`; this answers the per-service question).
+    checkVersionCompatibility @10 (serviceId :T.ServiceId, clientVersion :T.Version)
+                             -> (check :ServiceVersionCheck);
+
+    # Lookup by scope — a caller inside an isolation tier sees only what
+    # its tier may see.
+    getServiceByScope @11 (scope :T.IsolatedScope, pagination :T.Pagination)
+                     -> (services :List(ServiceDescriptor), total :UInt64);
+
+    # ── The one gated surface ────────────────────────────────
+    # Registration, deregistration, update and deprecation. Holding the
+    # returned reference IS the authority; no method takes a token.
+    registry @12 (authority :Capability) -> (service :DiscoveryRegistry);
+}
+
+interface DiscoveryRegistry {
+    # Register a service. A registration whose `expireAt` has passed is
+    # rejected; a live registration with the same id is replaced only by
+    # the holder of this reference.
+    register @0 (descriptor :ServiceDescriptor) -> T.VoidResult;
+
+    # Deregister a service.
+    deregister @1 (serviceId :T.ServiceId) -> T.VoidResult;
+
+    # Unified partial update — any field of the patch may be set.
+    update @2 (serviceId :T.ServiceId, patch :ServicePatch) -> T.VoidResult;
+
+    # Mark a service deprecated (the pre-revamp separate
+    # updateState/updateMetadata/updateEndpoints paths are folded in:
+    # the patch carries all three).
+    deprecateService @3 (serviceId :T.ServiceId, info :DeprecationInfo) -> T.VoidResult;
+
+    # Declare which categories a scope may see. Discovery then honours the
+    # boundary in `lookup` and `getServiceByScope`.
+    setScopeBoundary @4 (scopeId :T.ScopeId, allowedCategories :List(Text)) -> T.VoidResult;
 }
 
 interface DiscoverySubscription {
-    pull @0 () -> (events :List(DiscoveryEvent));
-    # Explicit cancellation — stops the event stream and releases resources.
+    # Bounded pull: the caller states how many events it will take, so a
+    # registration burst cannot flood one message.
+    pull @0 (maxEvents :UInt32) -> (events :List(DiscoveryEvent));
     cancel @1 () -> T.VoidResult;
 }
 
@@ -553,24 +333,17 @@ struct DiscoveryEvent {
     union {
         registered @1 :ServiceDescriptor;
         deregistered @2 :T.ServiceId;
-        stateChanged @3 :StateChange;
+        stateChanged @3 :ServiceStateChange;
         metadataChanged @4 :MetadataChange;
         endpointsChanged @5 :EndpointsChange;
         expired @6 :T.ServiceId;
-        # Health status changed.
         healthChanged @7 :ServiceHealth;
-        # Service was deprecated.
         deprecated @8 :DeprecationInfo;
-        # Service was sunset (final phase before removal).
-        sunset @9 :T.ServiceId;
-        # Attestation was verified.
-        attestationVerified @10 :ServiceAttestation;
-        # Backend-specific discovery event type.
-        custom @11 :Data;
+        unknown @9 :T.UnknownEvent;
     }
 }
 
-struct StateChange {
+struct ServiceStateChange {
     serviceId @0 :T.ServiceId;
     oldState @1 :ServiceState;
     newState @2 :ServiceState;
@@ -584,18 +357,4 @@ struct MetadataChange {
 struct EndpointsChange {
     serviceId @0 :T.ServiceId;
     endpoints @1 :List(ServiceEndpoint);
-}
-
-# ── Health Subscription ─────────────────────────────────────────────────
-
-interface HealthSubscription {
-    pull @0 () -> (health :List(ServiceHealth));
-    cancel @1 () -> T.VoidResult;
-}
-
-# ─── Liveness ────────────────────────────────────────────────
-struct Liveness {
-    lastBeat @0 :T.Timestamp;
-    jitterTolerance @1 :T.Duration;
-    gracePeriod @2 :T.Duration;
 }

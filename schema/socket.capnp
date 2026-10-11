@@ -3,78 +3,163 @@
 using T = import "types.capnp";
 
 # ═══════════════════════════════════════════════════════════════════════
-# Socket - network socket API (TCP, UDP, SCTP, Unix domain).
+# Socket — the connection contract, and the CANONICAL HOME for channel
+# security in this protocol.
 #
-# Improvements beyond the original schema (audit):
-#   - SocketKind extended with sctp, dccp.
-#   - IPv4-mapped IPv6 addresses (critical for dual-stack).
-#   - SocketFlags struct (nonBlock, cloexec — generic, not POSIX).
-#   - SocketInfo includes latencyMs, mtu, localPort, error.
-#   - connectWithDeadline (timeout for connection setup).
-#   - shutdownEmergency for hard close.
-#   - pendingConnect for non-blocking connect status.
-#   - pending / ready methods for polling.
-#   - SocketHandle.id uses T.SocketId (was raw UInt64).
-#   - SocketInfo.error uses T.Error (was raw UInt32).
-#   - SocketKind and ConnectionState have custom variants.
-#   - latencyMs has unit comment (milliseconds).
-#   - KeepAlive timeout fields use T.Duration (was raw UInt32).
-#   - send/receive use T.DataHandle for large payloads.
-#   - ShutdownHow has custom variant.
-#   - SocketAddress union has custom variant.
+# Why security lives here: a connection's trust configuration belongs to
+# the thing that establishes the connection. TLS configuration used to
+# exist in three places with three shapes (this file's `TlsSession`,
+# endpoint.capnp's `TlsConfig`/`TlsVersion`, and nothing at all in
+# web.capnp, where `wss://` implied TLS the URL only). It now exists
+# once, here; `endpoint.capnp` and `web.capnp` reference this type.
 #
-# Audit-7 improvements:
-#   - QoS/priority option for real-time traffic (TOS, DSCP, ECN).
-#   - getSocketName/getPeerName for address introspection.
-#   - Socket event subscription for state change notifications.
-#   - closeGracefully for clean teardown with timeout.
-#   - Socket proxy routing (SOCKS5, HTTP CONNECT).
-#   - Socket multicast support.
-#   - Socket compression option.
-#   - Socket rate limiting for server sockets.
+# Core of the contract: create/bind/listen/accept/connect/send/receive
+# over `T.DataHandle`, measured options, honest deadlines, pull + cancel
+# subscriptions. Options state intent; the backend maps intent onto
+# whatever its stack has, and reports what it actually applied.
 #
-# Audit-9 improvements:
-#   - TLS session integration (wrapTls/unwrapTls).
-#   - Congestion control algorithm selection.
-#   - TLS session ticket support for resumption.
-#   - Real-time bandwidth measurement sampling.
-#   - Socket pcap/traffic capture for debugging.
+# Design rules applied:
+#   - No POSIX flag names. The old `SocketFlags` carried `cloexec`
+#     (close-on-exec: an exec semantic, not a socket semantic) and
+#     `shared`/`exclusive` (file-lock semantics) in a struct whose own
+#     comment claimed "generic, not POSIX".
+#   - No algorithm hints as enums. Congestion control, compression and
+#     traffic class are open tokens: a 2046 stack's algorithm is a
+#     string, and the protocol reports what the stack uses rather than
+#     instructing it (TIMELESSNESS.md:84).
+#   - `receive` can say "nothing yet" without the caller polling.
+#   - A capture sink is not a filesystem path: pcap output is a
+#     path/buffer/handle union so a filesystem-less backend can honor it.
 # ═══════════════════════════════════════════════════════════════════════
 
+# ── Channel Security: the canonical TLS home ──────────────────────────
+
+struct TlsConfig {
+    # Whether channel security is required for this connection.
+    enabled @0 :Bool = true;
+
+    # Version bounds as open tokens ("tls12", "tls13", ...). A 2046
+    # version is a string with unknown-tolerance; an unrecognized token
+    # is ignored by a consumer that cannot act on it.
+    minVersion @1 :Text;
+    maxVersion @2 :Text;
+
+    # Cipher suites as open tokens (empty = backend defaults).
+    cipherSuites @3 :List(Text);
+
+    # Application protocols for ALPN ("h2", "h3", ...).
+    alpn @4 :List(Text);
+
+    # Server name for SNI and certificate validation.
+    serverName @5 :Text;
+
+    # How the peer certificate is treated. See "what wss:// means" below.
+    verifyMode @6 :VerifyMode = verifyPeer;
+
+    # Trust anchors as content (PEM/DER), not as paths.
+    trustAnchors @7 :List(T.DataHandle);
+
+    # Client certificate and key for mutual TLS, as content.
+    clientCert @8 :T.DataHandle;
+    clientKey @9 :T.DataHandle;
+
+    revocationCheck @10 :RevocationCheck;
+
+    # Certificate pins for this configuration.
+    pins @11 :List(CertificatePin);
+
+    metadata @12 :T.StringMap;
+}
+
+enum VerifyMode {
+    unknown @0;
+    verifyNone @1;
+    verifyPeer @2;
+    verifyPeerOnce @3;
+    custom @4;
+}
+
+enum RevocationCheck {
+    unknown @0;
+    none @1;
+    crl @2;
+    ocsp @3;
+    ocspStapling @4;
+    custom @5;
+}
+
+struct CertificatePin {
+    # Pinning algorithm as an open token ("sha256").
+    algorithm @0 :Text;
+    # Pin over the Subject Public Key Info.
+    spkiHash @1 :Data;
+    expiresAt @2 :T.Timestamp;
+    metadata @3 :T.StringMap;
+}
+
+# ── What `wss://` means (the semantics web.capnp delegates here) ──────
+#
+# A `wss://` endpoint is a TLS-protected stream socket, and its security
+# requirements are the ones declared in `TlsConfig` — not ones implied by
+# the URL:
+#
+#   1. `verifyMode` governs certificate checking. `verifyPeer` (the
+#      default) requires a chain that validates against the trust
+#      anchors. A backend that cannot verify MUST fail the connection;
+#      silently retrying without verification is the failure mode this
+#      rule exists to prevent.
+#   2. `serverName` (SNI) and `pins` are the identity checks available to
+#      a consumer. A connection that satisfies neither is encrypted but
+#      not authenticated, and `verifyMode = verifyNone` is the only way
+#      to say so — never an absence.
+#   3. `alpn` selects the application protocol; an unknown token is
+#      ignored, so a future protocol needs no schema change.
+#   4. `trustAnchors`, `clientCert` and `clientKey` are content
+#      (T.DataHandle), never file paths: a browser runtime or an
+#      in-memory backend has no filesystem to read them from.
+#
+# The same configuration applies to `https://` fetches and to any other
+# scheme that implies a secure channel; the scheme's meaning is defined
+# once, here, rather than per schema.
+
+# ── Datagram security (DTLS) ──────────────────────────────────────────
+
+struct DtlsConfig {
+    enabled @0 :Bool = true;
+    minVersion @1 :Text;
+    maxVersion @2 :Text;
+    cipherSuites @3 :List(Text);
+    verifyMode @4 :VerifyMode = verifyPeer;
+    trustAnchors @5 :List(T.DataHandle);
+    clientCert @6 :T.DataHandle;
+    clientKey @7 :T.DataHandle;
+    # Maximum transmission unit for the datagram channel.
+    mtu @8 :UInt16;
+    pins @9 :List(CertificatePin);
+    metadata @10 :T.StringMap;
+}
+
 # ── Address Types ──────────────────────────────────────────────────────
+# A socket address is a host/port pair, a name, or opaque bytes — the
+# same three shapes endpoint.capnp uses, so an address means the same
+# thing at both layers.
 
 struct SocketAddress {
     union {
-        ipv4 @0 :Ipv4Address;
-        ipv6 @1 :Ipv6Address;
-        ipv4Mapped @3 :Ipv4MappedIpv6Address;
-        unix @2 :UnixAddress;
-        custom @4 :Data;
+        network @0 :SocketNetworkAddress;
+        # A named peer: a filesystem socket path, an abstract-socket
+        # name, a bus name. Names avoid naming any OS's namespace.
+        named @1 :Text;
+        custom @2 :Data;
     }
 }
 
-struct Ipv4Address {
-    octets @0 :Data;
-    port @1 :UInt16;
-}
-
-struct Ipv6Address {
-    octets @0 :Data;
-    port @1 :UInt16;
-    flowInfo @2 :UInt32;
-    scopeId @3 :UInt32;
-}
-
-# IPv4-mapped IPv6: ::ffff:192.0.2.1 — critical for dual-stack.
-struct Ipv4MappedIpv6Address {
-    ipv4Octets @0 :Data;
-    port @1 :UInt16;
-    # Flow info / scope id are zero for mapped addresses.
-}
-
-struct UnixAddress {
-    abstract @0 :Data;
-    path @1 :Text;
+struct SocketNetworkAddress {
+    host @0 :T.IpAddress;
+    port @1 :T.Port;
+    # IPv6 scope id for link-local addresses (0 otherwise).
+    scopeId @2 :UInt32;
+    metadata @3 :T.StringMap;
 }
 
 # ── Socket Handles ──────────────────────────────────────────────────────
@@ -100,20 +185,26 @@ struct SocketOption {
         keepAliveInterval @10 :T.Duration;
         keepAliveCount @11 :UInt32;
         custom @12 :CustomOption;
-        # QoS / traffic prioritization (TOS, DSCP, ECN).
+
+        # Quality-of-service intent. The class is an open token: what a
+        # backend does with it is its own business.
         qos @13 :QosOption;
-        # Enable multiplexing on this socket.
-        multiplex @14 :Bool;
-        # Number of keepalive probes before declaring dead.
-        keepAliveProbes @15 :UInt32;
-        # Proxy routing configuration.
-        proxy @16 :ProxyRoute;
-        # Compression algorithm for socket data.
-        compression @17 :CompressionOption;
-        # Rate limiting for server sockets.
-        rateLimit @18 :RateLimitOption;
+
+        # Connection routing through a proxy.
+        proxy @14 :ProxyConfig;
+
+        # Whether the channel compresses, with an open algorithm token.
+        compression @15 :CompressionOption;
+
+        # Rate limiting for listening sockets.
+        rateLimit @16 :RateLimitOption;
+
         # Multicast group membership.
-        multicast @19 :MulticastGroup;
+        multicast @17 :MulticastGroup;
+
+        # Channel security for this connection (the canonical TLS home).
+        tls @18 :TlsConfig;
+        dtls @19 :DtlsConfig;
     }
 }
 
@@ -137,116 +228,90 @@ struct CustomOption {
 # ── QoS Option ──────────────────────────────────────────────────────────
 
 struct QosOption {
-    # Traffic class (maps to IP_TOS / SO_PRIORITY).
-    trafficClass @0 :TrafficClass;
+    # Open traffic-class token ("bestEffort", "controlledLoad", ...).
+    trafficClass @0 :Text;
     # 802.1p priority (0-7).
     priority @1 :UInt8;
     # DSCP value (0-63).
     dscp @2 :UInt8;
     # ECN codepoint (0-3).
     ecn @3 :UInt8;
+    metadata @4 :T.StringMap;
 }
 
-enum TrafficClass {
-    bestEffort @0;
-    controlledLoad @1;
-    guaranteed @2;
-    networkControl @3;
-    streaming @4;
-    interactive @5;
-    custom @6;
-}
+# ── Proxy (canonical home; endpoint.capnp and web.capnp reference it) ──
 
-# ── Proxy Route ─────────────────────────────────────────────────────────
-
-struct ProxyRoute {
-    # Proxy type.
-    type @0 :ProxyType;
-    # Proxy address.
+struct ProxyConfig {
+    # Open proxy-type token ("socks5", "httpConnect", ...).
+    type @0 :Text;
     address @1 :T.IpAddress;
     port @2 :T.Port;
-    # Authentication for proxy.
-    username @3 :Text;
-    password @4 :Text;
-    # Bypass rules: domains/IPs that bypass the proxy.
-    bypass @5 :List(Text);
-    # Connection timeout to proxy.
-    timeout @6 :T.Duration;
-}
-
-enum ProxyType {
-    none @0;
-    socks4 @1;
-    socks5 @2;
-    socks5h @3;
-    httpConnect @4;
-    httpsConnect @5;
-    transparent @6;
-    custom @7;
+    # Credentials as opaque content — a secret never crosses the wire as
+    # a bare Text field the schema invites callers to fill in.
+    credential @3 :T.DataHandle;
+    # Hosts that bypass the proxy.
+    bypass @4 :List(Text);
+    # Connection timeout to the proxy.
+    timeout @5 :T.Duration;
+    metadata @6 :T.StringMap;
 }
 
 # ── Compression Option ─────────────────────────────────────────────────
 
 struct CompressionOption {
-    # Whether compression is enabled.
     enabled @0 :Bool;
-    # Compression algorithm.
-    algorithm @1 :CompressionAlgorithm;
+    # Open algorithm token ("gzip", "zstd", "lz4", ...).
+    algorithm @1 :Text;
     # Minimum payload size to compress (below this, send uncompressed).
     minPayloadSize @2 :UInt32;
-    # Compression level (1 = fastest, 9 = best compression).
+    # Compression level.
     level @3 :UInt8;
-}
-
-enum CompressionAlgorithm {
-    none @0;
-    gzip @1;
-    zstd @2;
-    lz4 @3;
-    snappy @4;
-    custom @5;
+    metadata @4 :T.StringMap;
 }
 
 # ── Rate Limit Option ──────────────────────────────────────────────────
 
 struct RateLimitOption {
-    # Maximum connections per second.
     maxConnectionsPerSecond @0 :UInt32;
     # Maximum bytes per second (0 = unlimited).
     maxBytesPerSecond @1 :UInt64;
-    # Burst size.
     burstSize @2 :UInt32;
-    # Whether rate limiting is enabled.
     enabled @3 :Bool;
 }
 
 # ── Multicast Group ────────────────────────────────────────────────────
 
 struct MulticastGroup {
-    # Multicast group address.
     groupAddress @0 :T.IpAddress;
-    # Local interface to bind to.
     interfaceAddress @1 :T.IpAddress;
-    # Multicast TTL.
     ttl @2 :UInt8;
-    # Whether to enable loopback.
     loopback @3 :Bool;
+    metadata @4 :T.StringMap;
 }
 
 # ── Socket Flags ────────────────────────────────────────────────────────
+# Lifecycle intent only. The POSIX spellings this struct used to carry
+# (`cloexec` — close-on-exec, an exec semantic; `shared`/`exclusive` —
+# file-lock semantics) are gone: a capability runtime has no exec table
+# and no advisory file locks to configure through a socket.
 
 struct SocketFlags {
-    nonBlock @0 :Bool;
-    cloexec @1 :Bool;
+    # Whether operations on this socket do not block the caller.
+    nonBlocking @0 :Bool;
+    # Whether the socket survives after the creating reference is gone.
+    durable @1 :Bool;
+    # Whether other holders may use this socket concurrently.
     shared @2 :Bool;
-    exclusive @3 :Bool;
 }
 
 # ── Connection Info ─────────────────────────────────────────────────────
 
 struct SocketInfo {
     handle @0 :SocketHandle;
-    kind @1 :SocketKind;
+    # Socket kind as an open token ("stream", "datagram", "seqpacket",
+    # "raw", ...): the transport is chosen by the address, the kind
+    # states the semantics the caller asked for.
+    kind @1 :Text;
     localAddress @2 :SocketAddress;
     remoteAddress @3 :SocketAddress;
     localPort @4 :UInt16;
@@ -254,37 +319,34 @@ struct SocketInfo {
     options @6 :List(SocketOption);
     bytesSent @7 :UInt64;
     bytesReceived @8 :UInt64;
-    # Round-trip latency in milliseconds (for connected sockets).
-    latencyMs @9 :UInt32;
-    # Path MTU in bytes (for UDP or connected TCP).
-    mtu @10 :UInt32;
+    # Measured round-trip latency (absent when not measured).
+    latency @9 :T.Duration;
+    latencyMeasured @10 :Bool;
+    # Path MTU in bytes, if known.
+    mtu @11 :UInt32;
+    mtuKnown @12 :Bool;
     # Last socket-level error.
-    error @11 :T.Error;
-}
-
-enum SocketKind {
-    tcp @0;
-    udp @1;
-    sctp @2;
-    dccp @3;
-    raw @4;
-    custom @5;
+    error @13 :T.Error;
+    # Channel security in force, if any.
+    security @14 :TlsConfig;
+    metadata @15 :T.StringMap;
 }
 
 enum ConnectionState {
-    unconnected @0;
-    connecting @1;
-    connected @2;
-    listening @3;
-    disconnected @4;
-    error @5;
-    custom @6;
+    unknown @0;
+    unconnected @1;
+    connecting @2;
+    connected @3;
+    listening @4;
+    disconnected @5;
+    error @6;
+    custom @7;
 }
 
 # ── Service Interface ────────────────────────────────────────────────────
 
 interface SocketService {
-    create @0 (kind :SocketKind) -> (handle :SocketHandle);
+    create @0 (kind :Text) -> (handle :SocketHandle);
 
     bind @1 (handle :SocketHandle, address :SocketAddress) -> T.VoidResult;
 
@@ -295,98 +357,102 @@ interface SocketService {
     connect @4 (handle :SocketHandle, address :SocketAddress) -> T.VoidResult;
 
     # Connect with a deadline (wall-clock timeout).
-    connectWithDeadline @9 (handle :SocketHandle, address :SocketAddress, deadline :T.Timestamp) -> T.VoidResult;
+    connectWithDeadline @5 (handle :SocketHandle, address :SocketAddress, deadline :T.Timestamp) -> T.VoidResult;
 
-    # Check if a non-blocking connect is still in progress.
-    pendingConnect @10 (handle :SocketHandle) -> (pending :Bool);
+    # Check whether a non-blocking connect is still in progress.
+    pendingConnect @6 (handle :SocketHandle) -> (pending :Bool);
 
-    send @5 (handle :SocketHandle, data :T.DataHandle) -> (sent :UInt32);
-    sendTo @6 (handle :SocketHandle, data :T.DataHandle, destination :SocketAddress) -> (sent :UInt32);
+    send @7 (handle :SocketHandle, data :T.DataHandle) -> (sent :UInt32);
+    sendTo @8 (handle :SocketHandle, data :T.DataHandle, destination :SocketAddress) -> (sent :UInt32);
 
-    receive @7 (handle :SocketHandle, maxLength :UInt32) -> (data :T.DataHandle);
-    receiveFrom @8 (handle :SocketHandle, maxLength :UInt32) -> (data :T.DataHandle, source :SocketAddress);
+    # `wouldBlock` says "nothing available yet" so a non-blocking caller
+    # is not pushed into a poll loop; `closed` distinguishes an orderly
+    # shutdown from an empty queue.
+    receive @9 (handle :SocketHandle, maxLength :UInt32)
+            -> (data :T.DataHandle, wouldBlock :Bool, closed :Bool);
+    receiveFrom @10 (handle :SocketHandle, maxLength :UInt32)
+                -> (data :T.DataHandle, source :SocketAddress, wouldBlock :Bool, closed :Bool);
 
     getInfo @11 (handle :SocketHandle) -> (info :SocketInfo);
 
     setOption @12 (handle :SocketHandle, option :SocketOption) -> T.VoidResult;
     getOption @13 (handle :SocketHandle, option :SocketOption) -> (option :SocketOption);
 
-    # Set socket-level flags.
     setFlags @14 (handle :SocketHandle, flags :SocketFlags) -> T.VoidResult;
     getFlags @15 (handle :SocketHandle) -> (flags :SocketFlags);
 
     shutdown @16 (handle :SocketHandle, how :ShutdownHow) -> T.VoidResult;
-    # Hard close without grace.
-    shutdownEmergency @17 (handle :SocketHandle) -> T.VoidResult;
 
-    close @18 (handle :SocketHandle) -> T.VoidResult;
+    close @17 (handle :SocketHandle) -> T.VoidResult;
+
+    # Close with a timeout: flush pending data, then close.
+    closeGracefully @18 (handle :SocketHandle, timeout :T.Duration) -> T.VoidResult;
 
     # ── Address introspection ──
-    # Get the local address/port assigned after bind (useful for ephemeral ports).
     getSocketName @19 (handle :SocketHandle) -> (address :SocketAddress, port :UInt16);
-    # Get the remote address after connect.
     getPeerName @20 (handle :SocketHandle) -> (address :SocketAddress, port :UInt16);
 
-    # ── Graceful close ──
-    # Close with a timeout: flush pending data, then close.
-    closeGracefully @21 (handle :SocketHandle, timeout :T.Duration) -> T.VoidResult;
-
     # ── Event subscription ──
-    # Subscribe to socket state changes (connected, disconnected, error).
-    subscribeEvents @22 (handle :SocketHandle) -> (subscription :SocketEventSubscription);
+    # State changes AND readability. A readable event is what lets a
+    # consumer wait instead of poll `receive`.
+    subscribeEvents @21 (handle :SocketHandle) -> (subscription :SocketEventSubscription);
 
     # ── TLS integration ──
-    wrapTls @23 (handle :SocketHandle, serverName :Text) -> (tlsSession :TlsSession);
-    unwrapTls @24 (handle :SocketHandle) -> T.VoidResult;
+    # Wrap the connection with the given security configuration. The
+    # configuration is the canonical one defined in this file.
+    wrapTls @22 (handle :SocketHandle, config :TlsConfig) -> (tlsSession :TlsSession);
+    unwrapTls @23 (handle :SocketHandle) -> T.VoidResult;
 
-    # ── Congestion control ──
-    getCongestionControl @25 (handle :SocketHandle) -> (config :CongestionControl);
-    setCongestionControl @26 (handle :SocketHandle, config :CongestionControl) -> T.VoidResult;
+    # What the stack is actually using — reported, not instructed.
+    getCongestionControl @24 (handle :SocketHandle) -> (config :CongestionControl);
 
     # ── Bandwidth measurement ──
-    getBandwidthSample @27 (handle :SocketHandle) -> (sample :BandwidthSample);
+    getBandwidthSample @25 (handle :SocketHandle) -> (sample :BandwidthSample);
 
-    # ── Pcap capture ──
-    startPcapCapture @28 (handle :SocketHandle, filePath :Text) -> (session :PcapSession);
-    stopPcapCapture @29 (handle :SocketHandle) -> T.VoidResult;
+    # ── Capture ──
+    startPcapCapture @26 (handle :SocketHandle, sink :CaptureSink) -> (session :PcapSession);
+    stopPcapCapture @27 (handle :SocketHandle) -> T.VoidResult;
 
-    # ── Session ticket ──
-    getSessionTicket @30 (handle :SocketHandle) -> (ticket :SessionTicket);
-    setSessionTicket @31 (handle :SocketHandle, ticket :SessionTicket) -> T.VoidResult;
-
-    # ── Session ticket store ──
-    getSessionTicketStore @32 (serverName :Text) -> (tickets :List(SessionTicket));
-    addSessionTicket @33 (handle :SocketHandle, ticket :SessionTicket) -> T.VoidResult;
-    removeSessionTicket @34 (handle :SocketHandle, ticket :SessionTicket) -> T.VoidResult;
-    clearSessionTickets @35 (handle :SocketHandle) -> T.VoidResult;
+    # ── Session tickets ──
+    getSessionTicket @28 (handle :SocketHandle) -> (ticket :SessionTicket);
+    setSessionTicket @29 (handle :SocketHandle, ticket :SessionTicket) -> T.VoidResult;
+    getSessionTicketStore @30 (serverName :Text, pagination :T.Pagination)
+                         -> (tickets :List(SessionTicket), totalCount :UInt64);
+    addSessionTicket @31 (handle :SocketHandle, ticket :SessionTicket) -> T.VoidResult;
+    removeSessionTicket @32 (handle :SocketHandle, ticket :SessionTicket) -> T.VoidResult;
+    clearSessionTickets @33 (handle :SocketHandle) -> T.VoidResult;
 
     # ── SCTP options ──
-    setSctpOptions @36 (handle :SocketHandle, options :SctpOptions) -> T.VoidResult;
-    getSctpOptions @37 (handle :SocketHandle) -> (options :SctpOptions);
+    setSctpOptions @34 (handle :SocketHandle, options :SctpOptions) -> T.VoidResult;
+    getSctpOptions @35 (handle :SocketHandle) -> (options :SctpOptions);
 }
 
 enum ShutdownHow {
-    read @0;
-    write @1;
-    both @2;
-    custom @3;
+    unknown @0;
+    read @1;
+    write @2;
+    both @3;
+    custom @4;
 }
 
 # ── Socket Event Subscription ───────────────────────────────────────────
 
 interface SocketEventSubscription {
-    pull @0 () -> (event :SocketEvent);
+    pull @0 () -> (events :List(SocketEvent));
     cancel @1 () -> T.VoidResult;
 }
 
 struct SocketEvent {
-    # When this event occurred.
     timestamp @0 :T.Timestamp;
     union {
         stateChanged @1 :SocketStateChange;
-        error @2 :T.Error;
-        # Backend-specific socket event.
-        custom @3 :Data;
+        # The socket has data to read — the event that makes waiting
+        # possible instead of polling.
+        readable @2 :Void;
+        # The peer closed the write side.
+        readClosed @3 :Void;
+        error @4 :T.Error;
+        custom @5 :Data;
     }
 }
 
@@ -398,90 +464,83 @@ struct SocketStateChange {
 # ── TLS Session ─────────────────────────────────────────────────────────
 
 struct TlsSession {
-    # TLS version in use.
-    version @0 :T.TlsVersion;
-    # Cipher suite name.
+    # Version in force, as an open token.
+    version @0 :Text;
+    # Cipher suite in force, as an open token.
     cipherSuite @1 :Text;
-    # Whether session was resumed via ticket.
-    resumed @2 :Bool;
-    # Peer certificate data.
-    peerCertificate @3 :Data;
+    # ALPN protocol selected.
+    alpn @2 :Text;
+    # Whether the session was resumed via ticket.
+    resumed @3 :Bool;
+    # Peer certificate chain, as content.
+    peerCertificate @4 :T.DataHandle;
+    # Whether the peer's certificate was verified against the trust
+    # anchors (false when verifyMode said not to).
+    peerVerified @5 :Bool;
+    metadata @6 :T.StringMap;
 }
 
 # ── Congestion Control ─────────────────────────────────────────────────
 
 struct CongestionControl {
-    # Algorithm name (cubic, bbr, reno, etc.).
-    algorithm @0 :CongestionAlgorithm;
-    # Whether congestion control is enabled.
+    # Algorithm in use, as an open token. Reported by the stack; the
+    # protocol does not instruct it (TIMELESSNESS.md:84).
+    algorithm @0 :Text;
     enabled @1 :Bool;
-}
-
-enum CongestionAlgorithm {
-    cubic @0;
-    bbr @1;
-    reno @2;
-    vegas @3;
-    bic @4;
-    custom @5;
+    metadata @2 :T.StringMap;
 }
 
 # ── Bandwidth Measurement ──────────────────────────────────────────────
 
 struct BandwidthSample {
-    # Throughput in bytes per second (instantaneous).
     bytesPerSecond @0 :UInt64;
-    # Throughput in bits per second.
     bitsPerSecond @1 :UInt64;
-    # Sample timestamp.
     timestamp @2 :T.Timestamp;
-    # Sample window duration.
     window @3 :T.Duration;
 }
 
 # ── TLS Session Ticket ─────────────────────────────────────────────────
 
 struct SessionTicket {
-    # Session ticket data.
-    ticket @0 :Data;
-    # When this ticket expires.
+    ticket @0 :T.DataHandle;
     expiresAt @1 :T.Timestamp;
-    # Associated server name.
     serverName @2 :Text;
+    metadata @3 :T.StringMap;
 }
 
-# ── Pcap Session ────────────────────────────────────────────────────────
+# ── Capture ─────────────────────────────────────────────────────────────
+# A capture sink is not a filesystem path: the old signature forced a
+# path, which a browser runtime or a filesystem-less backend cannot
+# honor at all.
+
+struct CaptureSink {
+    union {
+        path @0 :Text;
+        buffer @1 :T.BufferId;
+        handle @2 :T.FileHandleId;
+        custom @3 :Data;
+    }
+}
 
 struct PcapSession {
-    # Session identifier.
-    sessionId @0 :Data;
-    # Capture file path.
-    filePath @1 :Text;
-    # Whether capture is currently active.
+    sessionId @0 :Text;
+    sink @1 :CaptureSink;
     active @2 :Bool;
-    # Packets captured so far.
     packetsCaptured @3 :UInt64;
+    metadata @4 :T.StringMap;
 }
 
 # ── SCTP Options ──────────────────────────────────────────────────────
 
 struct SctpOptions {
-    # Number of outbound streams.
     outboundStreams @0 :UInt16;
-    # Number of inbound streams.
     inboundStreams @1 :UInt16;
-    # Whether to use ordered delivery.
     ordered @2 :Bool = true;
-    # Maximum message size in bytes.
     maxMessageSize @3 :UInt32;
-    # fragmentation threshold.
     fragmentationThreshold @4 :UInt32;
-    # Heartbeat interval.
     heartbeatInterval @5 :T.Duration;
-    # RTO initial value.
     rtoInitial @6 :T.Duration;
-    # RTO minimum.
     rtoMin @7 :T.Duration;
-    # RTO maximum.
     rtoMax @8 :T.Duration;
+    metadata @9 :T.StringMap;
 }

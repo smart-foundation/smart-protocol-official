@@ -98,10 +98,23 @@ interface Locations {
     deleteAccuracyZone @19 (zoneId :Text) -> T.VoidResult;
 
     # Audit-10: Geo-fence attestation.
-    attestGeoFence @20 (fenceId :Text, location :LocationData, privateKey :Data)
-        -> (attestation :GeoFenceAttestation);
+    #
+    # The previous signature took `privateKey :Data` in the request body.
+    # A private key must never cross into a service: the service can
+    # only misuse it, and on hardware where the key cannot be exported
+    # at all (a secure element, a TPM, a future equivalent) the method
+    # was simply unimplementable — on exactly the hardware that most
+    # needs attestation. It also had no statement of custody and no key
+    # identifier, so nothing said which key signed or who held it.
+    #
+    # The key now stays where it lives and is named by an opaque handle:
+    # the location service asks the key owner to sign through
+    # key_management.capnp, and returns a reference to the signature
+    # rather than producing one itself.
+    attestGeoFence @20 (fenceId :Text, location :LocationData, key :T.KeyId)
+        -> (result :GeoFenceAttestationResult);
     verifyGeoFenceAttestation @21 (attestation :GeoFenceAttestation)
-        -> (valid :Bool, reason :Text);
+        -> (result :GeoFenceVerificationResult);
 }
 
 interface LocationSubscription {
@@ -139,7 +152,7 @@ struct LocationData {
     # Indoor positioning data (BLE beacon, ultrasound, Wi-Fi RTT).
     indoor @10 :IndoorPosition;
     # AR/VR spatial pose (6DoF position + orientation).
-    spatialPose @11 :SpatialPose;
+    spatialPose @11 :T.SpatialPose;
     # Signal-strength fingerprint for indoor matching.
     fingerprint @12 :Data;
     # Positioning mode indicator.
@@ -210,16 +223,6 @@ enum IndoorMethod {
 
 # ── AR/VR Spatial Pose ────────────────────────────────────────
 
-struct SpatialPose {
-    # Position in meters (x, y, z) relative to origin.
-    position @0 :T.Vec3;
-    # Orientation as quaternion.
-    rotation @1 :T.Quaternion;
-    # Linear velocity in meters/second.
-    velocity @2 :T.Vec3;
-    # Angular velocity in radians/second.
-    angularVelocity @3 :T.Vec3;
-}
 
 # ── Geo-Fence ─────────────────────────────────────────────────
 
@@ -291,10 +294,25 @@ struct GeoFenceAttestation {
     location @1 :LocationData;
     # Timestamp of attestation.
     timestamp @2 :T.Timestamp;
-    # Cryptographic signature (location + fence data signed with private key).
+    # Reference to the produced signature. Opaque and backend-decided:
+    # how the signature is encoded is crypto.capnp's business, not a
+    # location contract's, and a 2046 post-quantum scheme needs no new
+    # string here.
     signature @3 :Data;
-    # Public key used for verification.
-    publicKey @4 :Data;
-    # Attestation algorithm (e.g., "ecdsa-p256", "ed25519").
-    algorithm @5 :Text;
+    # The key that signed, as an opaque T.KeyId reference.
+    key @4 :T.KeyId;
+}
+
+struct GeoFenceAttestationResult {
+    union {
+        ok @0 :GeoFenceAttestation;
+        error @1 :T.Error;
+    }
+}
+
+struct GeoFenceVerificationResult {
+    union {
+        ok @0 :Void;
+        error @1 :T.Error;
+    }
 }

@@ -1,136 +1,110 @@
 @0xa1b2c3d4e5f60053;
 
 using T = import "types.capnp";
-using Trans = import "translation.capnp";
+using import "capability.capnp".Capability;
 
 # ═══════════════════════════════════════════════════════════════════════
 # Telephony - cellular network, calls, SMS, MMS, RCS, conference calls.
 #
-# Improvements beyond the original schema (audit):
-#   - Incoming SMS events via subscribeSms.
-#   - MMS sending/receiving via sendMms + MmsPart.
-#   - RCS message struct + sendRcs with SMS fallback.
-#   - conferenceId on CallInfo (multi-party calls).
-#   - DTMF tone sending via sendDtmf (IVR support).
-#   - displayName on CallInfo (caller-id display).
-#   - CallType on subscription (voice/data/video).
-#   - Cell tower info extended with TAC (tracking area code).
-#   - Satellite network type.
-#   - CallInfo.duration uses T.Duration.
-#   - Call.id uses T.CallId from types.capnp.
-#   - ConferenceInfo.id uses T.ConferenceId from types.capnp.
-#   - MmsPart.id uses T.MmsPartId from types.capnp (was raw UInt64).
-#   - MmsPart.contentType uses T.MimeType (was raw Text).
-#   - MmsPart.data uses T.DataHandle for large payloads.
-#   - RcsMessage.id uses T.TelephonyMessageId (was raw Text).
-#   - MmsResult.messageId uses T.TelephonyMessageId (was raw Text).
-#   - ConferenceInfo.participantsPagination for bounded iteration (Audit-6).
-#   - MmsResult.error uses T.Error.
-#   - All subscription interfaces have cancel for clean teardown.
-#   - MmsRetrievalStatus enum has custom variant.
-#   - NetworkType enum has custom variant.
-#   - CallState/CallDirection/CallType have custom variants.
-#   - SmsEncoding has custom variant.
-#   - signalStrength comment documents unit (dBm).
-#
-# Audit-8 enhancements:
-#   - SatelliteService: emergency off-grid satellite communication.
-#   - MeshCallService/MeshMessageService: Bluetooth/Wi-Fi mesh calling.
-#   - FreeBusyQuery: calendar-attached availability checking.
-#   - LineManager: dual-SIM / work-personal line management.
-#   - CallRecordingService: standardized call recording.
-#   - VoicemailService: visual voicemail management.
-#   - LanguageFallback: multi-language IVR voice menu support.
-#
-# Audit-9 improvements:
-#   - CallQuality struct for call quality metrics.
-#   - SpamScore struct for call screening.
-#   - CarrierSettings for APN/MMSC configuration.
-#   - E2eEncryption for SMS/MMS encryption.
-#   - CallScreeningService for call screening.
-#   - DataUsageBreakdown for per-app data tracking.
+# Fixes this revision makes:
+#   - Every feature service is now REACHABLE. The Audit-8 additions came
+#     in as whole interfaces returned by nothing: line management, call
+#     recording, voicemail and screening advertised themselves to a
+#     consumer that had no way to obtain the service, so every backend
+#     invented a root name for each. They are now gated accessors on
+#     `TelephonyService`, the doctrine's reference model: present a
+#     capability, receive the service, and holding the service IS the
+#     authority.
+#   - Satellite and mesh telephony are DELETED, with the reason stated
+#     rather than implied: satellite SOS and mesh calling are 2020s
+#     product features, not timeless contracts, and the same wave deleted
+#     the mesh stack from network.capnp. Nothing in the tree consumes
+#     them.
+#   - `makeCall` can fail. A call that cannot be placed (SIM locked,
+#     network busy, airplane mode) had no representation, so backends
+#     reported it as an empty call list or a synthetic disconnected
+#     state.
+#   - Technology enumerations became open tokens: the cellular
+#     generation catalog (6G has no value), the physical-SIM lifecycle
+#     (an eSIM or a non-cellular backend must map onto card-reader
+#     semantics or lie), and the RCS content-type feature list (the next
+#     RCS release's content type has no ordinal).
+#   - The calendar free/busy contract is gone: calendar.capnp owns
+#     availability, and telephony re-declared it with a different shape.
+#   - Opaque `Data` id namespaces are now typed ids, so a recording id
+#     passed where a message id belongs is a compile error.
+#   - The dead `LanguageFallback` type and its cross-file import of
+#     translation.capnp are gone.
 # ═══════════════════════════════════════════════════════════════════════
 
 struct SimInfo {
     slot @0 :UInt32;
     present @1 :Bool;
     carrierName @2 :Text;
+    # Card identifiers, as reported data. They carry no authority: what
+    # a caller may do is decided by which reference it holds.
     serialNumber @3 :Text;
     phoneNumber @4 :Text;
-    state @5 :SimState;
+    # SIM lifecycle state as an open token ("ready", "pinRequired",
+    # "networkLocked", ...). An eSIM, a soft-SIM or a non-cellular
+    # backend reports its own states instead of mapping onto a
+    # card reader's.
+    state @5 :Text;
     mcc @6 :Text;
     mnc @7 :Text;
     iccid @8 :Text;
     isDataActive @9 :Bool;
-}
-
-enum SimState {
-    absent @0;
-    pinRequired @1;
-    pukRequired @2;
-    networkLocked @3;
-    ready @4;
-    notReady @5;
-    permDisabled @6;
-    cardIOError @7;
-    custom @8;
+    metadata @10 :T.StringMap;
 }
 
 struct CellularNetworkInfo {
     operatorName @0 :Text;
-    type @1 :NetworkType;
+    # Link technology as an open token ("lte", "nr5G", "satellite", ...).
+    # A 6G release is a string, not a new ordinal.
+    type @1 :Text;
     # Signal strength in dBm (typically -120 to -30).
     signalStrength @2 :Int32;
+    signalStrengthMeasured @3 :Bool;
     # Normalized signal level 0-4 (0=none, 4=excellent).
-    signalLevel @3 :UInt32;
-    dataConnected @4 :Bool;
-    dataRoaming @5 :Bool;
-    cellId @6 :UInt32;
-    lac @7 :UInt32;
-    tac @8 :UInt32;
-    volte @9 :Bool;
-    vowifi @10 :Bool;
-    mcc @11 :Text;
-    mnc @12 :Text;
-}
-
-enum NetworkType {
-    unknown @0;
-    gprs @1;
-    edge @2;
-    umts @3;
-    hsdpa @4;
-    hsupa @5;
-    hspa @6;
-    hspaPlus @7;
-    lte @8;
-    nr5G @9;
-    wifi @10;
-    satellite @11;
-    custom @12;
+    signalLevel @4 :UInt32;
+    dataConnected @5 :Bool;
+    dataRoaming @6 :Bool;
+    # Cell identifiers, as reported data.
+    cellId @7 :UInt64;
+    lac @8 :UInt64;
+    tac @9 :UInt64;
+    volte @10 :Bool;
+    vowifi @11 :Bool;
+    mcc @12 :Text;
+    mnc @13 :Text;
+    metadata @14 :T.StringMap;
 }
 
 enum CallState {
-    dialing @0;
-    alerting @1;
-    active @2;
-    held @3;
-    disconnected @4;
-    waiting @5;
-    custom @6;
+    unknown @0;
+    dialing @1;
+    alerting @2;
+    active @3;
+    held @4;
+    disconnected @5;
+    waiting @6;
+    custom @7;
 }
 
 enum CallDirection {
-    incoming @0;
-    outgoing @1;
-    custom @2;
+    unknown @0;
+    incoming @1;
+    outgoing @2;
+    custom @3;
 }
 
+# Call media kind as an open token ("voice", "video", "data").
 enum CallType {
-    voice @0;
-    video @1;
-    data @2;
-    custom @3;
+    unknown @0;
+    voice @1;
+    video @2;
+    data @3;
+    custom @4;
 }
 
 struct CallInfo {
@@ -146,15 +120,27 @@ struct CallInfo {
     forwarded @9 :Bool;
     onHold @10 :Bool;
     slot @11 :UInt32;
+    metadata @12 :T.StringMap;
+}
+
+# A placed call or an honest failure — never an empty list standing in
+# for "the network refused us".
+struct CallResult {
+    union {
+        callId @0 :T.CallId;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
 
 enum DtmfTone {
-    digit0 @0; digit1 @1; digit2 @2; digit3 @3; digit4 @4;
-    digit5 @5; digit6 @6; digit7 @7; digit8 @8; digit9 @9;
-    star @10; hash @11;
-    a @12; b @13; c @14; d @15;
-    flash @16; hold @17; voiceMail @18;
-    custom @19;
+    unknown @0;
+    digit0 @1; digit1 @2; digit2 @3; digit3 @4; digit4 @5;
+    digit5 @6; digit6 @7; digit7 @8; digit8 @9; digit9 @10;
+    star @11; hash @12;
+    a @13; b @14; c @15; d @16;
+    flash @17; hold @18; voiceMail @19;
+    custom @20;
 }
 
 struct IncomingSmsEvent {
@@ -162,16 +148,11 @@ struct IncomingSmsEvent {
     sender @1 :Text;
     body @2 :Text;
     timestamp @3 :T.Timestamp;
-    encoding @4 :SmsEncoding;
+    # Encoding as an open token ("gsm7", "utf16", ...).
+    encoding @4 :Text;
     smsCenter @5 :Text;
     pduType @6 :UInt8;
-}
-
-enum SmsEncoding {
-    gsm7 @0;
-    utf16 @1;
-    eightBit @2;
-    custom @3;
+    metadata @7 :T.StringMap;
 }
 
 struct SmsStatusReport {
@@ -179,15 +160,17 @@ struct SmsStatusReport {
     status @1 :SmsStatus;
     timestamp @2 :T.Timestamp;
     recipient @3 :Text;
+    metadata @4 :T.StringMap;
 }
 
 enum SmsStatus {
-    received @0;
-    stored @1;
-    sent @2;
-    failed @3;
-    pending @4;
-    custom @5;
+    unknown @0;
+    received @1;
+    stored @2;
+    sent @3;
+    failed @4;
+    pending @5;
+    custom @6;
 }
 
 struct MmsPart {
@@ -197,6 +180,7 @@ struct MmsPart {
     filename @3 :Text;
     contentId @4 :Text;
     forwarded @5 :Bool;
+    metadata @6 :T.StringMap;
 }
 
 struct IncomingMmsEvent {
@@ -207,14 +191,16 @@ struct IncomingMmsEvent {
     timestamp @4 :T.Timestamp;
     read @5 :Bool;
     retrievalStatus @6 :MmsRetrievalStatus;
+    metadata @7 :T.StringMap;
 }
 
 enum MmsRetrievalStatus {
-    notRetrieved @0;
-    retrieving @1;
-    retrieved @2;
-    deferred @3;
-    custom @4;
+    unknown @0;
+    notRetrieved @1;
+    retrieving @2;
+    retrieved @3;
+    deferred @4;
+    custom @5;
 }
 
 struct MmsSendRequest {
@@ -222,6 +208,7 @@ struct MmsSendRequest {
     subject @1 :Text;
     parts @2 :List(MmsPart);
     smsFallback @3 :Bool;
+    metadata @4 :T.StringMap;
 }
 
 struct RcsMessage {
@@ -231,31 +218,23 @@ struct RcsMessage {
     timestamp @3 :T.Timestamp;
     direction @4 :CallDirection;
     status @5 :RcsStatus;
-    contentType @6 :RcsContentType;
+    # Content type as an open token ("text", "image", "fileTransfer", ...).
+    # The next RCS release's content type is a string.
+    contentType @6 :Text;
     isDelivered @7 :Bool;
     isRead @8 :Bool;
-    replyTo @9 :Text;
+    replyTo @9 :T.TelephonyMessageId;
+    metadata @10 :T.StringMap;
 }
 
 enum RcsStatus {
-    sending @0;
-    sent @1;
-    delivered @2;
-    displayed @3;
-    failed @4;
-    custom @5;
-}
-
-enum RcsContentType {
-    text @0;
-    image @1;
-    video @2;
-    audio @3;
-    fileTransfer @4;
-    geolocation @5;
-    typingIndicator @6;
-    readReceipt @7;
-    custom @8;
+    unknown @0;
+    sending @1;
+    sent @2;
+    delivered @3;
+    displayed @4;
+    failed @5;
+    custom @6;
 }
 
 struct ConferenceInfo {
@@ -264,10 +243,11 @@ struct ConferenceInfo {
     participantCount @2 :UInt32;
     state @3 :CallState;
     participants @4 :List(CallInfo);
-    # Pagination for participants. Used when participantCount exceeds practical
-    # in-message limits; backend may page participants without affecting
-    # participantCount (which always reports the total).
+    # Pagination for participants. Used when participantCount exceeds
+    # practical in-message limits; the backend may page participants
+    # without affecting participantCount (which always reports the total).
     participantsPagination @5 :T.Pagination;
+    metadata @6 :T.StringMap;
 }
 
 struct DataUsage {
@@ -279,103 +259,203 @@ struct DataUsage {
     periodEnd @5 :T.Timestamp;
 }
 
+# ── Root service ───────────────────────────────────────────────────────
+
 interface TelephonyService {
-    getSimInfo @0 (slot :UInt32) -> (info :SimInfo);
+    getSimInfo @0 (slot :UInt32) -> (result :SimInfoResult);
     getSimSlots @1 () -> (slots :List(SimInfo));
 
     getNetworkInfo @2 () -> (info :CellularNetworkInfo);
 
-    makeCall @3 (number :Text) -> (callId :T.CallId);
+    makeCall @3 (number :T.PhoneNumber) -> (result :CallResult);
     answerCall @4 (callId :T.CallId) -> T.VoidResult;
     hangUp @5 (callId :T.CallId) -> T.VoidResult;
-    getActiveCalls @6 () -> (calls :List(CallInfo));
+    getActiveCalls @6 (pagination :T.Pagination) -> (calls :List(CallInfo), totalCount :UInt32);
 
-    sendDtmf @15 (callId :T.CallId, tone :DtmfTone) -> T.VoidResult;
-    startDtmf @16 (callId :T.CallId, tone :DtmfTone) -> T.VoidResult;
-    stopDtmf @17 (callId :T.CallId) -> T.VoidResult;
+    sendDtmf @7 (callId :T.CallId, tone :DtmfTone) -> T.VoidResult;
+    startDtmf @8 (callId :T.CallId, tone :DtmfTone) -> T.VoidResult;
+    stopDtmf @9 (callId :T.CallId) -> T.VoidResult;
 
-    createConference @18 (participants :List(T.CallId)) -> (conferenceId :T.ConferenceId);
-    mergeCalls @19 (callIds :List(T.CallId)) -> (conferenceId :T.ConferenceId);
-    splitConference @20 (conferenceId :T.ConferenceId) -> (calls :List(CallInfo));
-    addConferenceParticipant @21 (conferenceId :T.ConferenceId, callId :T.CallId) -> T.VoidResult;
-    removeConferenceParticipant @22 (conferenceId :T.ConferenceId, callId :T.CallId) -> T.VoidResult;
-    getConferenceInfo @23 (conferenceId :T.ConferenceId) -> (info :ConferenceInfo);
+    createConference @10 (participants :List(T.CallId)) -> (result :ConferenceResult);
+    mergeCalls @11 (callIds :List(T.CallId)) -> (result :ConferenceResult);
+    splitConference @12 (conferenceId :T.ConferenceId) -> (calls :List(CallInfo));
+    addConferenceParticipant @13 (conferenceId :T.ConferenceId, callId :T.CallId) -> T.VoidResult;
+    removeConferenceParticipant @14 (conferenceId :T.ConferenceId, callId :T.CallId) -> T.VoidResult;
+    getConferenceInfo @15 (conferenceId :T.ConferenceId) -> (result :ConferenceInfoResult);
 
-    sendSms @7 (number :Text, message :Text) -> T.VoidResult;
-    getSmsStatus @24 (messageId :T.TelephonyMessageId) -> (status :SmsStatusReport);
+    sendSms @16 (number :T.PhoneNumber, message :Text) -> T.VoidResult;
+    getSmsStatus @17 (messageId :T.TelephonyMessageId) -> (result :SmsStatusResult);
 
-    sendMms @25 (request :MmsSendRequest) -> (result :MmsResult);
-    downloadMms @26 (slot :UInt32, messageId :Text) -> (event :IncomingMmsEvent);
+    sendMms @18 (request :MmsSendRequest) -> (result :MmsResult);
+    # Download MMS by typed message id.
+    downloadMms @19 (slot :UInt32, messageId :T.TelephonyMessageId) -> (result :IncomingMmsResult);
 
-    sendRcs @27 (message :RcsMessage) -> T.VoidResult;
-    getRcsMessages @28 (chatId :Text, since :T.Timestamp) -> (messages :List(RcsMessage), pagination :T.Pagination, total :UInt64);
+    sendRcs @20 (message :RcsMessage) -> T.VoidResult;
+    getRcsMessages @21 (chatId :Text, since :T.Timestamp, pagination :T.Pagination)
+                  -> (messages :List(RcsMessage), totalCount :UInt64);
 
-    getSignalStrength @8 () -> (strength :Int32, level :UInt32);
-    getDataUsage @9 () -> (usage :DataUsage);
-    setMobileData @10 (enabled :Bool) -> T.VoidResult;
-    isMobileDataEnabled @11 () -> (enabled :Bool);
-    setDataRoaming @12 (enabled :Bool) -> T.VoidResult;
+    getSignalStrength @22 () -> (result :SignalStrengthResult);
+    getDataUsage @23 () -> (usage :DataUsage);
+    setMobileData @24 (enabled :Bool) -> T.VoidResult;
+    isMobileDataEnabled @25 () -> (enabled :Bool);
+    setDataRoaming @26 (enabled :Bool) -> T.VoidResult;
 
-    subscribeCalls @13 () -> (subscription :CallSubscription);
-    cancelCalls @29 (subscription :CallSubscription) -> T.VoidResult;
-    subscribeNetwork @14 () -> (subscription :NetworkSubscription);
+    subscribeCalls @27 () -> (subscription :CallSubscription);
+    cancelCalls @28 (subscription :CallSubscription) -> T.VoidResult;
+    subscribeNetwork @29 () -> (subscription :NetworkSubscription);
     cancelNetwork @30 (subscription :NetworkSubscription) -> T.VoidResult;
     subscribeSms @31 () -> (subscription :SmsSubscription);
     cancelSms @32 (subscription :SmsSubscription) -> T.VoidResult;
     subscribeMms @33 () -> (subscription :MmsSubscription);
     cancelMms @34 (subscription :MmsSubscription) -> T.VoidResult;
 
-    # Download MMS by typed message ID (replaces text-based messageId at ordinal 26).
-    downloadMmsById @35 (slot :UInt32, messageId :T.TelephonyMessageId) -> (event :IncomingMmsEvent);
+    # ── Call management ──
+    holdCall @35 (callId :T.CallId) -> T.VoidResult;
+    unholdCall @36 (callId :T.CallId) -> T.VoidResult;
+    getCallLog @37 (pagination :T.Pagination) -> (calls :List(CallInfo), totalCount :UInt32);
 
-    # -- Audit-8: Call management --
-    holdCall @36 (callId :T.CallId) -> T.VoidResult;
-    unholdCall @37 (callId :T.CallId) -> T.VoidResult;
-    getCallLog @38 (pagination :T.Pagination) -> (calls :List(CallInfo), total :UInt32);
+    # ── Call quality monitoring ──
+    getCallQuality @38 (callId :T.CallId) -> (result :CallQualityResult);
 
-    # -- Audit-8: Calendar integration --
-    getFreeBusy @39 (query :FreeBusyQuery) -> (result :FreeBusyResult);
+    # ── Carrier settings ──
+    getCarrierSettings @39 () -> (settings :CarrierSettings);
+    setCarrierSettings @40 (settings :CarrierSettings) -> T.VoidResult;
 
-    # -- Audit-9: Call quality monitoring --
-    getCallQuality @40 (callId :T.CallId) -> (quality :CallQuality);
+    # ── Emergency numbers ──
+    # Safety-critical: the caller must hold a TelephonyService reference
+    # granted for administration (the capability system is the access
+    # control mechanism). No per-method token.
+    setEmergencyNumber @41 (entry :EmergencyNumber) -> T.VoidResult;
+    getEmergencyNumbers @42 (pagination :T.Pagination) -> (entries :List(EmergencyNumber), totalCount :UInt64);
 
-    # -- Audit-9: Carrier settings --
-    getCarrierSettings @41 () -> (settings :CarrierSettings);
-    setCarrierSettings @42 (settings :CarrierSettings) -> T.VoidResult;
+    # ── Data usage breakdown ──
+    getDataUsageBreakdown @43 (pagination :T.Pagination)
+                          -> (breakdown :List(AppDataUsage), totalCount :UInt64, totalBytes :UInt64);
 
-    # -- Audit-9: Emergency numbers --
-    setEmergencyNumber @43 (number :Text) -> T.VoidResult;
+    # ── E2E encryption for SMS/MMS ──
+    getE2eEncryptionStatus @44 () -> (encryption :E2eEncryption);
+    setE2eEncryption @45 (encryption :E2eEncryption) -> T.VoidResult;
 
-    # -- Audit-9: Data usage breakdown --
-    getDataUsageBreakdown @44 () -> (breakdown :DataUsageBreakdown);
+    # ── Call transfer and forwarding ──
+    transferCall @46 (callId :T.CallId, targetNumber :T.PhoneNumber) -> T.VoidResult;
+    acceptTransfer @47 (callId :T.CallId) -> T.VoidResult;
+    rejectTransfer @48 (callId :T.CallId) -> T.VoidResult;
+    setCallForwarding @49 (enabled :Bool, targetNumber :T.PhoneNumber) -> T.VoidResult;
+    getCallForwarding @50 () -> (result :CallForwardingResult);
 
-    # -- Audit-9: E2E encryption for SMS/MMS --
-    getE2eEncryptionStatus @45 () -> (encryption :E2eEncryption);
-    setE2eEncryption @46 (encryption :E2eEncryption) -> T.VoidResult;
+    # ── Video call support ──
+    startVideoCall @51 (number :T.PhoneNumber) -> (result :CallResult);
+    getVideoQuality @52 (callId :T.CallId) -> (result :VideoQualityResult);
 
-    # -- Audit-9: Call transfer and forwarding --
-    transferCall @47 (callId :T.CallId, targetNumber :Text) -> T.VoidResult;
-    acceptTransfer @48 (callId :T.CallId) -> T.VoidResult;
-    rejectTransfer @49 (callId :T.CallId) -> T.VoidResult;
-    setCallForwarding @50 (enabled :Bool, targetNumber :Text) -> T.VoidResult;
-    getCallForwarding @51 () -> (enabled :Bool, targetNumber :Text);
+    # ── Gated feature services ─────────────────────────────────────────
+    # Four features that used to be unreachable. Each accessor takes a
+    # capability and returns the service; the returned reference is the
+    # authority to use the feature (no per-method token inside).
 
-    # -- Audit-9: Video call support --
-    startVideoCall @52 (number :Text) -> (callId :T.CallId);
-    getVideoQuality @53 (callId :T.CallId) -> (quality :VideoQuality);
+    # Multi-line / dual-SIM management.
+    lineManager @53 (authority :Capability) -> (service :LineManager);
 
-    # -- Audit-9: Emergency calling --
-    getEmergencyNumbers @54 () -> (numbers :List(Text), priorityList :List(Text));
+    # Call recording.
+    callRecording @54 (authority :Capability) -> (service :CallRecordingService);
+
+    # Visual voicemail.
+    voicemail @55 (authority :Capability) -> (service :VoicemailService);
+
+    # Call screening / spam blocking.
+    callScreening @56 (authority :Capability) -> (service :CallScreeningService);
+}
+
+struct SimInfoResult {
+    union {
+        info @0 :SimInfo;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct ConferenceResult {
+    union {
+        conferenceId @0 :T.ConferenceId;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct ConferenceInfoResult {
+    union {
+        info @0 :ConferenceInfo;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct SmsStatusResult {
+    union {
+        report @0 :SmsStatusReport;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct IncomingMmsResult {
+    union {
+        event @0 :IncomingMmsEvent;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
 
 struct MmsResult {
-    ok @0 :Bool;
-    messageId @1 :T.TelephonyMessageId;
-    error @2 :T.Error;
+    union {
+        ok @0 :Void;
+        messageId @1 :T.TelephonyMessageId;
+        error @2 :T.Error;
+        unknown @3 :T.UnknownEvent;
+    }
 }
 
+struct SignalStrengthResult {
+    # dBm, present only when measured.
+    strength @0 :Int32;
+    strengthMeasured @1 :Bool;
+    # Normalized 0-4 level.
+    level @2 :UInt32;
+}
+
+struct CallQualityResult {
+    union {
+        quality @0 :CallQuality;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct VideoQualityResult {
+    union {
+        quality @0 :VideoQuality;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct CallForwardingResult {
+    union {
+        forwarding @0 :CallForwarding;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct CallForwarding {
+    enabled @0 :Bool;
+    targetNumber @1 :T.PhoneNumber;
+    metadata @2 :T.StringMap;
+}
+
+# ── Subscriptions ──────────────────────────────────────────────────────
+
 interface CallSubscription {
-    pull @0 (pagination :T.Pagination) -> (calls :List(CallInfo), total :UInt32);
+    pull @0 (pagination :T.Pagination) -> (calls :List(CallInfo), totalCount :UInt32);
     cancel @1 () -> T.VoidResult;
 }
 
@@ -394,202 +474,186 @@ interface MmsSubscription {
     cancel @1 () -> T.VoidResult;
 }
 
-# ════════════════════════════════════════════════════════════════════════
-# Audit-8 additions: satellite SOS, mesh calling/messaging, calendar
-# free-busy, multi-line management, call recording, visual voicemail,
-# language fallback for IVR systems.
-# ════════════════════════════════════════════════════════════════════════
-
-# ── Satellite Service (emergency off-grid communication) ────────────────
-interface SatelliteService {
-    checkAvailability @0 () -> (available :Bool, signalStrength :Int32);
-    sendSos @1 (message :Text, location :T.GeoCoordinate) -> (messageId :Data);
-    sendMessage @2 (number :Text, message :Text) -> (messageId :Data);
-    receiveMessages @3 () -> (messages :List(SatelliteMessage));
-    subscribeSatellite @4 () -> (subscription :SatelliteSubscription);
-}
-
-struct SatelliteMessage {
-    messageId @0 :Data;
-    sender @1 :Text;
-    body @2 :Text;
-    timestamp @3 :T.Timestamp;
-    channel @4 :SatelliteChannel;
-    encrypted @5 :Bool;
-}
-
-enum SatelliteChannel {
-    sos @0;
-    text @1;
-    tracking @2;
-    weather @3;
-    custom @4;
-}
-
-interface SatelliteSubscription {
-    pull @0 () -> (messages :List(SatelliteMessage));
-    cancel @1 () -> T.VoidResult;
-}
-
-# ── Mesh Call Service (Bluetooth/Wi-Fi mesh calls) ─────────────────────
-interface MeshCallService {
-    meshCall @0 (peerId :Data, callType :CallType) -> (callId :T.CallId);
-    answerMeshCall @1 (callId :T.CallId) -> T.VoidResult;
-    getMeshCallQuality @2 (callId :T.CallId) -> (quality :MeshCallQuality);
-    discoverMeshPeers @3 () -> (peers :List(MeshTelephonyPeer));
-}
-
-struct MeshTelephonyPeer {
-    peerId @0 :Data;
-    name @1 :Text;
-    signalLevel @2 :UInt8;
-    hops @3 :UInt8;
-    capabilities @4 :List(Text);
-    lastSeen @5 :T.Timestamp;
-}
-
-struct MeshCallQuality {
-    signalStrength @0 :Int32;
-    latency @1 :T.Duration;
-    packetLoss @2 :Float32;
-    codec @3 :Text;
-}
-
-# ── Mesh Message Service (mesh messaging) ──────────────────────────────
-interface MeshMessageService {
-    sendMeshMessage @0 (peerId :Data, body :Text) -> (messageId :Data);
-    broadcastMeshMessage @1 (body :Text) -> (messageId :Data);
-    receiveMeshMessages @2 () -> (messages :List(MeshMessage));
-    subscribeMeshMessages @3 () -> (subscription :MeshMessageSubscription);
-}
-
-struct MeshMessage {
-    messageId @0 :Data;
-    sender @1 :Data;
-    body @2 :Text;
-    timestamp @3 :T.Timestamp;
-    hops @4 :UInt8;
-    ttl @5 :UInt8;
-}
-
-interface MeshMessageSubscription {
-    pull @0 () -> (messages :List(MeshMessage));
-    cancel @1 () -> T.VoidResult;
-}
-
-# ── Calendar Free-Busy (availability-aware calling) ────────────────────
-struct FreeBusyQuery {
-    phoneNumber @0 :Text;
-    timeRange @1 :TimeRange;
-    calendarId @2 :Text;
-}
-
-struct TimeRange {
-    start @0 :T.Timestamp;
-    end @1 :T.Timestamp;
-}
-
-struct FreeBusyResult {
-    available @0 :Bool;
-    busyPeriods @1 :List(TimeRange);
-    nextFreeSlot @2 :T.Timestamp;
-    calendarEvent @3 :Text;
-}
+# ── Gated feature services ─────────────────────────────────────────────
 
 # ── Line Manager (multi-line / dual-SIM management) ────────────────────
 interface LineManager {
-    listLines @0 () -> (lines :List(PhoneLine));
-    getActiveLine @1 () -> (line :PhoneLine);
-    setActiveLine @2 (lineId :Text) -> T.VoidResult;
-    getLineSettings @3 (lineId :Text) -> (settings :LineSettings);
+    listLines @0 (pagination :T.Pagination) -> (lines :List(PhoneLine), totalCount :UInt64);
+    getActiveLine @1 () -> (result :PhoneLineResult);
+    setActiveLine @2 (lineId :LineId) -> T.VoidResult;
+    getLineSettings @3 (lineId :LineId) -> (result :LineSettingsResult);
+}
+
+# Line identity is a typed id, not a free-text label.
+struct LineId {
+    id @0 :Text;
+    # Display label, if the backend has one.
+    label @1 :Text;
+    extensions @2 :T.StringMap;
+}
+
+struct PhoneLineResult {
+    union {
+        line @0 :PhoneLine;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct LineSettingsResult {
+    union {
+        settings @0 :LineSettings;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
 
 struct PhoneLine {
-    lineId @0 :Text;
+    lineId @0 :LineId;
     name @1 :Text;
     simSlot @2 :UInt32;
-    phoneNumber @3 :Text;
+    phoneNumber @3 :T.PhoneNumber;
     isActive @4 :Bool;
+    # Capabilities as open tokens.
     capabilities @5 :List(Text);
+    metadata @6 :T.StringMap;
 }
 
 struct LineSettings {
     callForwarding @0 :Bool;
     callWaiting @1 :Bool;
-    callerId @2 :CallerIdMode;
+    # Caller-id presentation as an open token ("show", "hide", ...).
+    callerId @2 :Text;
     voicemail @3 :Text;
+    metadata @4 :T.StringMap;
 }
 
-enum CallerIdMode {
-    show @0;
-    hide @1;
-    custom @2;
-}
-
-# ── Language Fallback (multi-language IVR) ─────────────────────────────
-struct LanguageFallback {
-    primary @0 :Trans.Translation;
-    fallbacks @1 :List(Trans.Translation);
-    maxAttempts @2 :UInt32;
-}
-
-# ── Call Recording Service ─────────────────────────────────────────────
+# ── Call Recording ─────────────────────────────────────────────────────
 interface CallRecordingService {
-    startRecording @0 (callId :T.CallId) -> (recordingId :Data);
-    stopRecording @1 (recordingId :Data) -> T.VoidResult;
-    getRecordingStatus @2 (recordingId :Data) -> (status :RecordingStatus);
-    listRecordings @3 (pagination :T.Pagination)
-        -> (recordings :List(CallRecording), total :UInt64);
-    getRecordingData @4 (recordingId :Data) -> (audio :T.DataHandle, format :RecordAudioFormat);
-    # Audit-10: Recording encryption
-    setRecordingEncryption @5 (recordingId :Data, encryption :RecordingEncryption) -> T.VoidResult;
-    getRecordingEncryption @6 (recordingId :Data) -> (encryption :RecordingEncryption);
+    startRecording @0 (callId :T.CallId) -> (result :RecordingIdResult);
+    stopRecording @1 (recordingId :T.RecordingId) -> T.VoidResult;
+    getRecordingStatus @2 (recordingId :T.RecordingId) -> (result :RecordingStatusResult);
+    listRecordings @3 (pagination :T.Pagination) -> (recordings :List(CallRecording), totalCount :UInt64);
+    getRecordingData @4 (recordingId :T.RecordingId) -> (result :RecordingDataResult);
+    setRecordingEncryption @5 (recordingId :T.RecordingId, encryption :RecordingEncryption) -> T.VoidResult;
+    getRecordingEncryption @6 (recordingId :T.RecordingId) -> (result :RecordingEncryptionResult);
+}
+
+struct RecordingIdResult {
+    union {
+        recordingId @0 :T.RecordingId;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct RecordingStatusResult {
+    union {
+        status @0 :RecordingStatus;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct RecordingDataResult {
+    union {
+        data @0 :RecordingData;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct RecordingEncryptionResult {
+    union {
+        encryption @0 :RecordingEncryption;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
 
 struct CallRecording {
-    recordingId @0 :Data;
+    recordingId @0 :T.RecordingId;
     callId @1 :T.CallId;
     startTime @2 :T.Timestamp;
     endTime @3 :T.Timestamp;
     duration @4 :T.Duration;
-    format @5 :RecordAudioFormat;
+    # Encoding as an open token ("opus", "pcm", ...).
+    format @5 :Text;
     sizeBytes @6 :UInt64;
     encrypted @7 :Bool;
+    metadata @8 :T.StringMap;
 }
 
 enum RecordingStatus {
-    recording @0;
-    paused @1;
-    stopped @2;
-    error @3;
-    custom @4;
+    unknown @0;
+    recording @1;
+    paused @2;
+    stopped @3;
+    error @4;
+    custom @5;
 }
 
-struct RecordAudioFormat {
-    encoding @0 :Text;
-    sampleRate @1 :UInt32;
-    channels @2 :UInt8;
+struct RecordingData {
+    audio @0 :T.DataHandle;
+    format @1 :Text;
+    metadata @2 :T.StringMap;
 }
 
-# ── Voicemail Service (visual voicemail) ───────────────────────────────
+struct RecordingEncryption {
+    enabled @0 :Bool;
+    # Algorithm as an open token ("aes-256-gcm", "chacha20-poly1305", ...).
+    algorithm @1 :Text;
+    # Wrapped key material, as content.
+    encryptedKey @2 :T.DataHandle;
+    # Key identifier for rotation.
+    keyId @3 :T.KeyId;
+    createdAt @4 :T.Timestamp;
+    metadata @5 :T.StringMap;
+}
+
+# ── Visual Voicemail ───────────────────────────────────────────────────
 interface VoicemailService {
-    listVoicemails @0 (pagination :T.Pagination)
-        -> (voicemails :List(Voicemail), total :UInt64);
-    getVoicemail @1 (voicemailId :Data) -> (voicemail :Voicemail);
-    playVoicemail @2 (voicemailId :Data) -> (audio :T.DataHandle, format :RecordAudioFormat);
-    deleteVoicemail @3 (voicemailId :Data) -> T.VoidResult;
-    markRead @4 (voicemailId :Data) -> T.VoidResult;
+    listVoicemails @0 (pagination :T.Pagination) -> (voicemails :List(Voicemail), totalCount :UInt64);
+    getVoicemail @1 (voicemailId :VoicemailId) -> (result :VoicemailResult);
+    playVoicemail @2 (voicemailId :VoicemailId) -> (result :VoicemailDataResult);
+    deleteVoicemail @3 (voicemailId :VoicemailId) -> T.VoidResult;
+    markRead @4 (voicemailId :VoicemailId) -> T.VoidResult;
     subscribeVoicemail @5 () -> (subscription :VoicemailSubscription);
 }
 
+struct VoicemailId { id @0 :UInt64; }
+
+struct VoicemailResult {
+    union {
+        voicemail @0 :Voicemail;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct VoicemailDataResult {
+    union {
+        data @0 :VoicemailData;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
 struct Voicemail {
-    voicemailId @0 :Data;
+    voicemailId @0 :VoicemailId;
     sender @1 :Text;
     timestamp @2 :T.Timestamp;
     duration @3 :T.Duration;
     read @4 :Bool;
     transcription @5 :Text;
     sizeBytes @6 :UInt64;
+    metadata @7 :T.StringMap;
+}
+
+struct VoicemailData {
+    audio @0 :T.DataHandle;
+    format @1 :Text;
+    metadata @2 :T.StringMap;
 }
 
 interface VoicemailSubscription {
@@ -600,72 +664,75 @@ interface VoicemailSubscription {
 struct VoicemailEvent {
     union {
         received @0 :Voicemail;
-        deleted @1 :Data;
+        deleted @1 :VoicemailId;
         custom @2 :Data;
     }
 }
 
-# ── Call Quality (audit-9) ────────────────────────────────────────────────
-
-struct CallQuality {
-    # MOS score (1.0-5.0).
-    mosScore @0 :Float32;
-    # Round-trip latency in milliseconds.
-    latencyMs @1 :UInt32;
-    # Jitter in milliseconds.
-    jitterMs @2 :UInt32;
-    # Packet loss as fraction (0.0-1.0).
-    packetLoss @3 :Float32;
-    # Audio codec in use.
-    codec @4 :Text;
+# ── Call Screening ─────────────────────────────────────────────────────
+interface CallScreeningService {
+    screenCall @0 (callerId :T.PhoneNumber) -> (result :SpamScoreResult);
+    getBlockList @1 (pagination :T.Pagination) -> (numbers :List(T.PhoneNumber), totalCount :UInt64);
+    blockNumber @2 (number :T.PhoneNumber) -> T.VoidResult;
+    unblockNumber @3 (number :T.PhoneNumber) -> T.VoidResult;
 }
 
-# ── Spam Score (audit-9) ─────────────────────────────────────────────────
+struct SpamScoreResult {
+    union {
+        score @0 :SpamScore;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+# ── Quality, Screening and Carrier (audit-9) ───────────────────────────
+
+struct CallQuality {
+    mosScore @0 :Float32;
+    latency @1 :T.Duration;
+    jitter @2 :T.Duration;
+    packetLoss @3 :Float32;
+    # Codec as an open token.
+    codec @4 :Text;
+    metadata @5 :T.StringMap;
+}
+
+struct VideoQuality {
+    width @0 :UInt16;
+    height @1 :UInt16;
+    frameRate @2 :UInt16;
+    bitrate @3 :UInt32;
+    packetLossPercent @4 :Float32;
+    codec @5 :Text;
+    metadata @6 :T.StringMap;
+}
 
 struct SpamScore {
     # Spam likelihood score (0.0 = not spam, 1.0 = definitely spam).
     score @0 :Float32;
-    # Whether call is blocked.
     blocked @1 :Bool;
-    # Category (telemarketer, scam, survey, etc.).
+    # Category as an open token ("telemarketer", "scam", "survey", ...).
     category @2 :Text;
+    metadata @3 :T.StringMap;
 }
-
-# ── Carrier Settings (audit-9) ──────────────────────────────────────────
 
 struct CarrierSettings {
-    # APN name.
     apn @0 :Text;
-    # MMSC URL.
     mmsc @1 :Text;
-    # MMS proxy.
-    mmsProxy @2 :Text;
-    # MMS port.
-    mmsPort @3 :UInt16;
-    # Authentication type.
+    mmsProxy @2 :T.IpAddress;
+    mmsPort @3 :T.Port;
+    # Authentication type as an open token.
     authType @4 :Text;
-    # Whether carrier is default.
     isDefault @5 :Bool;
+    metadata @6 :T.StringMap;
 }
-
-# ── E2E Encryption (audit-9) ─────────────────────────────────────────────
 
 struct E2eEncryption {
-    # Whether E2E encryption is enabled.
     enabled @0 :Bool;
-    # Encryption algorithm.
+    # Algorithm as an open token.
     algorithm @1 :Text;
-    # Whether keys are verified.
     keysVerified @2 :Bool;
-}
-
-# ── Data Usage Breakdown (audit-9) ───────────────────────────────────────
-
-struct DataUsageBreakdown {
-    # Per-app data usage.
-    apps @0 :List(AppDataUsage);
-    # Total as computed from apps.
-    totalBytes @1 :UInt64;
+    metadata @3 :T.StringMap;
 }
 
 struct AppDataUsage {
@@ -673,52 +740,14 @@ struct AppDataUsage {
     appName @1 :Text;
     bytesRx @2 :UInt64;
     bytesTx @3 :UInt64;
+    metadata @4 :T.StringMap;
 }
 
-# ── Call Screening Service (audit-9) ─────────────────────────────────────
-
-interface CallScreeningService {
-    # Screen a call and return spam score.
-    screenCall @0 (callerId :Text) -> (score :SpamScore);
-
-    # Get current block list.
-    getBlockList @1 (pagination :T.Pagination) -> (numbers :List(Text), total :UInt64);
-
-    # Add a number to block list.
-    blockNumber @2 (number :Text) -> T.VoidResult;
-
-    # Remove a number from block list.
-    unblockNumber @3 (number :Text) -> T.VoidResult;
-}
-
-# ── Video Quality (audit-9) ────────────────────────────────────────────────
-
-struct VideoQuality {
-    # Resolution width.
-    width @0 :UInt16;
-    # Resolution height.
-    height @1 :UInt16;
-    # Frame rate in fps.
-    frameRate @2 :UInt16;
-    # Bitrate in kbps.
-    bitrate @3 :UInt32;
-    # Packet loss percentage (0.0-100.0).
-    packetLossPercent @4 :Float32;
-    # Video codec in use.
-    codec @5 :Text;
-}
-
-# ── Recording Encryption (audit-10) ────────────────────────────────────
-
-struct RecordingEncryption {
-    # Whether encryption is enabled.
-    enabled @0 :Bool;
-    # Encryption algorithm (e.g., "aes-256-gcm", "chacha20-poly1305").
-    algorithm @1 :Text;
-    # Encryption key (encrypted with device key, not plaintext).
-    encryptedKey @2 :Data;
-    # Key identifier for key rotation.
-    keyId @3 :Text;
-    # When the key was created.
-    createdAt @4 :T.Timestamp;
+struct EmergencyNumber {
+    # Lower = answered first.
+    priority @0 :UInt32;
+    number @1 :T.PhoneNumber;
+    # Region this number applies to (open token; empty = everywhere).
+    region @2 :Text;
+    metadata @3 :T.StringMap;
 }

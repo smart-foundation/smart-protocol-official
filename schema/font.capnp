@@ -14,8 +14,9 @@
 #   - FontSession.matchFonts paginated (maxResults → T.Pagination).
 #   - FontEventStream has cancel() (already present).
 #   - FontCapability has other variant for forward compatibility.
-#   - FontWeight has other variant for forward compatibility.
-#   - FontStretch has other variant for forward compatibility.
+#   - FontWidth is the one width-axis vocabulary; FontStretch (a
+#     verbatim copy of it) and FontWeight (nine buckets of a
+#     1-1000 continuum) are deleted — see FontDescriptor.
 #   - FontWidth has other variant for forward compatibility.
 #   - FontSlant has other variant for forward compatibility.
 #   - FontSource has other variant for forward compatibility.
@@ -42,6 +43,7 @@
 # ══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
 
 # ══════════════════════════════════════════════════════════════════════
 # SESSION
@@ -190,6 +192,18 @@ interface FontSession {
 # ══════════════════════════════════════════════════════════════════════
 # EXISTING FONT INTERFACE
 # Ordinals 0-6 preserved exactly as-is.
+#
+# This is the host-injected root: the font service is handed to the
+# system at boot, so "returned by no method" is the protocol's normal
+# shape for a root — the same as System, Audio and Files.
+#
+# What was NOT normal is that `FontSession` above was returned by
+# nothing at all. The file's own session half — per-application
+# matching, hinting, accessibility, cache scoping — was uncallable
+# contract, while the flat methods below are global last-writer-wins
+# state on shared hardware. `openSession` closes that hole (R8): it is
+# how a client obtains the session the whole second half of this file
+# was written for.
 # ══════════════════════════════════════════════════════════════════════
 
 interface Font {
@@ -201,6 +215,13 @@ interface Font {
     getMetrics @4 (family :Text, style :FontStyle) -> (metrics :FontMetrics);
     getGlyphInfo @5 (family :Text, style :FontStyle, codepoints :List(UInt32)) -> (glyphs :List(GlyphInfo));
     measureText @6 (family :Text, style :FontStyle, text :Text) -> (width :Float32, height :Float32);
+
+    # Gated once, at acquisition. Holding the returned session IS the
+    # authority to match, load and configure fonts for this application;
+    # none of FontSession's methods takes a capability token, because a
+    # per-method parameter would duplicate the authority the reference
+    # already carries (ai.capnp:49-60).
+    openSession @7 (authority :Capability) -> (session :FontSession);
 }
 
 # ══════════════════════════════════════════════════════════════════════
@@ -298,15 +319,35 @@ struct FontQuery {
 
 # -- Font Descriptor --
 
+# A font request. Each axis has ONE spelling, and the numeric axes are
+# numbers:
+#
+#   weight   — was TWO spellings in this file: FontStyle.weight :UInt16
+#              (the OpenType `wght` continuum, 1-1000) and
+#              FontDescriptor.weight :FontWeight (nine named buckets)
+#              with no defined mapping between them. Is FontWeight.medium
+#              500? Is semibold 600? Nothing said, so a backend filling
+#              one and a client reading the other disagreed — and a
+#              variable font at wght=350 could not be described by the
+#              enum AT ALL. The enum is deleted; the number stays.
+#   width    — was FontWidth here and a VERBATIM COPY of it named
+#              FontStretch on this very struct, so one descriptor
+#              carried the same axis twice under two names, and a
+#              backend could fill them with different values with no
+#              rule. FontStretch is deleted; FontWidth remains.
+#   slant    — a continuous angle, correctly a number.
+#
+# `style` is removed because it already contained weight/width/slant:
+# three redundant encodings inside one struct that could disagree.
 struct FontDescriptor {
     familyName  @0 :Text;
-    style       @1 :FontStyle;
-    weight      @2 :FontWeight;
-    stretch     @3 :FontStretch;
-    slant       @4 :Float32;
-    opticalSize @5 :UInt32;
-    features    @6 :List(FontFeature);
-    metadata    @7 :List(T.Meta);
+    # OpenType wght, 1-1000. 400 = regular, 700 = bold.
+    weight      @1 :UInt16;
+    width       @2 :FontWidth;
+    slant       @3 :Float32;
+    opticalSize @4 :UInt32;
+    features    @5 :List(FontFeature);
+    metadata    @6 :List(T.Meta);
 }
 
 struct FontFeature {
@@ -315,32 +356,6 @@ struct FontFeature {
 }
 
 # -- Enums --
-
-enum FontWeight {
-    thin       @0;
-    extralight @1;
-    light      @2;
-    regular    @3;
-    medium     @4;
-    semibold   @5;
-    bold       @6;
-    extrabold  @7;
-    black      @8;
-    other      @9;
-}
-
-enum FontStretch {
-    ultraCondensed @0;
-    extraCondensed @1;
-    condensed      @2;
-    semiCondensed  @3;
-    normal         @4;
-    semiExpanded   @5;
-    expanded       @6;
-    extraExpanded  @7;
-    ultraExpanded  @8;
-    other          @9;
-}
 
 # -- Font Family (extended) --
 
@@ -394,16 +409,16 @@ struct OpenTypeInfo {
 
 struct FontMatchQuery {
     familyName  @0 :Text;
-    style       @1 :FontStyle;
-    weight      @2 :FontWeight;
-    stretch     @3 :FontStretch;
-    slant       @4 :Float32;
-    opticalSize @5 :UInt32;
-    language    @6 :Text;
-    features    @7 :List(FontFeature);
-    hinting     @8 :HintingMode;
-    antialias   @9 :Bool;
-    metadata   @10 :List(T.Meta);
+    # Same single-spelling axes as FontDescriptor — see the note there.
+    weight      @1 :UInt16;
+    width       @2 :FontWidth;
+    slant       @3 :Float32;
+    opticalSize @4 :UInt32;
+    language    @5 :Text;
+    features    @6 :List(FontFeature);
+    hinting     @7 :HintingMode;
+    antialias   @8 :Bool;
+    metadata   @9 :List(T.Meta);
 }
 
 enum HintingMode {
@@ -483,7 +498,7 @@ struct FallbackChainEntry {
     language     @0 :Text;
     familyNames  @1 :List(Text);
     fontCount    @2 :UInt32;
-    systemDefault @3 :Bool;
+    builtinDefault @3 :Bool;
 }
 
 # -- Font Directories --
@@ -499,14 +514,14 @@ struct FontDirectory {
 # -- Family Filter --
 
 struct FamilyFilter {
-    style    @0 :FontStyle;
-    weight   @1 :FontWeight;
-    stretch  @2 :FontStretch;
-    source   @3 :FontSource;
-    language @4 :Text;
-    variable @5 :T.BoolFilter;
+    # Same single-spelling axes as FontDescriptor — see the note there.
+    weight   @0 :UInt16;
+    width    @1 :FontWidth;
+    source   @2 :FontSource;
+    language @3 :Text;
+    variable @4 :T.BoolFilter;
     # Pagination for unbounded result sets.
-    page     @6 :T.Pagination;
+    page     @5 :T.Pagination;
 }
 
 # ══════════════════════════════════════════════════════════════════════
@@ -605,6 +620,10 @@ struct FontUnloadedEvent {
 # QUERY
 # ══════════════════════════════════════════════════════════════════════
 
+# A query union with an `unknown` arm. Without it, a backend receiving a
+# query kind it does not know has no way to say "I don't understand this
+# query kind" — it must answer `notSupported` for everything, which is
+# indistinguishable from "unsupported feature" (ai.capnp:43-47).
 struct FontQueryRequest {
     union {
         allFamilies          @0 :Void;
@@ -615,10 +634,20 @@ struct FontQueryRequest {
         fallbackChainForLang @5 :Text;
         fontDirectories      @6 :Void;
         fontServerCapabilities @7 :Void;
-        custom               @8 :CustomFontQuery;
+        unknown              @8 :UnknownFontQuery;
     }
 }
 
+# Unknown values are ignored, never rejected (ai.capnp:43-47).
+struct UnknownFontQuery {
+    typeId @0 :UInt64;
+    payload @1 :Data;
+}
+
+# Backend-specific query escape, kept for the queries a particular font
+# server understands beyond the contract. Unlike `unknown`, this is a
+# query the caller DELIBERATELY wrote and a backend is expected to
+# attempt.
 struct CustomFontQuery {
     name       @0 :Text;
     parameters @1 :List(T.Meta);

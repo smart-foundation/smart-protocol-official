@@ -29,11 +29,25 @@ struct SearchProviderId { id @0 :UInt64; }
 struct SettingKey     { id @0 :UInt64; }
 struct AppId          { id @0 :UInt64; }
 struct BackupId       { id @0 :UInt64; }
+# Identity of one retained crash dump. Crash dumps were addressed by
+# free Text (a path or a backend-chosen string), which made the crash
+# path fragile exactly where fragility is least affordable.
+struct CrashDumpId    { id @0 :UInt64; }
+# Identity of one process group. A group is not a process: the
+# pre-revamp process.capnp typed group ids as T.ProcessId, so a caller
+# could pass a group id where a process id was meant.
+struct ProcessGroupId { id @0 :UInt64; }
+# Identity of one debugger breakpoint/watchpoint.
+struct BreakpointId   { id @0 :UInt64; }
 struct BiometricId    { id @0 :UInt64; }
 struct AuthMethodId   { id @0 :UInt64; }
 struct AuthTokenId    { id @0 :UInt64; }
 struct PermissionId   { id @0 :UInt64; }
 struct BootStageId    { id @0 :UInt64; }
+# Identity of one selectable boot entry (one OS option in the boot menu).
+# Opaque: the bootloader's own numbering, never a path or a title —
+# boot.capnp's BootService configuration plane addresses entries by this.
+struct BootEntryId    { id @0 :UInt64; }
 struct DeviceAddress  { id @0 :UInt64; }
 struct UpgradeId      { id @0 :UInt64; }
 struct ContactId      { id @0 :UInt64; }
@@ -68,6 +82,7 @@ struct Version {
     preRelease @3 :Text;
     buildMetadata @4 :Text;
     epoch @5 :UInt32;
+    metadata @6 :StringMap;
 }
 
 # ── Geometry ─────────────────────────────────────────────────
@@ -78,6 +93,33 @@ struct Vec3  { x @0 :Float32; y @1 :Float32; z @2 :Float32; }
 struct Vec4  { x @0 :Float32; y @1 :Float32; z @2 :Float32; w @3 :Float32; }
 
 struct Quaternion { x @0 :Float32; y @1 :Float32; z @2 :Float32; w @3 :Float32; }
+
+# ── Spatial Pose ─────────────────────────────────────────────
+# The one spatial pose: where a thing is, which way it faces, and how it is
+# moving. Shared by three domains — location.capnp (a device's own pose),
+# input.capnp (a tracked pointer or controller) and any future domain that
+# addresses something in space — so it lives here rather than as a
+# per-domain copy that drifts.
+#
+# compositor.capnp keeps `SurfaceSpatialPose`, a deliberately different
+# shape: a surface's pose is a placement (position, orientation, scale, the
+# anchor it is bound to), not a motion state, and it uses `Vec4` because a
+# surface carries no quaternion normalisation requirement. Merging the two
+# would have forced velocity onto a surface and an anchor onto a device.
+#
+# Orientation is a `Quaternion`, not Euler angles: Euler has gimbal lock
+# and twelve spellings of the same rotation, which two backends would
+# resolve differently.
+
+struct SpatialPose {
+    position        @0 :Vec3;
+    rotation        @1 :Quaternion;
+    # Linear velocity in meters/second, and angular velocity in
+    # radians/second. Zero when the producer cannot measure it — the
+    # absence of a measurement is a zero here, not an absent field.
+    velocity        @2 :Vec3;
+    angularVelocity @3 :Vec3;
+}
 
 struct Rect3D {
     position @0 :Vec3;
@@ -103,12 +145,18 @@ struct Transform2D {
 
 # ── Time ─────────────────────────────────────────────────────
 
-struct Timestamp { nanoseconds @0 :UInt64; }
-struct Duration  { nanoseconds @0 :UInt64; }
+struct Timestamp { nanoseconds @0 :UInt64; 
+    metadata @1 :StringMap;
+}
+struct Duration  { nanoseconds @0 :UInt64; 
+    metadata @1 :StringMap;
+}
 
 # Monotonic timestamp immune to system clock adjustments (NTP, DST, manual changes).
 # Use for timeouts, benchmarks, interval measurement.
-struct MonotonicTimestamp { nanoseconds @0 :UInt64; }
+struct MonotonicTimestamp { nanoseconds @0 :UInt64; 
+    metadata @1 :StringMap;
+}
 
 struct FrameRate {
     numerator   @0 :UInt32;
@@ -146,10 +194,12 @@ struct StringMap {
 struct StringMapEntry {
     key @0 :Text;
     value @1 :Text;
+    metadata @2 :StringMap;
 }
 
 struct StringDataMap {
     entries @0 :List(StringDataMapEntry);
+    metadata @1 :StringMap;
 }
 
 struct StringDataMapEntry {
@@ -184,6 +234,7 @@ struct VoidResult {
         success @0 :Void;
         error @1 :Error;
     }
+    metadata @2 :StringMap;
 }
 
 struct BoolResult {
@@ -191,6 +242,7 @@ struct BoolResult {
         ok @0 :Bool;
         error @1 :Error;
     }
+    metadata @2 :StringMap;
 }
 
 struct Error {
@@ -198,6 +250,75 @@ struct Error {
     message @1 :Text;
     context @2 :Text;
     retryable @3 :Bool;
+    metadata @4 :StringMap;
+}
+
+# ── The one canonical unknown-event carrier ──────────────────
+# Every event union in the protocol terminates with
+# `unknown @N :T.UnknownEvent` (TIMELESSNESS.md:98, DESIGN_PRINCIPLES
+# "Forward compatibility"). Promoting it here means R7 is checkable
+# against ONE type instead of a private copy per schema: a consumer that
+# does not recognise an event kind can still read `typeId` and skip the
+# payload without guessing what the bytes mean.
+#
+# `typeId` is a caller/producer-assigned discriminant — there is no
+# published registry and none is needed, because an unrecognised id is
+# ignored, never rejected (the unknown-tolerance rule ai.capnp states
+# at :42-47).
+#
+# ── THE ONE DECLARED R2 EXCEPTION ─────────────────────────────────────
+# `payload` is inline `Data`, and the validator must never report it. The
+# reasoning, because "inline is a copy" is otherwise a hard rule:
+#
+#   1. The event is, BY DEFINITION, not modelled. If the producer could
+#      have described the payload it would have declared a typed arm; the
+#      `unknown` arm exists precisely for the case where it could not.
+#   2. A `T.DataHandle` is a choice, not a format: its producer must decide
+#      inline-or-buffer, and must therefore know the payload's size. An
+#      unknown payload has no known size, so the choice cannot be made
+#      correctly — a backend that guessed "small" and inlined would still
+#      be the copy the rule forbids, and one that guessed "large" would pay
+#      a buffer registration for a value it is explicitly not interpreting.
+#   3. The `BufferId` arm of `T.DataHandle` requires the producer and the
+#      consumer to share a buffer namespace. A producer emitting an event
+#      it cannot model, over a transport that shares no such namespace with
+#      its consumer, cannot construct a handle at all. Making the field a
+#      handle would therefore make the escape hatch unimplementable on
+#      exactly the transports where it matters most.
+#   4. Every alternative leaks the thing the arm is for. Adding typed arms
+#      per domain re-freezes today's list; making the payload `Text`
+#      asserts it is UTF-8; making it a `T.StringMap` asserts it is pairs.
+#
+# So the protocol carries exactly ONE inline payload, here, where opacity
+# is the point. `scripts/validate.py` names this exemption explicitly
+# (R2_ESCAPE_HATCH) and scopes it to this struct in this file, so a second
+# schema cannot inherit it by re-declaring a struct of the same name.
+
+struct UnknownEvent {
+    typeId @0 :UInt64;
+    payload @1 :Data;
+}
+
+# ── Execution lifecycle ──────────────────────────────────────
+# The one canonical state of a running thread of control, shared by the
+# kernel (task observation), process.capnp and every lifecycle schema.
+#
+# The previous spellings were POSIX vocabularies — `zombie`, `defunct`,
+# `sleeping`, `newBorn` — which a capability kernel or an actor runtime
+# must either fake or extend an eternal enum to express. These four are
+# the universal set DESIGN_PRINCIPLES.md:178 / TIMELESSNESS.md:76 order:
+# every execution context is doing work, waiting on something, held by
+# an observer, or finished. `custom` carries anything a backend cannot
+# express in those terms, and `unknown @0` is the neutral sentinel so an
+# absent field never means "running".
+
+enum ExecutionState {
+    unknown @0;
+    active @1;
+    blocked @2;
+    suspended @3;
+    terminated @4;
+    custom @5;
 }
 
 enum ErrorCode {
@@ -229,6 +350,7 @@ enum ErrorCode {
 struct Meta {
     key @0 :Text;
     value @1 :MetaValue;
+    metadata @2 :StringMap;
 }
 
 struct MetaValue {
@@ -238,6 +360,10 @@ struct MetaValue {
         real @2 :Float64;
         boolean @3 :Bool;
         bytes @4 :Data;
+        # A value kind a backend must carry that is not named above. It
+        # arrives as opaque bytes plus a declared content type, so the
+        # consumer can decode it or skip it.
+        custom @5 :Data;
     }
 }
 
@@ -354,26 +480,20 @@ enum WindowLayer {
 }
 
 # ── Touch Gestures ───────────────────────────────────────────
-
-enum TouchGesture {
-    none @0;
-    tap @1;
-    doubleTap @2;
-    longPress @3;
-    pinch @4;
-    rotate @5;
-    swipe @6;
-    edgeSwipe @7;
-}
-
-struct GestureEvent {
-    gesture @0 :TouchGesture;
-    position @1 :Vec2i;
-    scale @2 :Float32;
-    rotation @3 :Float32;
-    velocity @4 :Vec2;
-    fingerCount @5 :UInt32;
-}
+# DELETED in the 2026-10-10 integration pass, together with the
+# `GestureEvent` struct that was its only reader. The pair was an
+# unconsumed foundation shadow: no schema outside types.capnp named either
+# type, so every schema paid to parse types.capnp for a gesture vocabulary
+# nothing spoke. The live gesture contract is input.capnp's `GestureEvent`
+# (`gestureId`, `timestamp`, `surfaceId`, `touches :List(TouchPoint)`),
+# which is the shape a gesture subscription actually delivers and which a
+# backend can populate. `shell.capnp`'s navigation command is
+# `ShellGesture`, a third and unrelated concept.
+#
+# The lesson recorded here: the foundation earns a type by being consumed
+# by two or more domains, not by being a plausible idea. A vocabulary that
+# only the foundation itself reads is dead weight, and deleting it is the
+# same call the same pass made for `TlsVersion`.
 
 # ── Data Handles ─────────────────────────────────────────────
 # For payloads that may exceed 1KB. Use inline for small data,
@@ -446,6 +566,15 @@ struct ActivityId        { id @0 :UInt64; }
 struct ServiceHandleId   { id @0 :UInt64; }
 
 # ── Service Identity ─────────────────────────────────────────
+# `ServiceId` (line 22) is THE canonical service identity: every schema
+# that names a service uses it.
+#
+# `ServiceName` and `ServiceHandleId` are older spellings of the same
+# idea, kept only so that a schema in mid-rewrite still compiles. The name
+# is the trap — both hold an opaque UInt64, so `stop (name :ServiceName)`
+# reads as "stop by name" while it means "stop by id": a caller must
+# resolve the name through the discovery contract first. New schemas use
+# `T.ServiceId`; the rest fold onto it during the revamp.
 
 struct ServiceName       { id @0 :UInt64; }
 struct ManifestName      { id @0 :UInt64; }
@@ -566,11 +695,11 @@ enum TrustLevel {
 # CredentialId is an alias for AccessCredentialId.
 
 # ── Subscription Error ─────────────────────────────────────
-# Standardized subscription pull response.
-
-struct SubscriptionOk {
-    ok @0 :Bool;
-}
+# DELETED (pre-release revamp). `SubscriptionOk { ok :Bool }` was the
+# third spelling of the same dead idea (see the note above): a boolean
+# that reports success without reporting WHAT succeeded. A subscription
+# that has nothing to deliver returns an empty batch, which is the
+# answer, not a failure.
 
 # ── Capability Handle ─────────────────────────────────────
 struct CapabilityHandle { handle @0 :UInt64; }
@@ -679,6 +808,7 @@ struct Language {
     code @0 :Text;     # ISO 639-1 code (e.g., "en", "fr", "de")
     name @1 :Text;     # Human-readable name (e.g., "English", "French")
     nativeName @2 :Text;  # Name in the language itself (e.g., "English", "Français")
+    metadata @3 :StringMap;
 }
 
 # ── Date ─────────────────────────────────────────────────────
@@ -703,6 +833,7 @@ struct Warning {
     code @0 :UInt32;   # Warning code (backend-defined, 0 = generic)
     message @1 :Text;  # Human-readable warning description
     context @2 :Text;  # Optional additional context
+    metadata @3 :StringMap;
 }
 
 # ── URI ──────────────────────────────────────────────────────
@@ -716,6 +847,7 @@ struct Uri {
     path @2 :Text;        # path component
     query @3 :Text;       # query string (without '?')
     fragment @4 :Text;    # fragment (without '#')
+    metadata @5 :StringMap;
 }
 
 # ── File Path ────────────────────────────────────────────────
@@ -726,6 +858,7 @@ struct Uri {
 struct FilePath {
     path @0 :Text;        # Platform-independent path (POSIX-style with '/')
     isAbsolute @1 :Bool;  # Whether path is absolute
+    metadata @2 :StringMap;
 }
 
 # ── IP Address ───────────────────────────────────────────────
@@ -760,13 +893,20 @@ struct Port {
     number @0 :UInt16;  # 0–65535
 }
 
-# ── Bluetooth Address ────────────────────────────────────────
-# network.capnp BluetoothDevice.address is bare Text.
-# A typed struct enforces the 6-byte MAC format and enables
-# privacy-aware address handling (public vs random).
+# ── MAC Address ──────────────────────────────────────────────
+# The foundation's 6-octet link-layer address. It carries ANY MAC —
+# Wi-Fi, Ethernet, Bluetooth, a future link — so the name states the shape
+# and not one of its users. It was spelled `BluetoothAddress` until the
+# 2026-10-10 integration pass, which is exactly the X1 contradiction the
+# verifier recorded: network.capnp was typing Wi-Fi BSSIDs and Ethernet
+# hardware addresses with a type named after a radio.
+#
+# A typed struct enforces the 6-byte format and enables privacy-aware
+# address handling (public vs random) through `metadata`.
 
-struct BluetoothAddress {
+struct MacAddress {
     address @0 :Text;  # 6 colon-separated hex octets (e.g., "AA:BB:CC:DD:EE:FF")
+    metadata @1 :StringMap;
 }
 
 # ── MIME Type ────────────────────────────────────────────────
@@ -787,6 +927,7 @@ struct MimeType {
 
 struct Frequency {
     hertz @0 :Float64;  # Value in Hertz. 60.0 = 60 Hz display refresh.
+    metadata @1 :StringMap;
 }
 
 # ── Point ──────────────────────────────────────────────────────
@@ -881,11 +1022,6 @@ struct ExtendedColor {
 # StringMap preserves insertion order. Use when iteration order
 # matters (e.g., CSS property order, HTTP header order, config).
 
-struct OrderedStringMap {
-    entries @0 :List(StringMapEntry);
-}
-
-# ── Resource Usage with Timestamp ─────────────────────────────
 # Extended resource usage with acquisition timestamp for lifecycle
 # tracking (expiry, sampling windows, billing windows).
 
@@ -901,32 +1037,41 @@ struct ResourceUsage {
 }
 
 # ── Subscription Result ───────────────────────────────────────
-# Standardized subscription pull result. Replaces ad-hoc
-# SubscriptionOk and inline result unions across schemas.
-
-struct SubscriptionResult {
-    union {
-        ok @0 :SubscriptionData;
-        empty @1 :Void;       # No data available (not an error)
-        ended @2 :Void;       # Stream ended (clean completion)
-        error @3 :Error;
-    }
-}
-
-struct SubscriptionData {
-    data @0 :DataHandle;
-    sequence @1 :UInt64;      # Monotonic sequence for ordering/dedup
-    timestamp @2 :Timestamp;  # When data was produced
-}
+# DELETED (pre-release revamp). `SubscriptionResult`, `SubscriptionData`
+# and `SubscriptionOk` standardized nothing: zero schemas referenced
+# them, and every live subscription in the protocol returns either a
+# plain value or a `T.VoidResult`. Two canonical subscription shapes in
+# one file is a fork site — a 2028 implementer must guess which is
+# normative.
+#
+# The live convention, stated once here: a subscription is an INTERFACE
+# REFERENCE. Holding it is the authority to pull; `pull` takes a bound
+# (maxEvents / pagination) and returns the batch plus a total for gap
+# detection; `cancel` releases it. There is no subscription id parameter
+# anywhere in the protocol, because a second identity path for one
+# subscription is the two-authority-paths anti-pattern
+# (DESIGN_PRINCIPLES.md:394-396, ai.capnp:49-54).
 
 # ── Key Code ─────────────────────────────────────────────────
-# input.capnp emulateKey takes raw UInt32 scancode/keycode.
 # A typed KeyCode improves cross-platform key emulation.
-# The backend translates platform-specific codes; the protocol
-# defines a cross-platform semantic key space.
+#
+# THE VALUE SPACE IS PUBLISHED, AND IT IS NOT OURS TO INVENT: `code` is a
+# USB HID keyboard/usage-page-0x07 usage id, as input.capnp:17-27 states.
+# That page is a stable, vendor-neutral, already-published numbering of
+# physical keys, so the protocol inherits a domain rather than defining a
+# second one. `input.capnp` is the file that owns the emulation and
+# observation surface and carries the full statement of the mapping; a
+# backend translates its platform's native codes to and from this page.
+#
+# What is deliberately NOT here is a semantic key space (a named set like
+# "KEY_ENTER"), which is what this comment used to claim: a semantic space
+# is a second vocabulary to keep in agreement with the HID page forever,
+# and a 2046 keyboard would have no ordinal in it. For the semantic
+# direction, `compositor.capnp.LogicalKey` is the open token + Unicode
+# codepoint pair.
 
 struct KeyCode {
-    code @0 :UInt32;  # Cross-platform semantic key code
+    code @0 :UInt32;  # USB HID usage page 0x07 (keyboard) usage id
 }
 
 # ── Capability Identity ──────────────────────────────────────
@@ -1015,6 +1160,32 @@ struct TaskId { id @0 :UInt64; }
 
 struct ActionId { id @0 :UInt64; }
 
+# ── Window Manager Identity ──────────────────────────────────
+# Promoted in the 2026-10-10 integration pass (batch D's cross-batch
+# item 2). windowmanager.capnp defined these locally because the
+# foundation had no home for them; a window group and a snap zone are both
+# addressed by more than one schema-side concept and both are server-issued
+# opaque references, which is the definition of a foundation id wrapper.
+#   - WindowGroupId: correlates the windows a user grouped, so an app does
+#     not need a hand-rolled client-side map to find its siblings.
+#   - SnapZoneId: addresses one snap zone on one output.
+
+struct WindowGroupId { id @0 :UInt64; }
+struct SnapZoneId    { id @0 :UInt64; }
+
+# ── Intent Identity ──────────────────────────────────────────
+# Promoted in the same pass, from intent.capnp. A chain, a trace and a
+# history entry are all server-issued and opaque; intent.capnp addresses
+# them, and a consumer that received a chain id from `executeChain` must be
+# able to name its type without importing the intent schema.
+#   - IntentChainId: one multi-step dispatch, and what its status is.
+#   - IntentTraceId: one recorded run of a chain.
+#   - IntentHistoryId: one entry in the dispatch history.
+
+struct IntentChainId   { id @0 :UInt64; }
+struct IntentTraceId   { id @0 :UInt64; }
+struct IntentHistoryId { id @0 :UInt64; }
+
 # ══════════════════════════════════════════════════════════════
 # BATCH 13 — AUDIT-7 ZERO-COST PRIMITIVES
 # All types below were identified during audit-6 review or surfaced
@@ -1088,7 +1259,7 @@ struct EndpointId { id @0 :UInt64; }
 # ── Mount Identity ────────────────────────────────────────────
 # Promoted from mount.capnp (new in Batch 13). A mount point is
 # referenced by files.capnp (getDiskUsage), storage.capnp (block
-# devices), and filesystem.capnp (mount options). Typed ID
+# devices), and mount.capnp (mount options). Typed ID
 # prevents accidental string-comparison between mount points and
 # arbitrary file paths.
 #
@@ -1130,12 +1301,12 @@ struct SandboxId { id @0 :UInt64; }
 # ── Storage Pool Identity ─────────────────────────────────────
 # Promoted from storage.capnp (new in Batch 13). Storage pools
 # (LVM volume groups, ZFS pools, btrfs pools, RAID arrays) are
-# referenced by storage.capnp itself and by filesystem.capnp
+# referenced by storage.capnp itself and by mount.capnp
 # (pool-backed mount sources).
 #
 # Cross-schema impact:
 #   - storage.capnp: StoragePoolId (replace local definition)
-#   - filesystem.capnp: mount options referencing storage pool
+#   - mount.capnp: mount options referencing storage pool
 #   - backup.capnp: backup destination pool handle
 
 struct StoragePoolId { id @0 :UInt64; }
@@ -1157,12 +1328,12 @@ struct VolumeId { id @0 :UInt64; }
 # Promoted from storage.capnp (new in Batch 13). Storage
 # snapshots (ZFS, btrfs, LVM thin) are referenced by
 # storage.capnp, backup.capnp (PIT backups), and
-# filesystem.capnp (snapshot-aware operations).
+# mount.capnp (snapshot-aware operations).
 #
 # Cross-schema impact:
 #   - storage.capnp: SnapshotId (replace local definition)
 #   - backup.capnp: snapshot-based backup references
-#   - filesystem.capnp: snapshot-aware mount operations
+#   - mount.capnp: snapshot-aware mount operations
 
 struct SnapshotId { id @0 :UInt64; }
 
@@ -1339,6 +1510,7 @@ struct DisplayConfiguration {
     preferredColorSpace @9 :ColorSpace;
     # Default frame timing.
     frameTiming @10 :FrameTiming;
+    metadata @11 :StringMap;
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -1412,12 +1584,14 @@ struct EmailAddress {
     local @0 :Text;    # Part before @
     domain @1 :Text;   # Part after @
     raw @2 :Text;      # Full email address (for display/legacy)
+    metadata @3 :StringMap;
 }
 
 struct PhoneNumber {
     countryCode @0 :UInt16;
     nationalNumber @1 :Text;
     raw @2 :Text;       # E.164 format (e.g., "+12025551234")
+    metadata @3 :StringMap;
 }
 
 # ── Network Primitives ──────────────────────────────────────
@@ -1427,11 +1601,13 @@ struct PhoneNumber {
 struct Ipv4Range {
     start @0 :IpAddressV4;
     end @1 :IpAddressV4;
+    metadata @2 :StringMap;
 }
 
 struct Ipv6Range {
     start @0 :IpAddressV6;
     end @1 :IpAddressV6;
+    metadata @2 :StringMap;
 }
 
 # ── Geographic Primitives ───────────────────────────────────
@@ -1459,6 +1635,7 @@ struct FileExtension {
     extension @0 :Text;          # e.g., ".pdf", ".jpg"
     mimeType @1 :MimeType;       # Associated MIME type
     isExecutable @2 :Bool;
+    metadata @3 :StringMap;
 }
 
 # ── Encoding Primitives ─────────────────────────────────────
@@ -1468,10 +1645,12 @@ struct FileExtension {
 struct Base64 {
     data @0 :Text;       # Base64-encoded string
     padding @1 :Bool;    # Whether padding characters present
+    metadata @2 :StringMap;
 }
 
 struct HexString {
     data @0 :Text;       # Hex-encoded string (0-9, a-f)
+    metadata @1 :StringMap;
 }
 
 # ── Regex ───────────────────────────────────────────────────
@@ -1481,6 +1660,7 @@ struct HexString {
 struct Regex {
     pattern @0 :Text;    # Regular expression pattern
     flags @1 :Text;      # Optional flags (e.g., "i", "m", "s")
+    metadata @2 :StringMap;
 }
 
 # ── Numeric Primitives ──────────────────────────────────────
@@ -1493,18 +1673,6 @@ struct BigInteger {
 }
 
 # ── Ordered Map ─────────────────────────────────────────────
-# Generic ordered map with typed keys. OrderedStringMap exists
-# but no generic ordered map with arbitrary key types.
-
-struct OrderedMapEntry {
-    key @0 :Text;
-    value @1 :MetaValue;
-}
-
-struct OrderedMap {
-    entries @0 :List(OrderedMapEntry);
-}
-
 # ── Subnet Identity ─────────────────────────────────────────
 # network.capnp uses bare Text for subnet references.
 # Typed ID enables cross-schema subnet references.
@@ -1560,14 +1728,15 @@ struct TimeRange {
 struct DeviceGroupId { id @0 :UInt64; }
 
 # ── TLS Version ───────────────────────────────────────────────
-# Used by socket.capnp for TLS session information.
-enum TlsVersion {
-    ssl30 @0;
-    tls10 @1;
-    tls11 @2;
-    tls12 @3;
-    tls13 @4;
-}
+# DELETED in the 2026-10-10 integration pass (decision recorded in
+# audit-revamp/INTEGRATION-REPORT.md). It was an unconsumed eternal type:
+# `socket.capnp` now types a version as an open token, so nothing in the
+# tree referred to this enum, and an enum no schema reads is pure weight
+# in the file every other schema imports. It was also an R1 violation —
+# a closed list of today's TLS versions, with `ssl30 @0` as the zero
+# member, frozen into an eternal contract. The version field of
+# `socket.capnp`'s canonical `TlsConfig` is the sanctioned pattern: an open
+# token, so a TLS successor is spellable today with no new ordinal.
 
 # ── Search Bookmark Identity ────────────────────────────────────
 # Used by system_search.capnp for bookmark references.
@@ -1666,6 +1835,7 @@ struct DriverHealth {
     restartCount @4 :UInt32;
     # Free-form metrics (counters, queues, etc.) — implementation-defined.
     metrics @5 :List(DriverMetric);
+    metadata @6 :StringMap;
 }
 
 struct DriverMetric {
@@ -1675,39 +1845,32 @@ struct DriverMetric {
         intValue @1 :Int64;
         floatValue @2 :Float64;
         textValue @3 :Text;
+        # A metric kind this schema does not name. Carries the value as
+        # opaque bytes; the consumer skips what it cannot decode.
+        unknown @4 :UnknownEvent;
     }
+    metadata @5 :StringMap;
 }
 
 # ── Bus & DMA Foundation ─────────────────────────────────────
 # Capability-capable bus addressing. The contract is a tagged bus
 # address; implementations decide how to walk the bus topology.
-
-enum BusType {
-    unknown    @0;
-    pci        @1;
-    pcie       @2;
-    usb        @3;
-    i2c        @4;
-    spi        @5;
-    i3c        @6;
-    uart       @7;
-    can        @8;
-    platform   @9;
-    acpi       @10;
-    dtb        @11;
-    mmio       @12;
-    # Backend-defined bus not modeled above.
-    custom     @13;
-}
+#
+# `busType` is an OPEN token — "pci", "usb", "i2c", "platform", or a bus
+# invented after this schema was frozen. The previous `BusType` enum named
+# fourteen 2026 buses (including `acpi` and `uart`, which are not buses),
+# and every consumer's switch over it would have had to grow forever.
 
 struct BusAddress {
-    busType @0 :BusType;
+    busType @0 :Text;
     # Domain, bus, device, function for PCIe; addr for I2C; etc.
     address @1 :UInt64;
     # Backend decides sub-addressing beyond address (function, lane, ...).
     subAddress @2 :UInt64;
     # Bus-specific slot/port (e.g., USB port, PCI slot).
     port @3 :UInt32;
+    # Open, backend-declared addressing detail.
+    metadata @4 :StringMap;
 }
 
 struct DmaHandle {
@@ -1723,10 +1886,6 @@ struct DmaHandle {
 # ── IRQ ───────────────────────────────────────────────────────
 # Cookies are the kernel-issued opaque tokens drivers use to
 # reference their IRQ registration across calls.
-
-struct IrqCookie {
-    id @0 :UInt64;
-}
 
 # ── Audio Foundation ─────────────────────────────────────────
 struct AudioSampleFormat {
@@ -1837,24 +1996,17 @@ struct StateOutcome {
     union {
         success @0 :Void;
         error @1 :Error;
+        # A backend that must report an outcome outside these two says so
+        # with its own discriminant instead of defaulting to success.
+        unknown @2 :UnknownEvent;
     }
+    metadata @3 :StringMap;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
 # BATCH 15 — Audit-5 Typed Hardware Abstraction Primitives
 # Backend-agnostic, platform-agnostic, device-agnostic, language-agnostic.
 # ═══════════════════════════════════════════════════════════════════════
-
-# ── Address Space Mode ────────────────────────────────────────
-# Paging mode for virtual address spaces. Used by address_space.capnp
-# and kernel.capnp for page table management.
-
-enum AddressSpaceMode {
-    identity @0;
-    shallow @1;
-    deep @2;
-    auto @3;
-}
 
 # ── Page Flags ────────────────────────────────────────────────
 # Per-page attributes for virtual memory mappings. Arch-agnostic
@@ -1871,6 +2023,25 @@ struct PageFlags {
     archSpecific @7 :Data;
 }
 
+# ── Interrupt Level ───────────────────────────────────────────
+# How a line signals that it fired. Closed by hardware physics, not by
+# fashion: a line is edge-triggered, level-triggered or message-signalled,
+# and no fourth mechanism exists to be invented. `unknown @0` is the
+# neutral sentinel; `custom` carries a backend that must say more.
+#
+# Interrupt DISPATCH (ioapic, msi, msix, vector routing, affinity) is
+# deliberately absent: DESIGN_PRINCIPLES.md:68 rules "add interrupt
+# dispatch" KEEPS OUT — the protocol subscribes to a line, and the
+# kernel decides how the firing reaches the subscriber.
+
+enum InterruptLevel {
+    unknown @0;
+    edge @1;
+    level @2;
+    message @3;
+    custom @4;
+}
+
 # ── Failure Report ────────────────────────────────────────────
 # Structured failure information for device/driver crash reporting.
 # Used by respawn.capnp for typed failure classification.
@@ -1883,18 +2054,7 @@ struct FailureReport {
     diagnosticData @4 :Text;
     suggestedAction @5 :RecoveryAction;
     lastKnownGoodState @6 :Text;
-}
-
-# ── Interrupt Mode ────────────────────────────────────────────
-# Delivery mechanism for device interrupts. Used by interrupt.capnp
-# and hal.capnp for interrupt resource management.
-
-enum InterruptMode {
-    ioapic @0;     # x86 I/O APIC pin-based
-    msi @1;        # Message Signaled Interrupts
-    msix @2;       # MSI with per-vector masking
-    legacy @3;     # ISA PIC-compatible
-    custom @4;     # Backend-defined
+    metadata @7 :StringMap;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1903,10 +2063,16 @@ enum InterruptMode {
 #
 # Content formerly split across error.capnp, respawn.capnp,
 # interrupt.capnp, address_space.capnp and device_descriptor.capnp has
-# been merged here so `types.capnp` is the one source of truth. Existing
-# canonical types (Error, ErrorCode, AddressSpaceMode, PageFlags,
-# InterruptMode, BusAddress, BusType, DmaHandle, FailureReport) are
-# reused; only the missing pieces are added below.
+# been merged here so `types.capnp` is the one source of truth.
+#
+# Revamp note: the pieces that named kernel-internal machinery were then
+# deleted again — AddressSpaceMode, VirtualMapping, AddressSpaceInfo,
+# AddressSpaceCreateRequest (page tables are KEEPS OUT,
+# DESIGN_PRINCIPLES.md:65), InterruptMode, InterruptDelivery,
+# MsiCapability/MsiVector, IrqLine, InterruptConfig, InterruptStatus
+# (interrupt dispatch is KEEPS OUT, :68) and IrqCookie. Only the
+# observable contracts remain: InterruptLevel, PageFlags, BusAddress,
+# BusType, DmaHandle, FailureReport, DeviceResource.
 # ═══════════════════════════════════════════════════════════════════════
 
 # ── Error Severity & Recovery (from error.capnp) ────────────────────
@@ -1942,12 +2108,6 @@ struct TypedError {
     diagnosticData @6 :Data;
 }
 
-# ── Deadline Handle (from setDeadline lifecycle primitive) ────────────
-
-struct DeadlineHandle {
-    id @0 :UInt64;
-}
-
 # ── Respawn / Restart Policy (from respawn.capnp) ─────────────────────
 
 # The one canonical restart policy used by init, HAL and the kernel.
@@ -1957,31 +2117,23 @@ enum RestartPolicy {
     never @2;
 }
 
-struct RestartEntry {
-    name @0 :Text;
-    path @1 :Text;
-    restartPolicy @2 :RestartPolicy;
-    maxAttempts @3 :UInt32;
-    fallback @4 :Text;
-    kernelManaged @5 :Bool;
-}
-
+# The lifecycle of a supervised entity (a service under init, a device
+# driver under HAL, a process under a supervisor). Observed state, not a
+# mechanism: the supervisor reports where the entity is, and the protocol
+# never says how it got there.
+#
+# `unknown @0` is the neutral sentinel, so an absent field never means
+# "running".
 enum EntityState {
-    initializing @0;
-    running @1;
-    degraded @2;
-    respawning @3;
-    fallbackActive @4;
-    awaitingManual @5;
-    permanentlyFailed @6;
-}
-
-struct RespawnConfig {
-    maxAttempts @0 :UInt32;
-    backoffMs @1 :UInt32;
-    backoffMultiplier @2 :Float32;
-    maxBackoffMs @3 :UInt32;
-    fallbackFunction @4 :Data;
+    unknown @0;
+    initializing @1;
+    running @2;
+    degraded @3;
+    respawning @4;
+    fallbackActive @5;
+    awaitingManual @6;
+    permanentlyFailed @7;
+    custom @8;
 }
 
 enum FailureReason {
@@ -2003,92 +2155,6 @@ enum FailureSeverity {
     recoverable @0;
     critical @1;
     fatal @2;
-}
-
-# ── Interrupt internals (from interrupt.capnp) ────────────────────────
-
-enum InterruptLevel {
-    edge @0;
-    level @1;
-    message @2;
-}
-
-enum InterruptDelivery {
-    fixed @0;
-    lowestPriority @1;
-    smi @2;
-    nmi @3;
-    initSignal @4;
-    extInt @5;
-}
-
-struct MsiCapability {
-    deviceId @0 :HalDeviceId;
-    vectorCount @1 :UInt8;
-    messageAddressLow @2 :UInt64;
-    messageData @3 :UInt16;
-    supportedModes @4 :List(InterruptMode);
-    has64bitAddress @5 :Bool;
-    hasPerVectorMask @6 :Bool;
-}
-
-struct MsiVector {
-    handle @0 :UInt64;
-    vector @1 :UInt8;
-    address @2 :UInt64;
-    data @3 :UInt16;
-    targetCpu @4 :UInt32;
-}
-
-struct IrqLine {
-    vector @0 :UInt8;
-    line @1 :UInt8;
-    level @2 :InterruptLevel;
-    active @3 :Bool;
-    shared @4 :Bool;
-    owner @5 :UInt64;
-}
-
-struct InterruptConfig {
-    preferredMode @0 :InterruptMode;
-    allowedModes @1 :List(InterruptMode);
-    delivery @2 :InterruptDelivery;
-    vector @3 :UInt8;
-    affinity @4 :UInt32;
-    autoEoi @5 :Bool;
-}
-
-struct InterruptStatus {
-    vector @0 :UInt8;
-    mode @1 :InterruptMode;
-    count @2 :UInt64;
-    lastFiredAt @3 :Timestamp;
-    enabled @4 :Bool;
-    owner @5 :UInt64;
-}
-
-# ── Address space internals (from address_space.capnp) ────────────────
-
-struct VirtualMapping {
-    virt @0 :UInt64;
-    phys @1 :UInt64;
-    size @2 :UInt64;
-    flags @3 :PageFlags;
-}
-
-struct AddressSpaceInfo {
-    asid @0 :UInt64;
-    mode @1 :AddressSpaceMode;
-    levels @2 :UInt8;
-    hhdmOffset @3 :UInt64;
-    mappingCount @4 :UInt32;
-    maxMappings @5 :UInt32;
-}
-
-struct AddressSpaceCreateRequest {
-    mode @0 :AddressSpaceMode;
-    hhdmOffset @1 :UInt64;
-    maxMappings @2 :UInt32;
 }
 
 # ── Device descriptor internals (from device_descriptor.capnp) ────────

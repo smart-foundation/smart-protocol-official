@@ -19,10 +19,25 @@ Rules
   E6  Every union has an unknown/custom variant.
   E7  Every struct has an open extension point.
   E8  Every enum's @0 is a neutral sentinel, never a paradigm value.
+  E9  No platform/vendor noun in a required position (R5).
+  E10 No bulk payload outside T.DataHandle (R2).
+  E11 Authority is the reference: no per-method Capability token, no
+      authority-by-string (R3).
+  E12 No type name declared in two schemas (R6).
+  E13 Interface method ordinals are sequential and declared in order.
+  E14 Every interface is reachable; no declared type is unreferenced (R8).
 
 Severity
   ERROR  — enforced for ai.capnp (the in-scope schema).
-  REPORT — measured but not blocking, for the other 91 schemas.
+  REPORT — measured but not blocking, for every other schema in the tree.
+
+E9–E14 are the tree-wide gate for the revamp wave. They are REPORT for the
+non-ai schemas so that the tree stays green while other waves land; the
+intent is that every schema reaches zero in each of them.
+
+Every count this script prints is computed from the tree it just parsed —
+there is no hardcoded schema total anywhere in it, so the numbers in the
+report and in the docs cannot drift from `ls schema/`.
 """
 
 import os
@@ -44,6 +59,92 @@ NEUTRAL_SENTINELS = {
 # Enums legitimately closed: a completeness-check gate must never report
 # a tri-state filter as a paradigm leak.
 CLOSED_ENUM_ALLOWLIST = {"BoolFilter"}
+
+# ── E9: platform, vendor and POSIX nouns banned from required positions ──
+# Matched against enum variant names, struct field names, type names and
+# method names. Exact match (case-insensitive) or prefix match for compound
+# spellings (`hhdmOffset`, `uartConfig`, `acpiTables`, `grpcMetadata`).
+PLATFORM_NOUNS = {
+    "zombie", "defunct", "grub", "grub2", "limine", "syslinux", "systemd",
+    "journald", "syslog", "stdout", "stderr", "kmsg", "dmesg", "inode",
+    "cgroup", "cr3", "hhdm", "nvme", "ahci", "iscsi", "pxe", "ipxe", "tftp",
+    "dhcp", "smbios", "dmi", "uart", "acpi", "posix", "win32", "linux",
+    "x86", "x8664", "amd64", "i386", "i686", "arm64", "aarch64", "riscv",
+    "s390x", "pulseaudio", "alsa", "pipewire", "jack", "consul", "etcd",
+    "zookeeper", "kubernetes", "docker", "rabbitmq", "kafka", "grpc",
+    "prometheus", "opentelemetry", "ebpf", "dtrace", "seccomp", "landlock",
+    "rlimit", "cygwin", "machport",
+}
+# Compound spellings only match as a prefix, never as an arbitrary substring,
+# so `dmiStatus` is caught while `admin` is not.
+PLATFORM_PREFIX_NOUNS = {
+    "hhdm", "cgroup", "uart", "acpi", "smbios", "stdout", "stderr", "syslog",
+    "journald", "inode", "grpc", "nvme", "ahci", "iscsi", "pxe", "ipxe",
+    "tftp", "dhcp", "posix", "x86", "grub", "limine", "systemd",
+    "pulseaudio", "alsa", "consul", "etcd", "zookeeper", "kubernetes",
+    "docker", "rabbitmq", "kafka", "prometheus", "opentelemetry", "ebpf",
+    "dtrace", "seccomp", "landlock", "rlimit", "zombie", "defunct",
+}
+
+# ── E10: bulk payloads ────────────────────────────────────────────────
+# A list of machine words in a FIELD is a copied payload, not a bounded
+# vocabulary: it belongs behind T.DataHandle.
+BULK_LIST_TYPES = {
+    "Float32", "Float64", "UInt8", "UInt16", "UInt32", "UInt64",
+    "Int8", "Int16", "Int32", "Int64", "Bool",
+}
+# A field with one of these names typed inline `Data` is a payload position
+# (as opposed to an opaque id/proof/hash/digest/signature, which is correctly
+# inline). Names carry bytes of bulk; ids and proofs carry identity.
+PAYLOAD_FIELD_NAMES = {
+    "data", "content", "payload", "frames", "manifestbytes", "blob",
+    "image", "dump", "rawbytes", "sample", "samples",
+}
+
+# ── E11: authority ────────────────────────────────────────────────────
+# Fields named like an authority declaration but typed as free text or a
+# flag are the parallel-permission-model anti-pattern (DESIGN_PRINCIPLES §399).
+AUTHORITY_FIELD_NAMES = {
+    "capabilities", "requiredcaps", "requiredcapabilities", "permission",
+    "permissions", "roles", "role", "acl", "authority", "accesspolicy",
+    "allowedroles", "readrole", "writterole", "writerole", "droppedcapabilities",
+    "keptcapabilities", "permissioncapability",
+}
+AUTHORITY_VALUE_TYPES = {"Text", "Bool", "UInt8", "UInt32", "UInt64"}
+
+# Files where a `Capability` parameter is the OBJECT UNDER MANIPULATION,
+# not an authority token: capability.capnp's attenuate/transfer/revoke/
+# revokeControlled/evaluateCondition act on the capability named by the
+# parameter. Everywhere else a Capability parameter is legal ONLY on a
+# root accessor that returns a service (the ai.capnp precedent).
+CAPABILITY_OBJECT_HOME = {"capability.capnp"}
+
+# (struct, field) pairs where a name collides with the authority vocabulary
+# but the field is something else entirely: `Uri.authority` is the authority
+# COMPONENT of a URI (user@host:port), not an authority declaration.
+AUTHORITY_FALSE_POSITIVES = {("Uri", "authority")}
+
+# Unions whose non-success arm is the extension point.
+TERMINAL_UNIONS = {"VoidResult", "BoolResult", "DataHandle"}
+
+# ── The declared R2 exception: ONE inline payload in the protocol ──────
+#
+# `T.UnknownEvent.payload` is inline `Data` and the validator must never
+# report it, because it is not a defect — it is the protocol's single
+# sanctioned escape hatch (see the reasoning written into the struct's own
+# header in types.capnp). The exemption is deliberately narrow: it applies
+# ONLY to the canonical `UnknownEvent` declared in types.capnp, so a second
+# schema cannot inherit the exemption by re-declaring a struct of the same
+# name (which is exactly the drift R6 exists to stop).
+R2_ESCAPE_HATCH = ("types.capnp", "UnknownEvent")
+
+# Unions whose non-success arm is `T.Error` are the RESPECTED error model
+# (DESIGN_PRINCIPLES "How to Handle Errors": `union { buffer; error :T.Error }`).
+# `T.Error` already carries a code, a message, a context and a retryable flag,
+# so it is the extension point a further `unknown` arm would pretend to add.
+# Exempting by SHAPE rather than by a hand-maintained name list is what keeps
+# the exemption honest: a result union that gains a third arm still reports.
+ERROR_ARM_TYPES = {"T.Error", "Error"}
 
 
 def strip_comments(src):
@@ -77,9 +178,20 @@ def block_body(src, start):
     return src[start + 1:], len(src)
 
 
+# A declaration head tolerates an `extends` clause:
+#   interface X { ... }
+#   interface X extends(Y) { ... }
+#   interface X extends Y { ... }
+# Without the optional clause the parser stops matching at `extends`, so an
+# inherited interface is silently invisible to E11/E13/E14 and produces
+# false reachability findings for the interface that returns it.
+_HEAD = r"\b%s\s+(\w+)\s*(?:extends\s*\(?\s*[\w\.\s,]*\)?\s*)?\{"
+_HEAD_LINE = r"^%s\s+(\w+)\s*(?:extends\s*\(?\s*[\w\.\s,]*\)?\s*)?\{"
+
+
 def find_blocks(src, keyword):
     """All `keyword Name { ... }` blocks as (name, body, line_no)."""
-    for m in re.finditer(r"\b%s\s+(\w+)\s*\{" % keyword, src):
+    for m in re.finditer(_HEAD % keyword, src):
         body, _ = block_body(src, m.end() - 1)
         line = src[:m.start()].count("\n") + 1
         yield m.group(1), body, line
@@ -94,6 +206,20 @@ def top_level_enums(src):
 
 def variants(body):
     return re.findall(r"^\s*([a-zA-Z]\w*)\s*@\d+\s*[:;]", body, re.M)
+
+
+def union_arms(body):
+    """A union's arms as (name, type): `name @N :Type;` or `name @N;`.
+
+    The type is matched permissively (`List(X)`, `T.Y`, `Void`) because an
+    arm's type is what the E6 shape test reads; a strict pattern silently
+    dropped `pages @1 :List(UInt16)` and under-reported the union's arms.
+    """
+    out = []
+    for m in re.finditer(r"^\s*([a-zA-Z]\w*)\s*@(\d+)\s*(?::\s*(.+?)\s*)?;",
+                         body, re.M):
+        out.append((m.group(1), (m.group(3) or "").strip()))
+    return out
 
 
 def union_blocks(body):
@@ -126,6 +252,109 @@ def methods_of(body):
 
 def result_names(results):
     return re.findall(r"(\w+)\s*:\s*[\w\.]+", results)
+
+
+def interface_types_of(results):
+    """Interface-typed results (an accessor returning a service)."""
+    return set(re.findall(r":\s*([A-Z]\w*)", results))
+
+
+def is_platform_noun(name):
+    low = name.lower()
+    if low in PLATFORM_NOUNS:
+        return True
+    return any(low.startswith(p) for p in PLATFORM_PREFIX_NOUNS)
+
+
+def params_of(signature):
+    """`(a :Text, b :List(Text))` -> [(name, type), ...] honoring nesting."""
+    out, depth, cur, i = [], 0, "", 0
+    while i < len(signature):
+        ch = signature[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+        i += 1
+    if cur.strip():
+        out.append(cur)
+    parsed = []
+    for part in out:
+        m = re.match(r"\s*(\w+)\s*:\s*(.+?)\s*$", part, re.S)
+        if m:
+            parsed.append((m.group(1), m.group(2).strip()))
+    return parsed
+
+
+def declared_interfaces(src):
+    """[(name, body, line)] in declaration order."""
+    return list(find_blocks(src, "interface"))
+
+
+# Structs that are values rather than specifications: even though they are
+# structs, a backend has nothing to extend in them.
+VALUE_STRUCTS = {"Timestamp", "Duration", "MonotonicTimestamp", "Version"}
+
+SCALAR_TYPES = re.compile(
+    r"(UInt|Int)(8|16|32|64)|Float(32|64)|Bool")
+
+
+def compute_value_like_structs(schemas):
+    """Types whose every field is a scalar, enum, id wrapper or another
+    value struct — i.e. complete by construction. Transitive, memoised."""
+    bodies = {}
+    enums = set()
+    for src in schemas.values():
+        for kind, name, line in top_level_types(src):
+            if kind == "enum":
+                enums.add(name)
+                continue
+            if kind != "struct" or name in bodies:
+                continue
+            for m in re.finditer(r"^struct\s+%s\s*\{" % re.escape(name), src,
+                                 re.M):
+                bodies[name] = block_body(src, m.end() - 1)[0]
+                break
+    memo = {}
+
+    def scalar(t, seen):
+        t = t.strip()
+        if SCALAR_TYPES.fullmatch(t):
+            return True
+        inner = re.fullmatch(r"List\((.+)\)", t)
+        if inner:
+            return scalar(inner.group(1), seen)
+        name = t.split(".")[-1]
+        if name in enums or name in VALUE_STRUCTS:
+            return True
+        if name in memo:
+            return memo[name]
+        if name not in bodies or name in seen:
+            return False
+        seen.add(name)
+        fs = fields_of(bodies[name])
+        ok = bool(fs) and all(scalar(ft, seen) for _, _, ft in fs)
+        memo[name] = ok
+        return ok
+
+    for name in bodies:
+        scalar(name, set())
+    return memo
+
+
+def top_level_types(src):
+    """Every `struct|enum|interface Name {` at top level, in order."""
+    out = []
+    for kw in ("struct", "enum", "interface"):
+        for m in re.finditer(_HEAD_LINE % kw, src, re.M):
+            out.append((kw, m.group(1), src[:m.start()].count("\n") + 1))
+    out.sort(key=lambda t: t[2])
+    return out
 
 
 def load_all():
@@ -221,16 +450,48 @@ def main():
                               f"terminator (no done:Bool and no status union)")
 
     # ---- E6: every union has unknown/custom ----------------------------
+    # `TERMINAL_UNIONS` are the three whose non-success arm IS the extension
+    # point, so a further `unknown` arm would be noise: `VoidResult` and
+    # `BoolResult` carry `T.Error` (the open error model), and `DataHandle`
+    # is closed by construction (inline bytes or a buffer reference — there
+    # is no third possibility to extend towards). Everything else,
+    # especially event unions, must terminate with `unknown @N :T.UnknownEvent`
+    # or `custom`.
+    #
+    # Widened by SHAPE (batch B's finding): any union with a `T.Error` arm is
+    # the error model DESIGN_PRINCIPLES blesses, so requiring an extra
+    # `unknown` arm on `{ ok; error }` reports a correct contract as a
+    # defect. The widening is a shape test, not a name list, so it cannot go
+    # stale: a result union that gains an unrelated third arm still reports
+    # if it has neither `T.Error` nor `unknown`.
     for fn, src in schemas.items():
         for sname, sbody, sline in find_blocks(src, "struct"):
             for ub in union_blocks(sbody):
-                vs = variants(ub)
-                if not any(v in ("unknown", "custom") for v in vs):
-                    msg = (f"E6 {fn}:{sline} struct {sname} union has no "
-                           f"unknown/custom variant (has {vs})")
-                    (errors if fn == "ai.capnp" else reports).append(msg)
+                arms = union_arms(ub)
+                vs = [a for a, _ in arms]
+                if any(v in ("unknown", "custom") for v in vs):
+                    continue
+                if sname in TERMINAL_UNIONS:
+                    continue
+                if any(t in ERROR_ARM_TYPES for _, t in arms):
+                    continue
+                msg = (f"E6 {fn}:{sline} struct {sname} union has no "
+                       f"unknown/custom variant (has {vs})")
+                (errors if fn == "ai.capnp" else reports).append(msg)
 
     # ---- E7: every struct has an open extension point ------------------
+    # Scoped, deliberately. A struct whose every field is a scalar, an id
+    # wrapper, an enum or another value struct is COMPLETE BY CONSTRUCTION:
+    # `AckHandle { messageId, queueId, sequence, expiresAt }` has nothing a
+    # backend could add, and Cap'n Proto already ignores unknown fields in
+    # old readers. Forcing a T.StringMap onto every value struct would
+    # bloat the protocol for no gain — the same over-breadth the verifier
+    # rejected for E8 (see audit-verification.md O4).
+    #
+    # So the rule bites where extension is real: structs that DESCRIBE,
+    # SPECIFY or REQUEST something (any Text, List, Data, map or nested
+    # spec field). Those must carry an extension point.
+    #
     # Exemptions, both deliberate:
     #   - Opaque ID wrappers (`struct X { id :UInt64 }`). TIMELESSNESS.md:32
     #     requires pushing types as far left as possible; an extension point
@@ -240,12 +501,15 @@ def main():
     #     a new payload kind is a new subtype, not a new field.
     # A `custom :Data` field counts as an extension point (InferenceResponse
     # uses that shape rather than a union).
+    value_like = compute_value_like_structs(schemas)
     for fn, src in schemas.items():
         for sname, sbody, sline in find_blocks(src, "struct"):
             fs = fields_of(sbody)
             if [f[0] for f in fs] == ["id"] and fs[0][2].strip() == "UInt64":
                 continue
             if sname == "Artifact":
+                continue
+            if value_like.get(sname):
                 continue
             # A bare `Data` field is itself an opaque extension slot.
             has_data = any(t.strip() == "Data" for _, _, t in fs)
@@ -271,12 +535,198 @@ def main():
                     f"E8 {fn}:{eline} enum {ename}.@0 = {vs[0]} — an absent field "
                     f"silently means this value; @0 should be a neutral sentinel")
 
+    # ---- E9: platform / vendor nouns in required positions -------------
+    for fn, src in schemas.items():
+        for kind, tname, tline in top_level_types(src):
+            if is_platform_noun(tname):
+                reports.append(
+                    f"E9 {fn}:{tline} {kind} {tname} names a platform, vendor "
+                    f"or POSIX concept in a required position")
+        for ename, ebody, eline in top_level_enums(src):
+            for v in variants(ebody):
+                if is_platform_noun(v):
+                    reports.append(
+                        f"E9 {fn}:{eline} enum {ename}.{v} is a platform, vendor "
+                        f"or POSIX noun frozen into an eternal contract")
+        for sname, sbody, sline in find_blocks(src, "struct"):
+            for fname, _, ftype in fields_of(sbody):
+                if is_platform_noun(fname):
+                    reports.append(
+                        f"E9 {fn}:{sline} struct {sname}.{fname} is a platform, "
+                        f"vendor or POSIX noun in a required position")
+        for iname, ibody, iline in find_blocks(src, "interface"):
+            for mname, _, _, _ in methods_of(ibody):
+                if is_platform_noun(mname):
+                    reports.append(
+                        f"E9 {fn}:{iline} {iname}.{mname} names a platform, "
+                        f"vendor or POSIX mechanism")
+
+    # ---- E10: bulk payloads outside T.DataHandle -----------------------
+    # Exempt: a list of ID WRAPPERS (`List(T.ServiceId)`, `List(SchemaId)`)
+    # is a set of references, not a copied payload; and the one declared R2
+    # escape hatch, whose opaque payload is the point (see R2_ESCAPE_HATCH).
+    def is_id_list(ftype):
+        inner = re.fullmatch(r"List\((.+)\)", ftype)
+        if not inner:
+            return False
+        return inner.group(1).strip().split(".")[-1].endswith("Id")
+
+    for fn, src in schemas.items():
+        for sname, sbody, sline in find_blocks(src, "struct"):
+            for fname, _, ftype in fields_of(sbody):
+                ftype = ftype.strip()
+                if re.fullmatch(r"List\((%s)\)" % "|".join(BULK_LIST_TYPES),
+                                ftype) and not is_id_list(ftype):
+                    reports.append(
+                        f"E10 {fn}:{sline} {sname}.{fname} :{ftype} — a list of "
+                        f"machine words is a copied payload; bulk belongs in "
+                        f"T.DataHandle")
+                if ftype == "Data" and fname.lower() in PAYLOAD_FIELD_NAMES \
+                        and (fn, sname) != R2_ESCAPE_HATCH:
+                    reports.append(
+                        f"E10 {fn}:{sline} {sname}.{fname} :Data — a payload "
+                        f"position must be T.DataHandle (zero-cost reference)")
+        for iname, ibody, iline in find_blocks(src, "interface"):
+            for mname, _, params, _ in methods_of(ibody):
+                for pname, ptype in params_of(params):
+                    if ptype == "Data" and pname.lower() in PAYLOAD_FIELD_NAMES:
+                        reports.append(
+                            f"E10 {fn}:{iline} {iname}.{mname}({pname} :Data) — "
+                            f"a payload parameter must be T.DataHandle")
+
+    # ---- E11: authority is the reference -------------------------------
+    for fn, src in schemas.items():
+        for sname, sbody, sline in find_blocks(src, "struct"):
+            for fname, _, ftype in fields_of(sbody):
+                if (sname, fname) in AUTHORITY_FALSE_POSITIVES:
+                    continue
+                if (fname.lower() in AUTHORITY_FIELD_NAMES
+                        and ftype.strip() in AUTHORITY_VALUE_TYPES):
+                    reports.append(
+                        f"E11 {fn}:{sline} struct {sname}.{fname} :"
+                        f"{ftype.strip()} — an authority declaration as free "
+                        f"text/flag; use a Capability reference")
+        for iname, ibody, iline in find_blocks(src, "interface"):
+            ifaces = {n for n, _, _ in find_blocks(src, "interface")}
+            for mname, _, params, results in methods_of(ibody):
+                for pname, ptype in params_of(params):
+                    if "Capability" not in ptype:
+                        continue
+                    if fn in CAPABILITY_OBJECT_HOME:
+                        continue
+                    # An accessor that returns a service is the ai.capnp
+                    # precedent: the reference is the authority.
+                    if interface_types_of(results) & ifaces:
+                        continue
+                    reports.append(
+                        f"E11 {fn}:{iline} {iname}.{mname}({pname} :{ptype}) — "
+                        f"authority must be the interface reference granted at "
+                        f"acquisition, not a per-method token")
+
+    # ---- E12: one canonical home per type name -------------------------
+    where = defaultdict(list)
+    for fn, src in schemas.items():
+        for kind, tname, tline in top_level_types(src):
+            where[tname].append((fn, tline))
+    for tname, spots in sorted(where.items()):
+        if len(spots) > 1:
+            files = ", ".join(f"{f}:{l}" for f, l in spots)
+            reports.append(
+                f"E12 type {tname} is declared in {len(spots)} schemas "
+                f"({files}) — one canonical home per type")
+
+    # ---- E13: ordinal sequencing ---------------------------------------
+    for fn, src in schemas.items():
+        for iname, ibody, iline in find_blocks(src, "interface"):
+            ms = methods_of(ibody)
+            ords = [o for _, o, _, _ in ms]
+            if ords != sorted(ords):
+                reports.append(
+                    f"E13 {fn}:{iline} {iname} methods are not declared in "
+                    f"ascending ordinal order ({ords})")
+            if ords and (ords[0] != 0 or ords != list(range(len(ords)))):
+                reports.append(
+                    f"E13 {fn}:{iline} {iname} method ordinals are not "
+                    f"sequential from 0 ({ords})")
+        for sname, sbody, sline in find_blocks(src, "struct"):
+            fs = fields_of(sbody)
+            for (n1, o1, _), (n2, o2, _) in zip(fs, fs[1:]):
+                if int(o2) <= int(o1):
+                    reports.append(
+                        f"E13 {fn}:{sline} struct {sname} fields are not in "
+                        f"ascending ordinal order ({n1}@{o1} then {n2}@{o2})")
+
+    # ---- E14: reachability ---------------------------------------------
+    # The first interface declared in a file is that schema's root: like
+    # ai.capnp's `AI` (and System, Audio, Files), it is handed to the caller
+    # by the host, so "returned by no method" is the correct shape for it.
+    # The second signal is the FILE'S OWN NAME: `hal.capnp` -> HalService,
+    # `boot.capnp` -> BootService, `compositor.capnp` -> CompositorSession.
+    # Anything prefixed with the file's stem is that schema's entry point.
+    #
+    # Reachability also counts an interface taken as a PARAMETER: a
+    # provider-registered callback (`registerAuthMethod(handler :AuthHandler)`)
+    # is reachable because the caller supplies an implementation and the peer
+    # calls it. Counting only return types missed that whole shape and
+    # reported three live interfaces as unreachable.
+    returned = set()
+    taken = set()
+    for fn, src in schemas.items():
+        for iname, ibody, _ in find_blocks(src, "interface"):
+            for _, _, params, results in methods_of(ibody):
+                returned.update(re.findall(r":\s*(\w+)", results))
+                for _, ptype in params_of(params):
+                    taken.update(re.findall(r"[A-Z]\w*", ptype))
+    referenced = set()
+    for fn, src in schemas.items():
+        for _, tname, _ in top_level_types(src):
+            referenced.add(tname)
+        for sname, sbody, _ in find_blocks(src, "struct"):
+            for _, _, ftype in fields_of(sbody):
+                referenced.update(re.findall(r"\w+", ftype))
+        for iname, ibody, _ in find_blocks(src, "interface"):
+            for _, _, params, results in methods_of(ibody):
+                referenced.update(re.findall(r"\w+", params))
+                referenced.update(re.findall(r"\w+", results))
+    for fn, src in schemas.items():
+        declared = declared_interfaces(src)
+        stem = re.sub(r"[^a-z0-9]", "", fn[:-len(".capnp")].lower())
+        roots = set()
+        if declared:
+            roots.add(declared[0][0])
+            for iname, _, _ in declared:
+                # `hal.capnp` -> HalService, `boot.capnp` -> BootService,
+                # `queue.capnp` -> Queue, `compositor.capnp` ->
+                # CompositorSession. The file's own name is the best
+                # signal of which interface is the host-injected root.
+                low = re.sub(r"[^a-z0-9]", "", iname.lower())
+                if low == stem or low == stem + "service" \
+                        or low.startswith(stem):
+                    roots.add(iname)
+        for iname, _, iline in declared:
+            if iname in roots or iname in returned or iname in taken:
+                continue
+            reports.append(
+                f"E14 {fn}:{iline} interface {iname} is returned by no method "
+                f"anywhere — unreachable")
+        for kind, tname, tline in top_level_types(src):
+            if kind == "interface":
+                continue
+            if tname not in referenced:
+                reports.append(
+                    f"E14 {fn}:{tline} {kind} {tname} is referenced by no "
+                    f"field, parameter or result — unreachable")
+
     # ---- report --------------------------------------------------------
-    print(f"Schemas parsed: {len(schemas)}")
+    other_schemas = len(schemas) - 1  # every schema except ai.capnp
+    print(f"Schemas parsed: {len(schemas)} ({other_schemas} besides ai.capnp)")
     print(f"E1 enums in ai.capnp            : {len(ai_enums)}")
     print(f"E2 bulk lists in ai.capnp       : {len(bulk)}")
     print(f"E4 interfaces unreachable (all) : "
           f"{len([r for r in reports if r.startswith('E4')])} reported")
+    for tag in ("E6", "E7", "E8", "E9", "E10", "E11", "E12", "E13", "E14"):
+        print(f"{tag} hits (all schemas)        : "
+              f"{len([r for r in reports if r.startswith(tag)])}")
     print()
     if reports:
         print(f"--- REPORTED (not blocking, {len(reports)}) ---")

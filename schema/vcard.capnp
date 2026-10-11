@@ -1,38 +1,117 @@
 @0xa1b2c3d4e5f60108;
 
 using T = import "types.capnp";
+using Cal = import "calendar.capnp";
 
 # ═══════════════════════════════════════════════════════════════════════
 # vCard — vCard import/export for contacts interoperability (RFC 6350).
 #
-# contacts.capnp currently has no vCard support. This schema provides
-# bidirectional vCard ↔ Contact conversion with full RFC 6350 support.
+# This file is a CONVERTER, and it is kept as its own schema rather than
+# merged into contacts.capnp: vCard is an external standard that will
+# exist in 2046 regardless of what this protocol does, so a dedicated
+# converter contract is one of the more timeless things in the tree. The
+# payload handling is correct — photos, sounds, keys and imported/exported
+# data are all T.DataHandle — and is kept.
 #
 # Zero backend assumptions: no libvcard, no EKD, no platform contact
 # APIs. Backend provides vCard parsing/generation.
 #
-# Used by: contacts.capnp (import/export operations)
+# ── THE CONVERSION CONTRACT IS NOW DECLARED ────────────────────────────
 #
-# Improvements (audit-7):
-#   - validateVCard method for standalone validation.
-#   - GenderValue enum replacing bare Text in VCardGender.value.
-#   - KeyType enum (PGP, X509, SSH) for VCardKey.
-#   - VCardVersion.v5_0 forward-compatible slot.
-#   - VCardPropertyType enum for structured TYPE parameters.
-#   - VCardGeo.altitude field.
-#   - PronunciationFormat enum for VCardSound.
-#   - vCard sync protocol (false positive from vcard_sync.capnp):
-#     incremental sync, conflict resolution, last-modified tracking.
-#   - vCard schema validation (false positive from vcard_schema.capnp):
-#     custom property definitions, schema compliance checking.
+# contacts.capnp already owned import/export with a free-form `format`
+# string, and this file owned the same operations with structured
+# requests, and NEITHER declared the field mapping: does
+# `Contact.type = organization` produce FN or N? Which `EmailEntry.type`
+# maps to TYPE=INTERNET? Without the mapping, import/export is not
+# interoperable — every backend pairs them differently. The mapping is
+# declared at the bottom of this header, and `ImportRequest.fieldMapping`
+# names the exact keys a caller may override.
+#
+# ── THE 1998 TYPE VOCABULARY IS GONE ───────────────────────────────────
+#
+# `VCardPropertyType` froze the RFC 2426 (1998) TYPE parameter
+# vocabulary into a required position — including bulletin-board systems
+# and dial-up modems — while the same file had
+# `VCardProperty.parameters @2 :List(VCardParameter)`, the open key/value
+# mechanism that carries exactly that information two structs away. The
+# enum was a lossy duplicate of a mechanism next to it: anything it could
+# express, `parameters` already could; anything it could not
+# (TYPE=x-other, a 2046 parameter), it could not. `TelephoneCapability`
+# was the same 1998 list frozen a second time, on the telephone path,
+# while the address and email paths already used open `List(Text)`.
+#
+# All three now use the open mechanism, so one spelling replaces three
+# and a 2046 property parameter is expressible.
+#
+# ── THE SCHEMA REGISTRY IS GONE ────────────────────────────────────────
+#
+# `getPropertySchema`, `VCardPropertySchema`, `PropertyDefinition`,
+# `RequiredProperty`, `CustomNamespace` and `validateProperty` described
+# an external standard the consumer can already read, in six types and
+# two methods, with no consumer. They are deleted: a converter contract
+# is what remains.
+#
+# ── v50 IS GONE ────────────────────────────────────────────────────────
+#
+# `VCardVersion.v50` was a declared slot for a hypothetical vCard 5.0 —
+# a standard that does not exist (4.0 / RFC 6350 is the latest published
+# version). Asserting a future that may never arrive is exactly the
+# failure the doctrine names, and the slot made
+# `getSupportedVersions` return a value no implementation could support.
+#
+# Used by: contacts.capnp (import/export operations)
 # ═══════════════════════════════════════════════════════════════════════
+#
+# ══════════════════════════════════════════════════════════════════════
+# THE VCardContact ↔ Contact MAPPING — the conversion contract
+#
+# Every row is normative. A backend that cannot honour a row MUST report
+# it as a T.Warning on the imported contact rather than silently dropping
+# the field, so a caller can see what was lost.
+#
+# VCardContact.uid        -> Contact.metadata["vcard.uid"]
+# VCardContact.fn         -> Contact.name.display
+# VCardContact.n          -> Contact.name.{family,given,middle,prefix,suffix}
+#                             (empty components are omitted, not blanked)
+# VCardContact.nickname   -> Contact.metadata["vcard.nickname"]
+# VCardContact.org        -> Contact.organization.{name,department}
+#                             and Contact.type = "organization" when FN
+#                             is the org name
+# VCardContact.title      -> Contact.organization.title
+# VCardContact.role       -> Contact.organization.role
+# VCardContact.tel        -> Contact.phones[].value (E.164 normalised when
+#                             parseable; the raw value is preserved in
+#                             metadata["vcard.tel.raw"])
+# VCardContact.email      -> Contact.emails[].value
+# VCardContact.adr        -> Contact.addresses[] (street/city/region/
+#                             postalCode/country, in that component order)
+# VCardContact.photo      -> Contact.photo (T.DataHandle)
+# VCardContact.bday       -> Contact.birthday (T.Date; the time part is
+#                             dropped, never guessed)
+# VCardContact.anniversary-> Contact.metadata["vcard.anniversary"]
+# VCardContact.categories-> Contact.tags
+# VCardContact.note       -> Contact.note
+# VCardContact.geo        -> Contact.customFields["geo"]
+#
+# TYPE parameters: VCardAddress.types / VCardEmail.types /
+# VCardTelephone.types are open Text lists and map to the SAME open
+# tokens contacts.capnp publishes (home, work, other, ...). A TYPE value
+# that is not a published token is preserved verbatim in the sub-entry's
+# `type` and MUST be ignored rather than rejected by a consumer.
+#
+# `ImportRequest.fieldMapping` may override any row above. Its keys are
+# the DESTINATION field paths spelled exactly as in this table
+# ("name.display", "phones[].value", "metadata.vcard.uid", ...), and its
+# values are backend-declared. An unknown key MUST be reported as a
+# warning, never silently honoured.
+# ══════════════════════════════════════════════════════════════════════
 
 interface VCardService {
     # Import vCard data to Contact(s).
     importVCard @0 (request :ImportRequest) -> (result :ImportResult);
 
     # Export Contact(s) to vCard data.
-    exportVCard @1 (request :ExportRequest) -> (result :ExportResult);
+    exportVCard @1 (request :ExportRequest) -> (result :VcardExportResult);
 
     # Parse vCard data without importing (validation/inspection).
     parseVCard @2 (data :T.DataHandle) -> (result :ParseResult);
@@ -40,33 +119,20 @@ interface VCardService {
     # Format Contact as vCard data.
     formatVCard @3 (request :FormatRequest) -> (result :FormatResult);
 
-    # Get supported vCard versions.
+    # Get supported vCard versions. Honest now that the hypothetical
+    # v50 slot is gone: this returns what the backend can actually
+    # read and write.
     getSupportedVersions @4 () -> (versions :List(VCardVersion));
-
-    # Get supported properties.
-    getSupportedProperties @5 () -> (properties :List(VCardPropertyInfo));
 
     # ── Audit-7 additions ────────────────────────────────────
 
-    # Validate vCard data without importing (syntax + schema compliance).
-    validateVCard @6 (data :T.DataHandle, version :VCardVersion) -> (result :ValidationResult);
-
-    # ── vCard sync (false positive: vcard_sync.capnp) ────────
-    # Get the sync token for incremental vCard sync.
-    getSyncToken @7 (contactIds :List(T.ContactId)) -> (token :Text);
-
-    # Fetch vCard changes since a sync token.
-    syncChanges @8 (syncToken :Text) -> (result :VCardSyncResult);
-
-    # Resolve a vCard sync conflict.
-    resolveConflict @9 (conflictId :Text, resolution :ConflictResolution) -> T.VoidResult;
-
-    # ── Schema validation (false positive: vcard_schema) ─────
-    # Get the vCard property schema (definitions, constraints).
-    getPropertySchema @10 () -> (schema :VCardPropertySchema);
-
-    # Validate a property against the schema.
-    validateProperty @11 (property :VCardProperty, version :VCardVersion) -> (valid :Bool, errors :List(T.Warning));
+    # ── vCard sync ──
+    getSyncToken @5 (contactIds :List(T.ContactId)) -> (token :Text);
+    syncChanges @6 (syncToken :Text) -> (result :VCardSyncResult);
+    # ConflictResolution is calendar.capnp's: the identical enum used to
+    # be declared in both files, so a file importing both had two types
+    # by one name.
+    resolveConflict @7 (conflictId :Text, resolution :Cal.ConflictResolution) -> T.VoidResult;
 }
 
 # ─── Import/Export ───────────────────────────────────────────
@@ -82,25 +148,30 @@ struct ImportRequest {
     duplicateHandling @3 :DuplicateHandling = update;
     # Whether to merge with existing contacts.
     merge @4 :Bool = false;
-    # Custom field mapping.
+    # Custom field mapping. Keys are the DESTINATION field paths spelled
+    # exactly as in the mapping table in this file's header.
     fieldMapping @5 :T.StringMap;
 }
 
+# No v50: a declared slot for a standard that does not exist made
+# getSupportedVersions return a value no implementation could support.
+# The ordinal is preserved anyway (the doctrine's rule) and simply
+# carries no meaning.
 enum VCardVersion {
-    v21 @0;    # vCard 2.1 (legacy)
-    v30 @1;    # vCard 3.0 (RFC 2425/2426)
-    v40 @2;    # vCard 4.0 (RFC 6350)
-    auto @3;    # Auto-detect
-    # Forward-compatible slot for hypothetical vCard 5.0 (audit-7).
-    v50 @4;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    v21 @1;    # vCard 2.1 (legacy)
+    v30 @2;    # vCard 3.0 (RFC 2425/2426)
+    v40 @3;    # vCard 4.0 (RFC 6350) — the latest published version
+    auto @4;    # Auto-detect
 }
 
 enum DuplicateHandling {
-    skip @0;        # Skip duplicates
-    update @1;      # Update existing
-    create @2;      # Create new (allow duplicates)
-    merge @3;       # Merge data
-    custom @4;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    skip @1;        # Skip duplicates
+    update @2;      # Update existing
+    create @3;      # Create new (allow duplicates)
+    merge @4;       # Merge data
+    custom @5;
 }
 
 struct ImportResult {
@@ -108,21 +179,16 @@ struct ImportResult {
         success @0 :ImportSuccess;
         error @1 :T.Error;
         partial @2 :ImportPartial;
+        unknown @3 :T.UnknownEvent;
     }
 }
 
 struct ImportSuccess {
-    # Imported contacts.
     contacts @0 :List(ImportedContact);
-    # Total vCards processed.
     totalProcessed @1 :UInt32;
-    # Successfully imported.
     imported @2 :UInt32;
-    # Skipped (duplicates).
     skipped @3 :UInt32;
-    # Failed.
     failed @4 :UInt32;
-    # Warnings.
     warnings @5 :List(T.Warning);
 }
 
@@ -140,14 +206,11 @@ struct ImportedContact {
     contactId @0 :T.ContactId;
     # vCard UID that was imported.
     vcardUid @1 :Text;
-    # Whether this was a new contact.
     created @2 :Bool;
-    # Warnings for this contact.
     warnings @3 :List(T.Warning);
 }
 
 struct ImportError {
-    # vCard UID (if available).
     vcardUid @0 :Text;
     # Line number in vCard data.
     line @1 :UInt32;
@@ -155,7 +218,6 @@ struct ImportError {
 }
 
 struct ExportRequest {
-    # Contact IDs to export.
     contactIds @0 :List(T.ContactId);
     # Export all contacts if true.
     allContacts @1 :Bool = false;
@@ -165,39 +227,37 @@ struct ExportRequest {
     includeGroups @3 :List(Text);
     # Exclude these properties.
     excludeProperties @4 :List(Text);
-    # Custom field mapping.
+    # Custom field mapping (see the mapping table in this file's header).
     fieldMapping @5 :T.StringMap;
-    # Line folding length (75 per RFC, 0 = no folding).
-    lineLength @6 :UInt16 = 75;
+    # Line folding length (0 = no folding).
+    lineLength @6 :UInt16 = 0;
     # Whether to include PHOTO as inline base64.
     inlinePhotos @7 :Bool = true;
     # Output format.
     outputFormat @8 :OutputFormat = single;
 }
 
+# `single`/`multiple`/`stream` are output shapes of one encoding, not
+# three technologies, so they survive as a closed set.
 enum OutputFormat {
-    # Single vCard with multiple contacts.
-    single @0;
-    # Multiple vCards (one per contact).
-    multiple @1;
-    # Directory stream (one vCard per line, minimal).
-    stream @2;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    single @1;
+    multiple @2;
+    stream @3;
 }
 
-struct ExportResult {
+struct VcardExportResult {
     union {
         success @0 :ExportSuccess;
         error @1 :T.Error;
         partial @2 :ExportPartial;
+        unknown @3 :T.UnknownEvent;
     }
 }
 
 struct ExportSuccess {
-    # vCard data.
     data @0 :T.DataHandle;
-    # Number of contacts exported.
     exported @1 :UInt32;
-    # Warnings.
     warnings @2 :List(T.Warning);
 }
 
@@ -220,27 +280,28 @@ struct ParseResult {
     union {
         success @0 :ParseSuccess;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
 struct ParseSuccess {
-    # Parsed vCards.
     vcards @0 :List(VCard);
-    # Warnings.
     warnings @1 :List(T.Warning);
 }
 
 struct FormatRequest {
     contact @0 :VCardContact;
     version @1 :VCardVersion = v40;
-    lineLength @2 :UInt16 = 75;
+    lineLength @2 :UInt16 = 0;
     inlinePhotos @3 :Bool = true;
+    fieldMapping @4 :T.StringMap;
 }
 
 struct FormatResult {
     union {
         success @0 :FormatSuccess;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
@@ -249,41 +310,15 @@ struct FormatSuccess {
     warnings @1 :List(T.Warning);
 }
 
-# ─── Validation (audit-7) ────────────────────────────────────
-
-struct ValidationResult {
-    valid @0 :Bool;
-    # Errors found during validation.
-    errors @1 :List(ValidationError);
-    # Warnings (non-fatal issues).
-    warnings @2 :List(T.Warning);
-}
-
-struct ValidationError {
-    # Line number in vCard data (0 if not line-specific).
-    line @0 :UInt32;
-    # Property name that caused the error.
-    property @1 :Text;
-    # Error description.
-    message @2 :Text;
-    # Severity: error or warning.
-    severity @3 :ValidationSeverity;
-}
-
-enum ValidationSeverity {
-    error @0;
-    warning @1;
-    info @2;
-    custom @3;
-}
-
 # ─── vCard Data Model ─────────────────────────────────────────
 
 struct VCard {
     version @0 :VCardVersion;
     # All properties (including custom).
     properties @1 :List(VCardProperty);
-    # Raw lines for round-tripping unknown properties.
+    # Raw lines for round-tripping unknown properties — the right
+    # instinct, kept: an unknown property survives a round trip instead
+    # of being dropped.
     rawLines @2 :List(Text);
 }
 
@@ -292,21 +327,13 @@ struct VCard {
 struct VCardValue {
     union {
         text @0 :Text;
-        # Structured values:
         structured @1 :VCardStructuredValue;
-        # Binary data (base64 encoded in vCard).
         binary @2 :Data;
-        # URI reference.
         uri @3 :T.Uri;
-        # Date/time.
         date @4 :T.Timestamp;
-        # Boolean.
         boolean @5 :Bool;
-        # Integer.
         integer @6 :Int64;
-        # Float.
         float @7 :Float64;
-        # Custom/backend-specific value.
         custom @8 :Data;
     }
 }
@@ -316,7 +343,8 @@ struct VCardProperty {
     name @0 :Text;
     # Property group (e.g., "item1", "work").
     group @1 :Text;
-    # Parameters (e.g., TYPE=HOME, ENCODING=BASE64).
+    # Parameters (e.g., TYPE=HOME, ENCODING=BASE64) — the open key/value
+    # mechanism that replaces the frozen TYPE enums.
     parameters @2 :List(VCardParameter);
     # Values (multi-value properties).
     values @3 :List(VCardValue);
@@ -330,17 +358,6 @@ struct VCardParameter {
 struct VCardStructuredValue {
     # Components separated by ; in vCard.
     components @0 :List(Text);
-}
-
-struct VCardDateTime {
-    # ISO 8601 format.
-    value @0 :Text;
-    # Whether it's a date-only (no time).
-    dateOnly @1 :Bool;
-    # Whether it's UTC.
-    utc @2 :Bool;
-    # Timezone ID (if not UTC).
-    timezone @3 :Text;
 }
 
 # ─── Simplified Contact Model for vCard ──────────────────────
@@ -384,16 +401,22 @@ struct VCardContact {
     key @22 :List(VCardKey);
 
     # Calendar
-    bday @23 :VCardDateTime;
-    anniversary @24 :VCardDateTime;
+    bday @23 :T.Date;
+    anniversary @24 :T.Date;
     caladruri @25 :List(T.Uri);
     caluri @26 :List(T.Uri);
     fburl @27 :List(T.Uri);
 
-    # Gender (RFC 6350 Section 6.2.5)
-    gender @28 :VCardGender;
+    # Gender (RFC 6350 Section 6.2.5): an open token plus the free text
+    # the RFC also carries. The `none`/`undefined` pair is deleted — two
+    # values that both mean "not stated", an implementer trap with no
+    # protocol value.
+    gender @28 :Text;
 
-    # Expertise, Hobby, Interest (RFC 6350 Section 6.7)
+    # Expertise, Hobby, Interest (RFC 6350 Section 6.7): one open level
+    # vocabulary, replacing three enums with different scales
+    # (5/3/3 levels) that a consumer could not compare and an
+    # implementer had to convert between.
     expertise @29 :List(VCardExpertise);
     hobby @30 :List(VCardHobby);
     interest @31 :List(VCardInterest);
@@ -423,26 +446,21 @@ struct VCardSound {
     data @0 :T.DataHandle;
     mediaType @1 :T.MimeType;
     uri @2 :T.Uri;
-    # Pronunciation format (audit-7).
-    pronunciationFormat @3 :PronunciationFormat;
+    # Pronunciation format, as an open token (see the consts below).
+    pronunciationFormat @3 :Text;
 }
 
-enum PronunciationFormat {
-    ipa @0;        # International Phonetic Alphabet
-    xSAMPA @1;     # Extended Speech Assessment Methods Phonetic Alphabet
-    custom @2;
-}
-
+# Address, email, telephone and IM all carry their TYPE parameters as
+# open Text lists — one spelling for four paths. Previously only the
+# address and email paths were open; the telephone path carried a frozen
+# 1998 enum on top of the same list.
 struct VCardAddress {
-    # TYPE parameters
+    # TYPE parameters, open tokens.
     types @0 :List(Text);
-    # Preferred
     preferred @1 :Bool;
     # Components: PO Box, Extended Address, Street, City, Region, Postal Code, Country
     components @2 :List(Text);
-    # Geo URI
     geo @3 :T.Uri;
-    # Timezone
     tz @4 :Text;
 }
 
@@ -450,21 +468,6 @@ struct VCardTelephone {
     types @0 :List(Text);
     preferred @1 :Bool;
     value @2 :Text;  # E.164 format recommended
-    # For voice/video/text capabilities
-    capabilities @3 :List(TelephoneCapability);
-}
-
-enum TelephoneCapability {
-    voice @0;
-    video @1;
-    text @2;
-    cell @3;
-    pager @4;
-    bbs @5;
-    modem @6;
-    car @7;
-    isdn @8;
-    custom @9;
 }
 
 struct VCardEmail {
@@ -480,7 +483,7 @@ struct VCardImpp {
 }
 
 struct VCardLanguage {
-    tag @0 :Text;  # BCP 47 language tag
+    tag @0 :T.Language;  # BCP 47 tag
     preferred @1 :Bool;
 }
 
@@ -488,16 +491,16 @@ struct VCardGeo {
     uri @0 :T.Uri;  # geo: URI
     lat @1 :Float64;
     lon @2 :Float64;
-    # Altitude in meters (audit-7).
     altitude @3 :Float64;
 }
 
 struct VCardTimezone {
     # TZID
     id @0 :Text;
-    # UTC offset
-    offset @1 :Text;
-    # VTIMEZONE data
+    # UTC offset, as a T.Duration from UTC — a typed offset instead of a
+    # string that every backend re-parses.
+    offset @1 :T.Duration;
+    # VTIMEZONE data, preserved verbatim for round-tripping.
     vtimezone @2 :Text;
 }
 
@@ -510,93 +513,47 @@ struct VCardOrganization {
 
 struct VCardKey {
     data @0 :T.DataHandle;
+    # The media type IS the key type: PGP, X509 and SSH are all
+    # distinguishable by it, so the closed KeyType enum (which named
+    # `pgp`, a product name, and could not carry a 2046 format) is
+    # deleted in favour of the field that already existed.
     mediaType @1 :T.MimeType;
     uri @2 :T.Uri;
-    # Key type (audit-7): PGP, X509, SSH, etc.
-    keyType @3 :KeyType;
-}
-
-enum KeyType {
-    pgp @0;
-    x509 @1;
-    ssh @2;
-    custom @3;
-}
-
-# ─── RFC 6350 Section 6.2.5 — Gender ────────────────────────
-
-struct VCardGender {
-    # Gender value (audit-7: typed enum replacing bare Text).
-    value @0 :GenderValue;
-    # Textual representation (e.g., "Pronoun: they/them").
-    text @1 :Text;
-}
-
-enum GenderValue {
-    male @0;
-    female @1;
-    other @2;
-    none @3;
-    undefined @4;
-    custom @5;
 }
 
 # ─── RFC 6350 Section 6.7 — Expertise, Hobby, Interest ──────
 
 struct VCardExpertise {
     domain @0 :Text;        # e.g., "programming", "cooking"
-    level @1 :ExpertiseLevel;
-    # Human-readable description.
+    level @1 :Text;
     description @2 :Text;
-}
-
-enum ExpertiseLevel {
-    beginner @0;
-    average @1;
-    good @2;
-    expert @3;
-    master @4;
-    custom @5;
 }
 
 struct VCardHobby {
-    domain @0 :Text;        # e.g., "photography", "hiking"
-    level @1 :HobbyLevel;
-    # Human-readable description.
+    domain @0 :Text;
+    level @1 :Text;
     description @2 :Text;
-}
-
-enum HobbyLevel {
-    low @0;
-    medium @1;
-    high @2;
-    custom @3;
 }
 
 struct VCardInterest {
-    domain @0 :Text;        # e.g., "science fiction", "history"
-    level @1 :InterestLevel;
-    # Human-readable description.
+    domain @0 :Text;
+    level @1 :Text;
     description @2 :Text;
-}
-
-enum InterestLevel {
-    low @0;
-    medium @1;
-    high @2;
-    custom @3;
 }
 
 # ─── RFC 6350 Section 6.8 — XML Property ────────────────────
 
 struct VCardXml {
-    # XML namespace.
     namespace @0 :Text;
-    # Raw XML content.
-    content @1 :Data;
+    # A payload, not an opaque token, so it travels as a handle.
+    content @1 :T.DataHandle;
+    metadata @2 :T.StringMap;
 }
 
 # ─── Property Info ──────────────────────────────────────────
+# What remains of the registry half: a caller can still ask what the
+# backend claims to support, as data. The six-type schema-description
+# apparatus is deleted — RFC 6350 is readable by any consumer.
 
 struct VCardPropertyInfo {
     name @0 :Text;
@@ -608,51 +565,29 @@ struct VCardPropertyInfo {
 }
 
 enum Cardinality {
-    single @0;
-    multi @1;
-    optional @2;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    single @1;
+    multi @2;
+    optional @3;
 }
 
 enum ValueType {
-    text @0;
-    structured @1;
-    binary @2;
-    uri @3;
-    dateTime @4;
-    custom @5;
+    unspecified @0;   # Sentinel: an unset value is not the @0 paradigm
+    text @1;
+    structured @2;
+    binary @3;
+    uri @4;
+    dateTime @5;
+    custom @6;
 }
 
-# ─── TYPE Parameter Enum (audit-7) ──────────────────────────
-
-enum VCardPropertyType {
-    home @0;
-    work @1;
-    text @2;
-    voice @3;
-    fax @4;
-    cell @5;
-    video @6;
-    pager @7;
-    bbs @8;
-    modem @9;
-    car @10;
-    isdn @11;
-    pref @12;
-    custom @13;
-}
-
-# ─── vCard Sync (false positive: vcard_sync.capnp) ──────────
+# ─── vCard Sync ──────────────────────────────────────────────
 
 struct VCardSyncResult {
-    # New sync token.
     newSyncToken @0 :Text;
-    # vCards added or modified since last sync.
     changed @1 :List(VCard);
-    # Contact IDs deleted since last sync.
     deleted @2 :List(T.ContactId);
-    # Whether there are more changes to fetch.
     hasMore @3 :Bool;
-    # Sync conflicts that need resolution.
     conflicts @4 :List(VCardSyncConflict);
 }
 
@@ -664,40 +599,30 @@ struct VCardSyncConflict {
     detectedAt @4 :T.Timestamp;
 }
 
-enum ConflictResolution {
-    keepLocal @0;
-    keepRemote @1;
-    merge @2;
-    custom @3;
-}
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Today's spellings for the open tokens above (the TYPE parameters, the
+# level vocabulary, the pronunciation formats). Nothing requires them;
+# an unrecognized token MUST be preserved verbatim on round-trip and
+# ignored by a consumer that does not understand it — which is what
+# makes a 2046 property parameter lossless.
+# ══════════════════════════════════════════════════════════════════════
 
-# ─── Schema Validation (false positive: vcard_schema) ────────
+const typeHome :Text = "home";
+const typeWork :Text = "work";
+const typeCell :Text = "cell";
+const typeFax  :Text = "fax";
+const typePref :Text = "pref";
 
-struct VCardPropertySchema {
-    # All known property definitions.
-    properties @0 :List(PropertyDefinition);
-    # Required properties per version.
-    requiredProperties @1 :List(RequiredProperty);
-    # Custom property namespace registrations.
-    customNamespaces @2 :List(CustomNamespace);
-}
+const levelBeginner :Text = "beginner";
+const levelAverage  :Text = "average";
+const levelGood     :Text = "good";
+const levelExpert   :Text = "expert";
+const levelMaster   :Text = "master";
+const levelLow      :Text = "low";
+const levelMedium   :Text = "medium";
+const levelHigh     :Text = "high";
 
-struct PropertyDefinition {
-    name @0 :Text;
-    description @1 :Text;
-    versions @2 :List(VCardVersion);
-    cardinality @3 :Cardinality;
-    allowedValues @4 :List(Text);
-    parameters @5 :List(Text);
-}
-
-struct RequiredProperty {
-    version @0 :VCardVersion;
-    properties @1 :List(Text);
-}
-
-struct CustomNamespace {
-    prefix @0 :Text;
-    uri @1 :T.Uri;
-    description @2 :Text;
-}
+const pronunciationIpa   :Text = "ipa";
+const pronunciationXsampa :Text = "x-sampa";

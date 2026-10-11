@@ -1,6 +1,7 @@
 @0xa1b2c3d4e5f60103;
 
 using T = import "types.capnp";
+using M = import "mount.capnp";
 
 # ═══════════════════════════════════════════════════════════════════════
 # Storage — block device management, LVM/RAID, storage pools.
@@ -11,12 +12,32 @@ using T = import "types.capnp";
 #
 # hal.capnp covers hardware; this covers OS-level storage pools.
 #
-# Used by: filesystem.capnp (mount sources), device.capnp (storage devices)
+# Revamp fixes (this wave):
+#   - The header's promise is now true. It opens with "no LVM, no mdadm,
+#     no ZFS, no Btrfs, no Storage Spaces, no VxVM" and then declared
+#     `PoolType` — a REQUIRED field — whose values are exactly those
+#     products. A consumer reading the header would pass values the
+#     header promised cannot exist. The pool/bus/redundancy/encryption
+#     vocabularies are open tokens now: reported, never prescribed.
+#   - The promoted typed IDs are adopted (T.StoragePoolId / T.VolumeId /
+#     T.SnapshotId); the local shadow structs are deleted.
+#   - Day-long operations (scrub, rebuild, migration, replication) are
+#     subscribable. They were reachable only by polling a getter, so a
+#     consumer monitored a 40 TB scrub with an RPC loop for hours.
+#   - `FilesystemInfo` and `FilesystemCheckResult` come from
+#     mount.capnp, their canonical home — this file declared private
+#     copies with different shapes.
+#   - Block I/O can name its buffer (T.BufferId beside the slot), so the
+#     zero-copy block path is expressible instead of out-of-band.
+#   - The block-device driver (BlockProvider) is reachable: acquire it
+#     by presenting a capability, per the ai.capnp precedent.
+#
+# Used by: mount.capnp (mount sources), device.capnp (storage devices)
 # ═══════════════════════════════════════════════════════════════════════
 
 interface StorageService {
     # List all block devices.
-    listDevices @0 (filter :DeviceFilter, pagination :T.Pagination) -> (devices :List(BlockDevice), totalCount :UInt32);
+    listDevices @0 (filter :BlockDeviceFilter, pagination :T.Pagination) -> (devices :List(BlockDevice), totalCount :UInt32);
 
     # Get detailed info for a block device.
     getDevice @1 (deviceId :T.DeviceId) -> (device :BlockDevice);
@@ -64,7 +85,7 @@ interface StorageService {
     deleteSnapshot @15 (snapshotId :T.SnapshotId) -> T.VoidResult;
 
     # Check and repair filesystem on a volume.
-    checkFilesystem @16 (volumeId :T.VolumeId, repair :Bool) -> (result :FilesystemCheckResult);
+    checkFilesystem @16 (volumeId :T.VolumeId, repair :Bool) -> (result :M.FilesystemCheckResult);
 
     # Get SMART data for a block device.
     getSmartData @17 (deviceId :T.DeviceId) -> (smart :SmartData);
@@ -73,7 +94,7 @@ interface StorageService {
     runSmartTest @18 (deviceId :T.DeviceId, type :SmartTestType) -> (testId :Text);
 
     # Get SMART test results.
-    getSmartTestResults @19 (deviceId :T.DeviceId) -> (results :List(SmartTestResult));
+    getSmartTestResults @19 (deviceId :T.DeviceId, pagination :T.Pagination) -> (results :List(SmartTestResult), totalCount :UInt64);
 
     # Subscribe to storage events (device added/removed, pool state changes, etc.).
     subscribeStorage @20 () -> (subscription :StorageSubscription);
@@ -155,7 +176,7 @@ interface StorageService {
     replicatePool @40 (request :ReplicatePoolRequest) -> (replicationId :Text);
 
     # Get replication status.
-    getReplicationStatus @41 (replicationId :Text) -> (status :ReplicationStatus);
+    getReplicationStatus @41 (replicationId :Text) -> (status :PoolReplicationStatus);
 
     # Stop replication.
     stopReplication @42 (replicationId :Text) -> T.VoidResult;
@@ -198,6 +219,57 @@ interface StorageService {
 
     # Get compression statistics for a volume (not just pool).
     getVolumeCompressionStats @50 (volumeId :T.VolumeId) -> (stats :VolumeCompressionStats);
+
+    # ─── Progress for the day-long operations ─────────────────────────────
+    # A scrub of a 40 TB pool, a rebuild, a live migration and a
+    # replication sync all run for hours. They used to be reachable only
+    # by polling a getter, so every consumer ran an RPC loop and every
+    # backend picked its own poll interval. Each now has a subscription
+    # (pull + cancel), with the one-shot getters kept for a point check.
+
+    subscribeScrub @51 (poolId :T.StoragePoolId) -> (subscription :StorageProgressSubscription);
+    subscribeRebuild @52 (poolId :T.StoragePoolId) -> (subscription :StorageProgressSubscription);
+    subscribeMigration @53 (migrationId :Text) -> (subscription :StorageProgressSubscription);
+    subscribeReplication @54 (replicationId :Text) -> (subscription :StorageProgressSubscription);
+
+    # ─── Block device drivers ─────────────────────────────────────────────
+    # A block device driver is a capability: acquire the provider by
+    # presenting one. Holding the returned reference IS the authority to
+    # drive the device (the ai.capnp precedent — no per-method token
+    # inside the provider).
+    blockProvider @55 (authority :Capability) -> (provider :BlockProvider);
+}
+
+# One progress vocabulary for the four long operations. The one-shot
+# getters (getScrubProgress, getRebuildProgress, getMigrationProgress,
+# getReplicationStatus) remain for a point-in-time check.
+interface StorageProgressSubscription {
+    pull @0 () -> (progress :StorageProgress);
+    cancel @1 () -> T.VoidResult;
+}
+
+struct StorageProgress {
+    # Which operation this is, as an open token ("scrub", "rebuild",
+    # "migration", "replication").
+    operation @0 :Text;
+    # The operation's id (pool id, migration id or replication id).
+    subjectId @1 :Text;
+    # What is being done right now, as an open token.
+    phase @2 :Text;
+    bytesProcessed @3 :UInt64;
+    totalBytes @4 :UInt64;
+    itemsProcessed @5 :UInt64;
+    totalItems @6 :UInt64;
+    errorsFound @7 :UInt64;
+    errorsRepaired @8 :UInt64;
+    startedAt @9 :T.Timestamp;
+    estimatedCompletion @10 :T.Timestamp;
+    estimatedCompletionKnown @11 :Bool;
+    # Whether the operation is complete.
+    complete @12 :Bool;
+    # Terminal error, if any.
+    error @13 :T.Error;
+    metadata @14 :T.StringMap;
 }
 
 interface StorageSubscription {
@@ -223,10 +295,15 @@ struct BlockDevice {
     sectorSize @6 :UInt32;
     # Physical sector size in bytes.
     physicalSectorSize @7 :UInt32;
-    # Device type.
-    type @8 :BlockDeviceType;
-    # Bus/interface type.
-    bus @9 :BusType;
+    # Device type as an open token ("disk", "partition", "loop", ...).
+    # The old enum's crypt/lvm/md/zfs/btrfs values were device-mapper
+    # internals: a network-backed virtual disk was unclassifiable except
+    # as `custom`.
+    type @8 :Text;
+    # Bus/interface as an open token ("nvme", "usb", "virtio", ...):
+    # reported, never prescribed. (The foundation deleted its own
+    # BusType enum for the same reason.)
+    bus @9 :Text;
     # WWN (World Wide Name) for SCSI/FC devices.
     wwn @10 :Text;
     # NUMA node.
@@ -239,8 +316,8 @@ struct BlockDevice {
     readOnly @14 :Bool;
     # Current I/O scheduler.
     scheduler @15 :Text;
-    # Partition table type.
-    partitionTable @16 :PartitionTableType;
+    # Partition table type as an open token ("gpt", "mbr", ...).
+    partitionTable @16 :Text;
     # Partitions on this device.
     partitions @17 :List(Partition);
     # SMART health status.
@@ -253,94 +330,51 @@ struct BlockDevice {
     metadata @21 :T.StringMap;
 }
 
-enum BlockDeviceType {
-    unknown @0;
-    disk @1;           # HDD, SSD, NVMe
-    partition @2;
-    loop @3;           # Loopback device
-    ram @4;            # Ramdisk
-    floppy @5;
-    cdrom @6;
-    tape @7;
-    crypt @8;          # dm-crypt / LUKS
-    lvm @9;            # LVM logical volume
-    md @10;            # Linux md RAID
-    zfs @11;           # ZFS zvol
-    btrfs @12;         # Btrfs subvolume
-    vhd @13;           # Virtual hard disk
-    custom @14;
-}
+# Removed: BlockDeviceType (crypt/lvm/md/zfs/btrfs) — device-mapper
+# internals. Reported as an open token instead.
 
-enum BusType {
-    unknown @0;
-    scsi @1;
-    ata @2;
-    sata @3;
-    nvme @4;
-    usb @5;
-    sd @6;
-    mmc @7;
-    virtio @8;
-    spdk @9;
-    nbd @10;           # Network block device
-    rbd @11;           # Ceph RBD
-    iscsi @12;
-    fc @13;            # Fibre Channel
-    aoe @14;           # ATA over Ethernet
-    custom @15;
-}
+# Removed: BusType (scsi/ata/nvme/spdk/nbd/rbd/iscsi/aoe) shadowed the
+# foundation's enum with a different value set and named vendor tooling.
+# The bus is reported as an open token.
 
-enum PartitionTableType {
-    none @0;
-    mbr @1;
-    gpt @2;
-    bsd @3;
-    sun @4;
-    sgI @5;
-    custom @6;
-}
+# Removed: PartitionTableType (mbr/gpt/bsd/sun/sgI) — sgI and sun were
+# vendor nouns. Reported as an open token.
 
 struct Partition {
     # Partition number (1-based).
     number @0 :UInt32;
-    # Start sector.
-    start @1 :UInt64;
-    # Size in sectors.
-    size @2 :UInt64;
+    # Start offset in bytes. (Sector geometry is a device detail a
+    # consumer should not route on; it is reported in `metadata`.)
+    startBytes @1 :UInt64;
     # Size in bytes.
-    sizeBytes @3 :UInt64;
+    sizeBytes @2 :UInt64;
     # Partition type GUID/ID.
-    typeGuid @4 :Text;
+    typeGuid @3 :Text;
     # Partition label/name.
-    label @5 :Text;
+    label @4 :Text;
     # UUID.
-    uuid @6 :Text;
-    # Flags (boot, esp, lvm, raid, etc.).
-    flags @7 :List(PartitionFlag);
+    uuid @5 :Text;
+    # Flags as open tokens ("boot", "esp", "swap", ...): the old
+    # PartitionFlag enum carried vendor flag names a container-image
+    # backend partitions nothing with.
+    flags @6 :List(Text);
     # Filesystem on this partition (if detected).
-    filesystem @8 :FilesystemInfo;
+    filesystem @7 :M.FilesystemInfo;
+    # Backend-specific metadata (sector geometry, alignment, ...).
+    metadata @8 :T.StringMap;
 }
 
-enum PartitionFlag {
-    boot @0;
-    esp @1;           # EFI System Partition
-    lvm @2;
-    raid @3;
-    swap @4;
-    hidden @5;
-    readonly @6;
-    custom @7;
-}
+# Removed: PartitionFlag (boot/esp/lvm/raid/swap) — vendor flags.
+# Reported as open tokens.
 
 # ─── Storage Pool ────────────────────────────────────────────────────
-
-struct StoragePoolId { id @0 :UInt64; }
 
 struct StoragePool {
     id @0 :T.StoragePoolId;
     name @1 :Text;
-    # Pool type / backend.
-    type @2 :PoolType;
+    # Pool type / backend as an open token ("lvm", "zfs", "btrfs", ...).
+    # The header forbids prescribing these; a 2046 pool is a string.
+    type @2 :Text;
     # Devices composing this pool.
     devices @3 :List(T.DeviceId);
     # Total capacity in bytes.
@@ -349,8 +383,10 @@ struct StoragePool {
     used @5 :UInt64;
     # Available space in bytes.
     available @6 :UInt64;
-    # Redundancy level.
-    redundancy @7 :RedundancyLevel;
+    # Redundancy as an open token ("none", "mirror", "singleParity",
+    # "doubleParity", ...). raidz1/2/3 were ZFS spellings of what math
+    # calls 1/2/3 parity drives — the vendor name added no information.
+    redundancy @7 :Text;
     # Pool state.
     state @8 :PoolState;
     # Filesystem type (if pool has a default fs).
@@ -376,45 +412,13 @@ struct StoragePool {
     metadata @19 :T.StringMap;
 }
 
-enum PoolType {
-    unknown @0;
-    lvm @1;            # LVM volume group
-    mdraid @2;         # Linux md RAID
-    zfs @3;            # ZFS zpool
-    btrfs @4;          # Btrfs pool
-    storagespaces @5;  # Windows Storage Spaces
-    stratis @6;        # Stratis pool
-    vdo @7;            # VDO (dedup/compression)
-    bcache @8;         # bcache/bcachefs
-    # Ceph distributed storage
-    ceph @9;
-    # GlusterFS volume
-    gluster @10;
-    # NetApp ONTAP
-    ontap @11;
-    # Veritas Volume Manager
-    vvm @12;
-    # Solaris ZFS (if distinct from Linux ZFS)
-    illumosZfs @13;
-    # VMware VMFS
-    vmfs @14;
-    # NVMe-oF namespace
-    nvmeof @15;
-    # Custom backend
-    custom @16;
-}
+# Removed: the 17-value PoolType enum (lvm/mdraid/zfs/btrfs/storagespaces/
+# stratis/vdo/bcache/ceph/gluster/ontap/vvm/illumosZfs/vmfs/nvmeof), which
+# named the exact products the file header forbids, in a required field.
+# A pool's backend kind is reported as an open token.
 
-enum RedundancyLevel {
-    none @0;           # No redundancy (JBOD, stripe)
-    mirror @1;         # Mirror (RAID 1)
-    raid5 @2;          # RAID 5 (single parity)
-    raid6 @3;          # RAID 6 (dual parity)
-    raid10 @4;         # RAID 10 (mirrored stripes)
-    raidz1 @5;         # ZFS RAID-Z1
-    raidz2 @6;         # ZFS RAID-Z2
-    raidz3 @7;         # ZFS RAID-Z3
-    custom @8;
-}
+# Removed: RedundancyLevel (raid5/raid6/raid10/raidz1/raidz2/raidz3) —
+# RAID layout is backend vocabulary; reported as an open token.
 
 enum PoolState {
     unknown @0;
@@ -432,8 +436,6 @@ enum PoolState {
 }
 
 # ─── Volume ──────────────────────────────────────────────────────────
-
-struct VolumeId { id @0 :UInt64; }
 
 struct Volume {
     id @0 :T.VolumeId;
@@ -495,8 +497,6 @@ enum VolumeState {
 
 # ─── Snapshot ────────────────────────────────────────────────────────
 
-struct SnapshotId { id @0 :UInt64; }
-
 struct Snapshot {
     id @0 :T.SnapshotId;
     name @1 :Text;
@@ -532,9 +532,10 @@ enum SnapshotState {
 
 struct CreatePoolRequest {
     name @0 :Text;
-    type @1 :PoolType;
+    # Pool type as an open token (see StoragePool.type).
+    type @1 :Text;
     devices @2 :List(T.DeviceId);
-    redundancy @3 :RedundancyLevel;
+    redundancy @3 :Text;
     # Filesystem to create on pool.
     filesystem @4 :Text;
     # Encryption.
@@ -560,9 +561,10 @@ struct ResizePoolRequest {
     # Devices to remove (must be empty/unused).
     removeDevices @1 :List(T.DeviceId);
     # New redundancy level (if changing).
-    newRedundancy @2 :RedundancyLevel;
+    newRedundancy @2 :Text;
     # Force removal even if data movement required.
     force @3 :Bool;
+    metadata @4 :T.StringMap;
 }
 
 struct CreateVolumeRequest {
@@ -582,22 +584,11 @@ struct CreateVolumeRequest {
 
 # ─── Filesystem Info ─────────────────────────────────────────────────
 
-struct FilesystemInfo {
-    type @0 :Text;           # ext4, xfs, btrfs, zfs, ntfs, fat32, etc.
-    label @1 :Text;
-    uuid @2 :Text;
-    size @3 :UInt64;
-    used @4 :UInt64;
-    available @5 :UInt64;
-    mountPoint @6 :Text;
-    mountOptions @7 :List(Text);
-    features @8 :List(Text);  # Filesystem-specific features
-    lastChecked @9 :T.Timestamp;
-    state @10 :FilesystemState;
-}
-
-enum FilesystemState {
-    unknown @0;
+# Removed: this file's private `FilesystemInfo` (a different shape from
+# mount.capnp's). The canonical filesystem descriptor and check-result
+# contract live in mount.capnp and are referenced here as `M.*`.
+enum VolumeVolumeFilesystemState {
+    unspecified @0;
     clean @1;
     dirty @2;
     error @3;
@@ -605,13 +596,7 @@ enum FilesystemState {
     custom @5;
 }
 
-struct FilesystemCheckResult {
-    success @0 :Bool;
-    errorsFound @1 :UInt32;
-    errorsFixed @2 :UInt32;
-    details @3 :Text;
-    duration @4 :T.Duration;
-}
+
 
 # ─── SMART Data ──────────────────────────────────────────────────────
 
@@ -631,6 +616,7 @@ struct SmartData {
     lastTestTime @6 :T.Timestamp;
     # Last self-test result.
     lastTestResult @7 :SmartTestResult;
+    metadata @8 :T.StringMap;
 }
 
 enum SmartHealthStatus {
@@ -651,6 +637,7 @@ struct SmartAttribute {
     flags @6 :UInt16;          # Attribute flags
     # Whether value is below threshold (pre-fail).
     failing @7 :Bool;
+    metadata @8 :T.StringMap;
 }
 
 enum SmartTestType {
@@ -687,6 +674,7 @@ struct IoStatsTarget {
         device @0 :T.DeviceId;
         pool @1 :T.StoragePoolId;
         volume @2 :T.VolumeId;
+        custom @3 :Data;
     }
 }
 
@@ -711,18 +699,20 @@ struct IoStats {
     # Queue depth.
     avgQueueDepth @13 :Float32;
     maxQueueDepth @14 :UInt32;
-    # Latency percentiles (microseconds).
-    readLatencyP50 @15 :UInt32;
-    readLatencyP95 @16 :UInt32;
-    readLatencyP99 @17 :UInt32;
-    writeLatencyP50 @18 :UInt32;
-    writeLatencyP95 @19 :UInt32;
-    writeLatencyP99 @20 :UInt32;
+    # Latency percentiles. T.Duration, so the unit travels with the
+    # value instead of living in a comment.
+    readLatencyP50 @15 :T.Duration;
+    readLatencyP95 @16 :T.Duration;
+    readLatencyP99 @17 :T.Duration;
+    writeLatencyP50 @18 :T.Duration;
+    writeLatencyP95 @19 :T.Duration;
+    writeLatencyP99 @20 :T.Duration;
     # Errors.
     readErrors @21 :UInt64;
     writeErrors @22 :UInt64;
     # Timestamp of stats collection.
     collectedAt @23 :T.Timestamp;
+    metadata @24 :T.StringMap;
 }
 
 # ─── Storage Events ──────────────────────────────────────────────────
@@ -751,6 +741,7 @@ struct DeviceFailed {
     deviceId @0 :T.DeviceId;
     reason @1 :Text;
     smartData @2 :SmartData;
+    metadata @3 :T.StringMap;
 }
 
 struct PoolStateChanged {
@@ -762,29 +753,37 @@ struct PoolStateChanged {
 struct VolumeMounted {
     volumeId @0 :T.VolumeId;
     mountPoint @1 :Text;
+    metadata @2 :T.StringMap;
 }
 
 struct VolumeUnmounted {
     volumeId @0 :T.VolumeId;
     mountPoint @1 :Text;
+    metadata @2 :T.StringMap;
 }
 
 struct SmartThresholdExceeded {
     deviceId @0 :T.DeviceId;
     attribute @1 :SmartAttribute;
+    metadata @2 :T.StringMap;
 }
 
 # ─── Filters ─────────────────────────────────────────────────────────
 
-struct DeviceFilter {
-    type @0 :BlockDeviceType;
-    bus @1 :BusType;
+# Renamed from DeviceFilter (device.capnp and input.capnp each declare
+# their own): this one filters BLOCK devices.
+struct BlockDeviceFilter {
+    # Device type as an open token.
+    type @0 :Text;
+    # Bus as an open token.
+    bus @1 :Text;
     namePattern @2 :Text;
     minSize @3 :UInt64;
     maxSize @4 :UInt64;
     rotational @5 :Bool;
     removable @6 :Bool;
     smartStatus @7 :SmartHealthStatus;
+    metadata @8 :T.StringMap;
 }
 
 # ─── Scrub Operations ────────────────────────────────────────────
@@ -814,6 +813,7 @@ struct CacheTierRequest {
         add @0 :CacheTierAdd;
         remove @1 :CacheTierRemove;
         status @2 :Void;
+        custom @3 :Data;
     }
 }
 
@@ -821,7 +821,7 @@ struct CacheTierAdd {
     # Devices to use as cache.
     devices @0 :List(T.DeviceId);
     # Cache mode (write-back, write-through).
-    mode @1 :CacheMode;
+    mode @1 :CachePolicy;
     # Cache size (0 = auto).
     cacheSize @2 :UInt64;
 }
@@ -833,7 +833,7 @@ struct CacheTierRemove {
     force @1 :Bool;
 }
 
-enum CacheMode {
+enum CachePolicy {
     writeBack @0;     # Writes go to cache first, flushed later
     writeThrough @1;  # Writes go to both cache and backing device
     readAhead @2;     # Only read caching
@@ -845,55 +845,56 @@ enum CacheMode {
 struct PartitionDiskRequest {
     # Device to partition.
     deviceId @0 :T.DeviceId;
-    # Partition table type to create.
-    tableType @1 :PartitionTableType;
+    # Partition table type as an open token ("gpt", "mbr", ...).
+    tableType @1 :Text;
     # Partitions to create.
     partitions @2 :List(PartitionCreate);
     # Wipe existing partition table first.
     wipe @3 :Bool = true;
+    metadata @4 :T.StringMap;
 }
 
 struct PartitionCreate {
-    # Start sector (0 = auto).
-    startSector @0 :UInt64;
-    # Size in sectors or bytes (0 = fill remaining).
-    sizeSectors @1 :UInt64;
+    # Start offset in bytes (0 = auto).
+    startBytes @0 :UInt64;
+    # Size in bytes (0 = fill remaining).
+    sizeBytes @1 :UInt64;
     # Partition type GUID (GPT) or hex ID (MBR).
     typeGuid @2 :Text;
     # Human-readable label.
     label @3 :Text;
-    # Flags to set.
-    flags @4 :List(PartitionFlag);
+    # Flags as open tokens ("boot", "esp", "swap", ...).
+    flags @4 :List(Text);
+    metadata @5 :T.StringMap;
 }
 
 struct PartitionDiskResult {
     success @0 :Bool;
     partitions @1 :List(Partition);
     errors @2 :List(T.Error);
+    metadata @3 :T.StringMap;
 }
 
 # ─── Volume Encryption ───────────────────────────────────────────
 
+# Removed: EncryptionMethod (luks1/luks2/bitlocker/filevault) — four
+# products from two OS families; a capability-native sealed volume had no
+# value. The algorithm is an open token.
 struct EncryptVolumeRequest {
     # Volume to encrypt.
     volumeId @0 :T.VolumeId;
-    # Encryption method.
-    method @1 :EncryptionMethod;
+    # Encryption algorithm as an open token.
+    method @1 :Text;
     # Key ID from crypto.capnp key management (replaces bare Data).
     keyId @2 :T.KeyId;
     # Cipher to use (empty = backend default).
     cipher @3 :Text;
     # Key size in bits (e.g., 256).
     keySize @4 :UInt32;
+    metadata @5 :T.StringMap;
 }
 
-enum EncryptionMethod {
-    luks1 @0;         # LUKS version 1
-    luks2 @1;         # LUKS version 2
-    bitlocker @2;     # Windows BitLocker
-    filevault @3;     # macOS FileVault
-    custom @4;
-}
+
 
 # ─── RAID Rebuild ─────────────────────────────────────────────
 
@@ -948,6 +949,7 @@ struct ImportPoolRequest {
     name @1 :Text;
     # Devices to import to.
     devices @2 :List(T.DeviceId);
+    metadata @3 :T.StringMap;
 }
 
 # ─── Volume Clone ─────────────────────────────────────────────
@@ -977,7 +979,7 @@ struct MigrateVolumeRequest {
     bandwidthLimit @4 :UInt64;
 }
 
-enum MigrationState {
+enum VolumeMigrationState {
     pending @0;
     running @1;
     completed @2;
@@ -990,7 +992,7 @@ enum MigrationState {
 struct MigrationProgress {
     migrationId @0 :Text;
     volumeId @1 :T.VolumeId;
-    state @2 :MigrationState;
+    state @2 :VolumeMigrationState;
     # Percentage complete.
     percentComplete @3 :Float32;
     # Bytes migrated.
@@ -999,6 +1001,7 @@ struct MigrationProgress {
     totalBytes @5 :UInt64;
     # Estimated time remaining.
     estimatedRemaining @6 :T.Duration;
+    metadata @7 :T.StringMap;
 }
 
 # ─── Storage Tiering ──────────────────────────────────────────
@@ -1065,7 +1068,7 @@ enum ReplicationState {
     custom @6;
 }
 
-struct ReplicationStatus {
+struct PoolReplicationStatus {
     replicationId @0 :Text;
     sourcePoolId @1 :T.StoragePoolId;
     targetPoolId @2 :T.StoragePoolId;
@@ -1077,6 +1080,7 @@ struct ReplicationStatus {
     bytesReplicated @6 :UInt64;
     # Last sync timestamp.
     lastSyncAt @7 :T.Timestamp;
+    metadata @8 :T.StringMap;
 }
 
 # ─── I/O Stats Subscription ───────────────────────────────────
@@ -1091,11 +1095,12 @@ interface IoStatsSubscription {
 struct EncryptionStatus {
     volumeId @0 :T.VolumeId;
     encrypted @1 :Bool;
-    method @2 :EncryptionMethod;
-    algorithm @3 :Text;
-    keyId @4 :T.KeyId;
+    # Algorithm as an open token.
+    method @2 :Text;
+    keyId @3 :T.KeyId;
     # Whether the volume is currently unlocked.
-    unlocked @5 :Bool;
+    unlocked @4 :Bool;
+    metadata @5 :T.StringMap;
 }
 
 # ─── Pool Deduplication Stats ───────────────────────────────
@@ -1126,6 +1131,7 @@ struct PoolCompressionStats {
     ratio @3 :Float32;
     # Compression algorithm used.
     algorithm @4 :Text;
+    metadata @5 :T.StringMap;
 }
 
 # ─── Historical I/O Stats Subscription ──────────────────────
@@ -1174,6 +1180,7 @@ struct VolumeCompressionStats {
     ratio @3 :Float32;
     # Compression algorithm.
     algorithm @4 :Text;
+    metadata @5 :T.StringMap;
 }
 # ═══════════════════════════════════════════════════════════════════════
 # v0.0.2 additions — Block Device Provider
@@ -1202,6 +1209,9 @@ interface BlockProvider {
 }
 
 struct BlockGeometry {
+    # Backend dispatch class as open tokens ("nvme", "ahci",
+    # "virtio-blk", "usb-msd", ...).
+    driverClasses @0 :List(Text);
     # Logical block size (bytes). May be smaller than physical.
     logicalBlockSize @1 :UInt32;
     # Physical sector size (bytes).
@@ -1216,8 +1226,7 @@ struct BlockGeometry {
     discard @6 :Bool;
     # Whether the device supports secure erase (e.g. NVMe format / sanitize).
     secureErase @7 :Bool;
-    # Backend dispatch class (NVMe, AHCI, virtio-blk, USB-MSD, ...).
-    driverClasses @0 :List(Text);
+    metadata @8 :T.StringMap;
 }
 
 struct BlockIoOp {
@@ -1236,8 +1245,12 @@ struct BlockRange {
     startBlock @0 :UInt64;
     # Number of blocks.
     blockCount @1 :UInt32;
-    # Buffer slot the driver reads from / writes to.
+    # Slot within the provider's ring.
     bufferSlot @2 :UInt32;
+    # The shared-memory buffer the I/O lands in. THE zero-copy path:
+    # without this identity the block path depends on an out-of-band
+    # slot-to-buffer agreement every backend invents for itself.
+    buffer @3 :T.BufferId;
 }
 
 struct BlockWriteOp {
@@ -1257,10 +1270,12 @@ struct BlockHealth {
     degraded @3 :Bool;
     # Driver-defined extras.
     extras @4 :List(BlockHealthEntry);
+    metadata @5 :T.StringMap;
 }
 
 struct BlockHealthEntry {
     name @0 :Text;
     typeTag @1 :UInt8;
     value @2 :Int64;
+    metadata @3 :T.StringMap;
 }

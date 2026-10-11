@@ -6,14 +6,59 @@ using T = import "types.capnp";
 # Crypto — general-purpose cryptographic operations.
 #
 # Zero backend assumptions: no OpenSSL, no libsodium, no CryptoAPI,
-# no WebCrypto, no BoringSSL, no TPM assumptions. Backend provides
-# cryptographic primitives; protocol defines the contract.
+# no WebCrypto, no BoringSSL, no TPM, no HSM vendor. The backend provides
+# the primitives; this file defines the contract.
 #
-# Deduplicates crypto bits from auth.capnp, biometric.capnp,
-# backup.capnp, signature.capnp, key_management.capnp.
+# ── THE VOCABULARY RULE ─────────────────────────────────────────────────
 #
-# Used by: auth.capnp (password hashing), backup.capnp (checksum),
-# signature.capnp (hash algorithms), key_management.capnp (key ops)
+# This file contains NO algorithm enums. That is deliberate, and it is the
+# same rule ai.capnp states at the top of its own header: an enum ordinal
+# is a permanent commitment to a technology, and any list of algorithms is
+# today's list.
+#
+# The proof is this file's own history. It was amended once already — NIST
+# FIPS 203/204/205 (ML-KEM, ML-DSA, SLH-DSA) had to be appended as new
+# permanent ordinals because the original list lacked them. Every future
+# construction would have cost the same tax forever, and a backend could
+# never be asked for an algorithm the list happened to omit. Two backends
+# therefore could not interoperate on anything invented after the list was
+# frozen, and `custom @N` carried no identification, so even a working
+# "custom" exchange was unintelligible to the peer.
+#
+# So an algorithm is an OPEN TOKEN (Text) plus an open parameter map:
+#
+#   algorithm  @0 :Text;          # see CONFORMANCE TOKENS below
+#   parameters @1 :T.StringMap;   # key sizes, modes, cost knobs
+#
+# Interoperability is preserved by the tokens being published as `const`
+# values that nothing requires and that an unrecognized consumer ignores —
+# exactly the pattern ai.capnp's CONFORMANCE TOKENS section establishes.
+# New constructions become requestable with NO schema change and NO new
+# ordinal. `getSupportedAlgorithms` reports the same spellings, so a caller
+# can ask a peer what it supports before asking for it.
+#
+# This file is the canonical crypto vocabulary home. signature.capnp,
+# key_management.capnp, biometric.capnp and secret.capnp import these
+# tokens; none of them re-declares an algorithm list. (The previous local
+# copies in signature.capnp and this file carried the SAME enum names at
+# DIVERGENT ordinals — ed25519 @0 vs @12, sha256 @0 vs @1 — so a bare
+# algorithm ordinal crossing that boundary was silently reinterpreted.)
+#
+# ── AUTHORITY IS THE INTERFACE REFERENCE ───────────────────────────────
+#
+# No method takes a Capability parameter. Holding the reference IS the
+# authority to use the primitive; attenuation and revocation belong to
+# capability.capnp.
+#
+# ── ZERO-COPY IS A CONSTRAINT ──────────────────────────────────────────
+#
+# Every bulk payload is a T.DataHandle: ciphertexts, plaintexts, key
+# material, wrapped keys, shared secrets, random output, certificate
+# blobs. Request sides already were handle-based; result sides now are
+# too, so an encrypt→decrypt round trip of a 100 MB payload no longer
+# copies it twice. Small, construction-bounded values (digests, tags,
+# nonces, signatures, fingerprints) stay inline `Data`: a handle for a
+# 16-byte tag would add a copy, not remove one.
 # ═══════════════════════════════════════════════════════════════════════
 
 interface CryptoService {
@@ -43,8 +88,11 @@ interface CryptoService {
 
     # ─── Secure Random ──────────────────────────────────────────────
 
-    # Generate cryptographically secure random bytes.
-    randomBytes @6 (length :UInt32) -> (bytes :Data);
+    # Generate cryptographically secure random bytes. The result is a
+    # handle: the previous inline `Data` return capped generation at the
+    # message size, so a key or nonce larger than one message could not
+    # be produced at all.
+    randomBytes @6 (length :UInt32) -> (bytes :T.DataHandle);
 
     # Generate random bytes into a buffer (for large requests).
     randomBytesBuffer @7 (bufferId :T.BufferId, offset :UInt64, length :UInt32) -> T.VoidResult;
@@ -66,9 +114,8 @@ interface CryptoService {
     sign @11 (request :SignRequest) -> (result :SignResult);
 
     # Verify signature with public key.
-    verify @12 (request :VerifyRequest) -> (result :VerifyResult);
-
-    # Key agreement (ECDH, X25519, etc.).
+    verify @12 (request :SignatureVerifyRequest) -> (result :SignatureVerifyResult);
+    # Key agreement (ECDH, X25519, ML-KEM, ...).
     keyAgreement @13 (request :KeyAgreementRequest) -> (result :KeyAgreementResult);
 
     # ─── Key Wrapping/Unwrapping ──────────────────────────────────
@@ -81,37 +128,46 @@ interface CryptoService {
 
     # ─── Key Import/Export ────────────────────────────────────────
 
-    # Import a key from a standard format (PKCS#8, SPKI, JWK, PEM).
-    importKey @22 (request :ImportKeyRequest) -> (result :ImportKeyResult);
-
-    # Export a key to a standard format.
-    exportKey @23 (request :ExportKeyRequest) -> (result :ExportKeyResult);
-
     # ─── Certificate Operations ────────────────────────────────────
 
-    # Parse X.509 certificate.
-    parseCertificate @16 (der :Data) -> (cert :CertificateInfo);
+    # Parse a certificate. `format` is an open token ("der", "pem", ...);
+    # the previous signature accepted only raw DER, which made DER
+    # effectively mandatory for every backend.
+    parseCertificate @16 (certificate :T.DataHandle, format :Text) -> (cert :CertificateInfo);
 
-    # Verify certificate chain.
-    verifyCertificateChain @17 (chain :List(Data), trustAnchors :List(Data)) -> (result :VerifyChainResult);
+    # Verify certificate chain. `format` names the encoding of every blob
+    # in `chain` and `trustAnchors`.
+    verifyCertificateChain @17 (chain :List(T.DataHandle), trustAnchors :List(T.DataHandle),
+                                format :Text) -> (result :VerifyChainResult);
 
     # ─── Constant-Time Operations ──────────────────────────────────
 
-    # Constant-time memory comparison.
-    constantTimeCompare @18 (a :Data, b :Data) -> (equal :Bool);
+    # Constant-time memory comparison. Both operands are handles: copying
+    # two secrets inline before the "constant-time" step both defeated the
+    # property the method exists to provide and left two secrets in the
+    # message arena.
+    constantTimeCompare @18 (a :T.DataHandle, b :T.DataHandle) -> (equal :Bool);
 
     # Constant-time memory copy (for secret data).
-    constantTimeCopy @19 (dst :T.BufferId, src :Data, offset :UInt64) -> T.VoidResult;
+    constantTimeCopy @19 (dst :T.BufferId, src :T.DataHandle, offset :UInt64) -> T.VoidResult;
 
     # ─── Capability Query ──────────────────────────────────────────
 
-    # Get supported algorithms.
+    # Report the algorithms this backend supports, as open tokens.
     getSupportedAlgorithms @20 () -> (algorithms :SupportedAlgorithms);
 
-    # Check if algorithm/hardware acceleration is available.
+    # Check if an algorithm (and hardware acceleration for it) is available.
     isAlgorithmSupported @21 (algorithm :AlgorithmSpec) -> (supported :Bool, hardwareAccelerated :Bool);
 
-    # ─── Streaming AEAD (Audit-7) ──────────────────────────────────
+    # Import a key. `format` is an open token, so a backend holding a key
+    # in any encoding (DER, PEM, JWK, a future one) can hand it over
+    # instead of pre-decoding outside the protocol.
+    importKey @22 (request :ImportKeyRequest) -> (result :ImportKeyResult);
+
+    # Export a key to a named format.
+    exportKey @23 (request :ExportKeyRequest) -> (result :ExportKeyResult);
+
+    # ─── Streaming AEAD ───────────────────────────────────────────
 
     # Streaming encrypt for large data (chunked AEAD).
     encryptStream @24 (request :EncryptStreamRequest) -> (stream :EncryptStream);
@@ -119,15 +175,15 @@ interface CryptoService {
     # Streaming decrypt for large data (chunked AEAD).
     decryptStream @25 (request :DecryptStreamRequest) -> (stream :DecryptStream);
 
-    # ─── DRBG (Audit-7: Deterministic Random Bit Generator) ───────
+    # ─── DRBG (Deterministic Random Bit Generator) ────────────────
 
     # Create a DRBG instance for deterministic randomness.
     createDrbg @26 (request :CreateDrbgRequest) -> (handle :DrbgHandle);
 
     # Generate random bytes from a DRBG.
-    drbgGenerate @27 (handle :DrbgHandle, length :UInt32) -> (bytes :Data);
+    drbgGenerate @27 (handle :DrbgHandle, length :UInt32) -> (bytes :T.DataHandle);
 
-    # ─── HPKE (Audit-7: Hybrid Public Key Encryption) ────────────
+    # ─── HPKE (Hybrid Public Key Encryption) ──────────────────────
 
     # Seal (encrypt) using hybrid public key encryption.
     hpkeSeal @28 (request :HpkeSealRequest) -> (result :HpkeSealResult);
@@ -136,62 +192,101 @@ interface CryptoService {
     hpkeOpen @29 (request :HpkeOpenRequest) -> (result :HpkeOpenResult);
 }
 
+# ─── Algorithm identification ────────────────────────────────────────
+# ONE open spelling for every algorithm field in this file. A caller
+# names an algorithm with a token; `parameters` carries the knobs that
+# are not part of the identity (key size, mode, cost).
+#
+# This single struct replaces the previous `AlgorithmSpec` union of eight
+# families plus `PostQuantumSpec`: a union of families is a closed
+# taxonomy of what cryptography can be, and the post-quantum arm had to
+# be ADDED to it, which is the amendment loop made visible.
+
+struct AlgorithmSpec {
+    # Open token; see CONFORMANCE TOKENS. Unrecognized tokens are
+    # reported by getSupportedAlgorithms rather than rejected here.
+    algorithm @0 :Text;
+    # Algorithm-specific parameters (keyBits, mode, memoryKib, ...).
+    parameters @1 :T.StringMap;
+    # Backend-specific extras.
+    custom @2 :Data;
+}
+
+struct SupportedAlgorithms {
+    hashes @0 :List(Text);
+    kdfs @1 :List(Text);
+    aeads @2 :List(Text);
+    asymmetric @3 :List(Text);
+    signatures @4 :List(Text);
+    wraps @5 :List(Text);
+    # Hardware acceleration hints.
+    hwAcceleration @6 :List(HwAcceleration);
+    # Exportable key encodings (open tokens: "der", "pem", "jwk", ...).
+    keyFormats @7 :List(Text);
+    # DRBG mechanisms (open tokens).
+    drbgMechanisms @8 :List(Text);
+}
+
+struct HwAcceleration {
+    algorithm @0 :AlgorithmSpec;
+    # Which accelerator the backend is using, as the backend describes it.
+    # Deliberately not a vendor enum: naming AES-NI, QAT or a GPU here
+    # would freeze today's accelerator market into the contract.
+    provider @1 :Text;
+    description @2 :Text;
+}
+
 # ─── Streaming AEAD ──────────────────────────────────────────────────
 
 struct EncryptStreamRequest {
-    algorithm @0 :AeadAlgorithm;
+    algorithm @0 :Text;
     key @1 :T.DataHandle;
     nonce @2 :T.DataHandle;
     associatedData @3 :T.DataHandle;
 }
 
 interface EncryptStream {
-    # Feed plaintext chunk.
-    update @0 (data :Data) -> T.VoidResult;
+    # Handle on both directions: the previous inline `Data` chunk forced
+    # the caller to buffer, on an API that exists to avoid buffering.
+    update @0 (data :T.DataHandle) -> T.VoidResult;
 
     # Finalize and get ciphertext + tag.
-    finalize @1 () -> (ciphertext :Data, tag :Data);
+    finalize @1 () -> (ciphertext :T.DataHandle, tag :Data);
 
     # Reset stream for reuse.
     reset @2 () -> T.VoidResult;
 }
 
 struct DecryptStreamRequest {
-    algorithm @0 :AeadAlgorithm;
+    algorithm @0 :Text;
     key @1 :T.DataHandle;
     nonce @2 :T.DataHandle;
     associatedData @3 :T.DataHandle;
 }
 
 interface DecryptStream {
-    # Feed ciphertext chunk.
-    update @0 (data :Data) -> T.VoidResult;
-
-    # Finalize and get plaintext.
-    finalize @1 () -> (plaintext :Data);
-
-    # Reset stream for reuse.
+    update @0 (data :T.DataHandle) -> T.VoidResult;
+    finalize @1 () -> (plaintext :T.DataHandle);
     reset @2 () -> T.VoidResult;
 }
 
-# ─── DRBG (Deterministic Random Bit Generator) ───────────────────────
+# ─── DRBG ────────────────────────────────────────────────────────────
 
 struct CreateDrbgRequest {
-    # DRBG mechanism.
-    mechanism @0 :DrbgMechanism;
+    # DRBG mechanism, open token.
+    mechanism @0 :Text;
     # Entropy input (seed).
     entropy @1 :T.DataHandle;
     # Personalization string (optional).
     personalization @2 :Data;
     # Maximum number of bytes before reseeding required.
     reseedInterval @3 :UInt64;
-}
-
-enum DrbgMechanism {
-    hmacDrbg @0;     # HMAC-DRBG (NIST SP 800-90A)
-    hashDrbg @1;     # Hash-DRBG (NIST SP 800-90A)
-    ctrDrbg @2;      # CTR-DRBG (NIST SP 800-90A)
-    custom @3;
+    # Declared behaviour, so backends do not invent it: a DRBG used past
+    # `reseedInterval` bytes MUST either refuse further generation with
+    # T.Error(unavailable) or reseed transparently and report it in
+    # `custom`. The two choices are not equivalent, so a backend declares
+    # which it implements rather than leaving it per-implementation.
+    custom @4 :T.StringMap;
 }
 
 struct DrbgHandle {
@@ -199,15 +294,15 @@ struct DrbgHandle {
     id @0 :UInt64;
 }
 
-# ─── HPKE (Hybrid Public Key Encryption, RFC 9180) ──────────────────
+# ─── HPKE ────────────────────────────────────────────────────────────
 
 struct HpkeSealRequest {
-    # KEM algorithm for key encapsulation.
-    kem @0 :AsymmetricAlgorithm;
-    # KDF algorithm for key derivation.
-    kdf @1 :KdfAlgorithm;
-    # AEAD algorithm for symmetric encryption.
-    aead @2 :AeadAlgorithm;
+    # KEM algorithm for key encapsulation (open token).
+    kem @0 :Text;
+    # KDF algorithm for key derivation (open token).
+    kdf @1 :Text;
+    # AEAD algorithm for symmetric encryption (open token).
+    aead @2 :Text;
     # Recipient's public key.
     recipientPublicKey @3 :T.DataHandle;
     # Plaintext to encrypt.
@@ -219,30 +314,23 @@ struct HpkeSealRequest {
 }
 
 struct HpkeSealResult {
-    # Encapsulated key (ciphertext of the shared secret).
+    # Encapsulated key (ciphertext of the shared secret). Bounded by the
+    # KEM construction, so it stays inline.
     encapsulatedKey @0 :Data;
     # Encrypted plaintext.
-    ciphertext @1 :Data;
-    # Additional authenticated data (may be empty).
+    ciphertext @1 :T.DataHandle;
+    # Additional authenticated data (echoed for the caller's convenience).
     aad @2 :Data;
 }
 
 struct HpkeOpenRequest {
-    # KEM algorithm.
-    kem @0 :AsymmetricAlgorithm;
-    # KDF algorithm.
-    kdf @1 :KdfAlgorithm;
-    # AEAD algorithm.
-    aead @2 :AeadAlgorithm;
-    # Recipient's private key.
+    kem @0 :Text;
+    kdf @1 :Text;
+    aead @2 :Text;
     recipientPrivateKey @3 :T.DataHandle;
-    # Encapsulated key from seal.
     encapsulatedKey @4 :T.DataHandle;
-    # Ciphertext to decrypt.
     ciphertext @5 :T.DataHandle;
-    # Additional authenticated data.
     aad @6 :T.DataHandle;
-    # Application-specific context.
     info @7 :Data;
 }
 
@@ -250,557 +338,367 @@ struct HpkeOpenResult {
     union {
         success @0 :HpkeOpenSuccess;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
 struct HpkeOpenSuccess {
-    # Decrypted plaintext.
-    plaintext @0 :Data;
+    plaintext @0 :T.DataHandle;
+    metadata @1 :T.StringMap;
 }
 
 # ─── Hashing ────────────────────────────────────────────────────────
 
-enum HashAlgorithm {
-    # SHA-2 family
-    sha224 @0;
-    sha256 @1;
-    sha384 @2;
-    sha512 @3;
-    sha512224 @4;   # was: sha512_224
-    sha512256 @5;   # was: sha512_256
-
-    # SHA-3 family
-    sha3224 @6;     # was: sha3_224
-    sha3256 @7;     # was: sha3_256
-    sha3384 @8;     # was: sha3_384
-    sha3512 @9;     # was: sha3_512
-    shake128 @10;
-    shake256 @11;
-
-    # BLAKE2
-    blake2b @12;
-    blake2s @13;
-    blake2bp @14;  # parallel
-    blake2sp @15;  # parallel
-
-    # BLAKE3
-    blake3 @16;
-
-    # Legacy (for compatibility only)
-    md5 @17;
-    sha1 @18;
-    ripemd160 @19;
-
-    # Custom/backend-specific
-    custom @20;
-}
-
 struct HashRequest {
-    algorithm @0 :HashAlgorithm;
-    data @1 :T.DataHandle;  # Inline or buffer reference
-    # For SHAKE: output length in bytes.
+    # Open token; see CONFORMANCE TOKENS.
+    algorithm @0 :Text;
+    data @1 :T.DataHandle;
+    # For XOFs (SHAKE, BLAKE3): output length in bytes.
     outputLength @2 :UInt32;
+    # Backend-specific options.
+    custom @3 :T.StringMap;
 }
 
 struct HashResult {
-    algorithm @0 :HashAlgorithm;
+    algorithm @0 :Text;
+    # Bounded by the digest construction (32-64 bytes for today's hashes),
+    # so a handle would add a copy rather than remove one.
     hash @1 :Data;
 }
 
+# Note on T.HashOutput (types.capnp:1179): it was promoted with a
+# cross-schema note naming this file, but it encodes `algorithm` as a
+# UInt16 ORDINAL of the local enums this rewrite deletes. Adopting it
+# would re-freeze algorithm identity into an ordinal and undo the rule
+# above, so this file reports the open token instead. See report.md.
+
 struct HashStreamRequest {
-    algorithm @0 :HashAlgorithm;
-    # For SHAKE: output length in bytes.
+    algorithm @0 :Text;
     outputLength @1 :UInt32;
 }
 
 interface HashStream {
-    # Feed data into the hash.
-    update @0 (data :Data) -> T.VoidResult;
-
-    # Finalize and get hash.
-    finalize @1 () -> (hash :Data);
-
-    # Reset stream for reuse.
+    update @0 (data :T.DataHandle) -> T.VoidResult;
+    finalize @1 () -> (hash :T.DataHandle);
     reset @2 () -> T.VoidResult;
 }
 
 # ─── HMAC ────────────────────────────────────────────────────────────
 
 struct HmacRequest {
-    algorithm @0 :HashAlgorithm;  # Underlying hash for HMAC
-    key @1 :T.DataHandle;         # HMAC key
-    data @2 :T.DataHandle;        # Data to authenticate
+    # Underlying hash, as an open token.
+    algorithm @0 :Text;
+    key @1 :T.DataHandle;
+    data @2 :T.DataHandle;
 }
 
 struct HmacResult {
-    algorithm @0 :HashAlgorithm;
+    algorithm @0 :Text;
     mac @1 :Data;
 }
 
 struct HmacStreamRequest {
-    algorithm @0 :HashAlgorithm;
+    algorithm @0 :Text;
     key @1 :T.DataHandle;
 }
 
 interface HmacStream {
-    update @0 (data :Data) -> T.VoidResult;
-    finalize @1 () -> (mac :Data);
+    update @0 (data :T.DataHandle) -> T.VoidResult;
+    finalize @1 () -> (mac :T.DataHandle);
     reset @2 () -> T.VoidResult;
 }
 
 # ─── Key Derivation ──────────────────────────────────────────────────
 
-enum KdfAlgorithm {
-    # Password-based KDFs
-    pbkdf2HmacSha256 @0;   # was: pbkdf2_hmac_sha256
-    pbkdf2HmacSha512 @1;   # was: pbkdf2_hmac_sha512
-    argon2id @2;
-    argon2i @3;
-    argon2d @4;
-    scrypt @5;
-    bcrypt @6;  # For password hashing only
-
-    # Key-based KDFs
-    hkdfSha256 @7;      # was: hkdf_sha256
-    hkdfSha384 @8;      # was: hkdf_sha384
-    hkdfSha512 @9;      # was: hkdf_sha512
-    hkdfBlake2b @10;    # was: hkdf_blake2b
-    hkdfBlake3 @11;     # was: hkdf_blake3
-
-    # KBKDF (NIST SP 800-108)
-    kbkdfHmacSha256 @12;  # was: kbkdf_hmac_sha256
-    kbkdfHmacSha384 @13;  # was: kbkdf_hmac_sha384
-    kbkdfHmacSha512 @14;  # was: kbkdf_hmac_sha512
-    kbkdfAesCmac @15;     # was: kbkdf_aes_cmac
-
-    # X9.63 KDF
-    x963Sha256 @16;     # was: x963_sha256
-    x963Sha384 @17;     # was: x963_sha384
-    x963Sha512 @18;     # was: x963_sha512
-
-    # Custom
-    custom @19;
-}
-
 struct DeriveKeyRequest {
-    algorithm @0 :KdfAlgorithm;
-    password @1 :T.DataHandle;    # Password/passphrase
-    salt @2 :T.DataHandle;        # Salt (random, per-derivation)
+    # Open token; see CONFORMANCE TOKENS.
+    algorithm @0 :Text;
+    password @1 :T.DataHandle;
+    salt @2 :T.DataHandle;
     # Output key length in bytes.
     keyLength @3 :UInt32;
 
-    # Algorithm-specific parameters:
-    # PBKDF2: iterations
+    # Algorithm-specific parameters. A field that does not apply to the
+    # requested algorithm is left at zero; the open token names which
+    # ones matter, so a new KDF needs no new field and no new ordinal.
     iterations @4 :UInt32;
-
-    # Argon2: memory (KB), parallelism, version
     memoryKib @5 :UInt32;
     parallelism @6 :UInt32;
     version @7 :UInt32;
-
-    # Scrypt: N, r, p
     scryptN @8 :UInt32;
     scryptR @9 :UInt32;
     scryptP @10 :UInt32;
-
-    # Bcrypt: cost (log2 rounds)
     bcryptCost @11 :UInt8;
-
     # HKDF/X9.63: info/context
     info @12 :Data;
 
-    # Custom parameters (backend-specific)
+    # Custom parameters (backend-specific), including any knob the named
+    # fields above do not carry.
     custom @13 :T.StringMap;
 }
 
 struct DeriveKeyFromKeyRequest {
-  algorithm @0 :KdfAlgorithm;
-  inputKey @1 :T.DataHandle; # Input key material (IKM)
-  salt @2 :T.DataHandle; # Salt (optional for some KDFs)
-  keyLength @3 :UInt32;
-  info @4 :Data; # Context/application info
-  # For SSKDF (NIST SP 800-56C): additional fixed info.
-  fixedInfo @5 :Data;
-  custom @6 :T.StringMap;
+    algorithm @0 :Text;
+    inputKey @1 :T.DataHandle;   # Input key material (IKM)
+    salt @2 :T.DataHandle;
+    keyLength @3 :UInt32;
+    info @4 :Data;
+    # For SSKDF (NIST SP 800-56C): additional fixed info.
+    fixedInfo @5 :Data;
+    custom @6 :T.StringMap;
 }
 
 struct DeriveKeyResult {
-    algorithm @0 :KdfAlgorithm;
-    key @1 :Data;
-    # Parameters used (for storage/verification).
-    parameters @2 :KdfParameters;
-}
-
-struct KdfParameters {
-    union {
-        pbkdf2 @0 :Pbkdf2Params;
-        argon2 @1 :Argon2Params;
-        scrypt @2 :ScryptParams;
-        bcrypt @3 :BcryptParams;
-        hkdf @4 :HkdfParams;
-        kbkdf @5 :KbkdfParams;
-        x963 @6 :X963Params;
-        custom @7 :T.StringMap;
-    }
-}
-
-struct Pbkdf2Params {
-    algorithm @0 :HashAlgorithm;
-    iterations @1 :UInt32;
-    salt @2 :Data;
-    keyLength @3 :UInt32;
-}
-
-struct Argon2Params {
-    algorithm @0 :KdfAlgorithm;  # argon2id, argon2i, argon2d
-    memoryKib @1 :UInt32;
-    parallelism @2 :UInt32;
-    iterations @3 :UInt32;
-    version @4 :UInt32;
-    salt @5 :Data;
-    keyLength @6 :UInt32;
-}
-
-struct ScryptParams {
-    n @0 :UInt32;
-    r @1 :UInt32;
-    p @2 :UInt32;
-    salt @3 :Data;
-    keyLength @4 :UInt32;
-}
-
-struct BcryptParams {
-    cost @0 :UInt8;
-    salt @1 :Data;
-}
-
-struct HkdfParams {
-    algorithm @0 :HashAlgorithm;
-    salt @1 :Data;
-    info @2 :Data;
-    keyLength @3 :UInt32;
-}
-
-struct KbkdfParams {
-    algorithm @0 :HashAlgorithm;
-    label @1 :Data;
-    context @2 :Data;
-    keyLength @3 :UInt32;
-}
-
-struct X963Params {
-    algorithm @0 :HashAlgorithm;
-    sharedInfo @1 :Data;
-    keyLength @2 :UInt32;
-}
-
-# ─── Secure Random ───────────────────────────────────────────────────
-
-struct RandomRequest {
-    length @0 :UInt32;
-    # If true, use buffer reference for large requests.
-    useBuffer @1 :Bool;
-    bufferId @2 :T.BufferId;
-    offset @3 :UInt64;
+    algorithm @0 :Text;
+    key @1 :T.DataHandle;
+    # The parameters actually used, echoed back so a verifier can
+    # reproduce the derivation. Replaces the previous `KdfParameters`
+    # union of seven per-family structs plus a closed family taxonomy:
+    # a new KDF needed a new ordinal there and nowhere else.
+    parameters @2 :T.StringMap;
+    custom @3 :T.StringMap;
 }
 
 # ─── Symmetric Encryption (AEAD) ─────────────────────────────────────
 
-enum AeadAlgorithm {
-    aes256Gcm @0;       # was: aes256_gcm
-    aes128Gcm @1;       # was: aes128_gcm
-    chacha20Poly1305 @2;    # was: chacha20_poly1305
-    xchacha20Poly1305 @3;   # was: xchacha20_poly1305
-    aes256Ccm @4;       # was: aes256_ccm
-    aes128Ccm @5;       # was: aes128_ccm
-    aes256GcmSiv @6;    # was: aes256_gcm_siv
-    aes128GcmSiv @7;    # was: aes128_gcm_siv
-    # AES-SIV (RFC 5297) — misuse-resistant AEAD
-    aes256Siv @8;       # was: aes256_siv
-    aes128Siv @9;       # was: aes128_siv
-    # Post-quantum hybrid AEAD (NIST ML-KEM + AES-GCM)
-    pqcHybrid @10;      # was: pqc_hybrid
-    custom @11;
-}
-
 struct EncryptRequest {
-    algorithm @0 :AeadAlgorithm;
+    algorithm @0 :Text;
     key @1 :T.DataHandle;
-    nonce @2 :T.DataHandle;       # Must be unique per key!
+    # MUST be unique per key. A backend that receives a reused nonce
+    # refuses it with T.Error(alreadyExists) rather than producing the
+    # eventual AEAD failure with no cause; this is stated in the contract
+    # so the refusal is typed and not a comment.
+    nonce @2 :T.DataHandle;
     plaintext @3 :T.DataHandle;
-    associatedData @4 :T.DataHandle;  # AAD (optional)
+    associatedData @4 :T.DataHandle;
 }
 
 struct EncryptResult {
-    algorithm @0 :AeadAlgorithm;
-    ciphertext @1 :Data;
-    tag @2 :Data;                 # Authentication tag (appended to ciphertext in some APIs)
-    nonce @3 :Data;               # Nonce used (if generated)
+    algorithm @0 :Text;
+    ciphertext @1 :T.DataHandle;
+    # Bounded by the AEAD construction; inline.
+    tag @2 :Data;
+    # Nonce used (if the backend generated it). Inline for the same reason.
+    nonce @3 :Data;
 }
 
 struct DecryptRequest {
-    algorithm @0 :AeadAlgorithm;
+    algorithm @0 :Text;
     key @1 :T.DataHandle;
     nonce @2 :T.DataHandle;
     ciphertext @3 :T.DataHandle;
     tag @4 :T.DataHandle;         # Separate tag (if not appended)
-    associatedData @5 :T.DataHandle;  # AAD (optional)
+    associatedData @5 :T.DataHandle;
 }
 
 struct DecryptResult {
-    algorithm @0 :AeadAlgorithm;
-    plaintext @1 :Data;
+    algorithm @0 :Text;
+    plaintext @1 :T.DataHandle;
+    metadata @2 :T.StringMap;
 }
 
 # ─── Asymmetric Operations ──────────────────────────────────────────
 
-enum AsymmetricAlgorithm {
-    # RSA
-    rsa2048 @0;
-    rsa3072 @1;
-    rsa4096 @2;
-    rsa8192 @3;
-
-    # ECDSA
-    ecdsaP256 @4;      # was: ecdsa_p256
-    ecdsaP384 @5;      # was: ecdsa_p384
-    ecdsaP521 @6;      # was: ecdsa_p521
-    ecdsaSecp256k1 @7; # was: ecdsa_secp256k1
-
-    # EdDSA
-    ed25519 @8;
-    ed448 @9;
-
-    # ECDH / X25519 / X448
-    ecdhP256 @10;      # was: ecdh_p256
-    ecdhP384 @11;      # was: ecdh_p384
-    ecdhP521 @12;      # was: ecdh_p521
-    x25519 @13;
-    x448 @14;
-
-    # RSA-PSS
-    rsaPssSha256 @15;  # was: rsa_pss_sha256
-    rsaPssSha384 @16;  # was: rsa_pss_sha384
-    rsaPssSha512 @17;  # was: rsa_pss_sha512
-
-    # RSA-OAEP
-    rsaOaepSha256 @18; # was: rsa_oaep_sha256
-    rsaOaepSha384 @19; # was: rsa_oaep_sha384
-    rsaOaepSha512 @20; # was: rsa_oaep_sha512
-
-    # Post-quantum (NIST FIPS 203/204/205 — ML-KEM, ML-DSA, SLH-DSA)
-    mlKem512 @21;      # was: ml_kem_512 (CRYSTALS-Kyber-512)
-    mlKem768 @22;      # was: ml_kem_768 (CRYSTALS-Kyber-768)
-    mlKem1024 @23;     # was: ml_kem_1024 (CRYSTALS-Kyber-1024)
-    mlDsa44 @24;       # was: ml_dsa_44 (CRYSTALS-Dilithium-44)
-    mlDsa65 @25;       # was: ml_dsa_65 (CRYSTALS-Dilithium-65)
-    mlDsa87 @26;       # was: ml_dsa_87 (CRYSTALS-Dilithium-87)
-    slhDsaSha2128s @27;    # was: slh_dsa_sha2_128s
-    slhDsaSha2192s @28;    # was: slh_dsa_sha2_192s
-    slhDsaSha2256s @29;    # was: slh_dsa_sha2_256s
-
-    # Hybrid (classical + post-quantum)
-    x25519MlKem768 @30;     # was: x25519_ml_kem_768
-    ecdsaP256MlDsa65 @31;  # was: ecdsa_p256_ml_dsa_65
-
-    # Custom
-    custom @32;
-}
-
-enum SignatureAlgorithm {
-    # RSA
-    rsaPkcs1Sha256 @0;   # was: rsa_pkcs1_sha256
-    rsaPkcs1Sha384 @1;   # was: rsa_pkcs1_sha384
-    rsaPkcs1Sha512 @2;   # was: rsa_pkcs1_sha512
-    rsaPssSha256 @3;     # was: rsa_pss_sha256
-    rsaPssSha384 @4;     # was: rsa_pss_sha384
-    rsaPssSha512 @5;     # was: rsa_pss_sha512
-
-    # ECDSA
-    ecdsaSha256 @6;      # was: ecdsa_sha256
-    ecdsaSha384 @7;      # was: ecdsa_sha384
-    ecdsaSha512 @8;      # was: ecdsa_sha512
-    ecdsaSha256Der @9;   # was: ecdsa_sha256_der (DER-encoded)
-    ecdsaSha384Der @10;  # was: ecdsa_sha384_der
-    ecdsaSha512Der @11;  # was: ecdsa_sha512_der
-
-    # EdDSA
-    ed25519 @12;
-    ed25519ph @13;  # Pre-hashed
-    ed448 @14;
-    ed448ph @15;
-
-    # Custom
-    custom @16;
-}
-
 struct GenerateKeyPairRequest {
-    algorithm @0 :AsymmetricAlgorithm;
-    # For key management integration.
-    keyId @1 :Text;
-    # Export public key in request.
+    # Open token; see CONFORMANCE TOKENS.
+    algorithm @0 :Text;
+    # Where the generated key is registered, as the promoted foundation
+    # type (types.capnp:1041 names this field explicitly). Previously a
+    # free-form Text id, i.e. a second key-identity namespace beside
+    # key_management's.
+    keyId @1 :T.KeyId;
+    # Export public key in the request.
     includePublic @2 :Bool;
+    # Algorithm-specific generation options (key size, curve, ...).
+    parameters @3 :T.StringMap;
+    custom @4 :T.StringMap;
 }
 
 struct GenerateKeyPairResult {
-    algorithm @0 :AsymmetricAlgorithm;
-    publicKey @1 :Data;
-    privateKey @2 :Data;  # Only if backend supports export
-    keyId @3 :Text;
+    algorithm @0 :Text;
+    publicKey @1 :T.DataHandle;
+    # Only present when the backend can export private key material.
+    privateKey @2 :T.DataHandle;
+    keyId @3 :T.KeyId;
+    # `privateKeyExported` makes the "if" visible on the wire: a caller
+    # can now tell "export unsupported" from "export produced nothing"
+    # without out-of-band knowledge of the backend.
+    privateKeyExported @4 :Bool;
+    # Self-describing fingerprint, so a verifier does not have to guess
+    # the fingerprint algorithm from the byte length.
+    fingerprint @5 :T.KeyFingerprint;
+    metadata @6 :T.StringMap;
 }
 
 struct SignRequest {
-  algorithm @0 :SignatureAlgorithm;
-  privateKey @1 :T.DataHandle;
-  data @2 :T.DataHandle;
-  # For pre-hashed algorithms (Ed25519ph, RSA-PSS with external hash)
-  prehashed @3 :Bool;
-  hashAlgorithm @4 :HashAlgorithm; # If prehashed
-  # Deterministic ECDSA (RFC 6979)
-  deterministic @5 :Bool = false;
+    # Open token; see CONFORMANCE TOKENS.
+    algorithm @0 :Text;
+    privateKey @1 :T.DataHandle;
+    data @2 :T.DataHandle;
+    # For pre-hashed algorithms (Ed25519ph, RSA-PSS with external hash).
+    prehashed @3 :Bool;
+    # The hash that produced the pre-hashed input, as an open token.
+    hashAlgorithm @4 :Text;
+    # Deterministic ECDSA (RFC 6979)
+    deterministic @5 :Bool = false;
+    custom @6 :T.StringMap;
 }
 
 struct SignResult {
-    algorithm @0 :SignatureAlgorithm;
+    algorithm @0 :Text;
+    # Bounded by the signature scheme; inline.
     signature @1 :Data;
+    # Self-describing fingerprint of the signing key.
+    keyId @2 :T.KeyFingerprint;
 }
 
-struct VerifyRequest {
-    algorithm @0 :SignatureAlgorithm;
+# One canonical verification outcome for the whole tree: signature.capnp
+# imports this type rather than declaring a second `VerifyResult` with the
+# same name and a different shape.
+struct SignatureVerifyResult {
+    union {
+        valid @0 :ValidSignature;
+        invalid @1 :SignatureVerifyError;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+# The verification REQUEST, named to avoid the collision the previous
+# `VerifyRequest` had with capability.capnp's `VerifyRequest`
+# (capability verification vs signature verification — two unrelated
+# domains, one name, an import hazard).
+struct SignatureVerifyRequest {
+    # Open token; see CONFORMANCE TOKENS.
+    algorithm @0 :Text;
     publicKey @1 :T.DataHandle;
     data @2 :T.DataHandle;
     signature @3 :T.DataHandle;
     prehashed @4 :Bool;
-    hashAlgorithm @5 :HashAlgorithm;  # If prehashed
+    hashAlgorithm @5 :Text;
+    # Domain/context binding the signature must carry (open token).
+    domain @6 :Text;
+    custom @7 :T.StringMap;
 }
 
-struct VerifyResult {
-    valid @0 :Bool;
-    algorithm @1 :SignatureAlgorithm;
+struct ValidSignature {
+    algorithm @0 :Text;
+    signer @1 :T.KeyFingerprint;
+    # When the signature was made / expires, as reported by the backend.
+    signedAt @2 :T.Timestamp;
+    custom @3 :Data;
+}
+
+struct SignatureVerifyError {
+    algorithm @0 :Text;
+    # Open token naming the failure class; see CONFORMANCE TOKENS. This
+    # replaces a closed error enum for the same reason algorithms are
+    # open, and it carries the underlying T.Error so a caller never has
+    # to pattern-match text to learn why verification could not be
+    # attempted (unknown algorithm, malformed input, hardware failure).
+    kind @1 :Text;
+    error @2 :T.Error;
+    custom @3 :T.StringMap;
 }
 
 struct KeyAgreementRequest {
-    algorithm @0 :AsymmetricAlgorithm;
+    algorithm @0 :Text;
     privateKey @1 :T.DataHandle;
     peerPublicKey @2 :T.DataHandle;
 }
 
 struct KeyAgreementResult {
-    algorithm @0 :AsymmetricAlgorithm;
-    sharedSecret @1 :Data;
+    algorithm @0 :Text;
+    sharedSecret @1 :T.DataHandle;
+    custom @2 :T.StringMap;
 }
 
 # ─── Key Wrapping ────────────────────────────────────────────────────
 
-enum WrapAlgorithm {
-    # AES Key Wrap (RFC 3394)
-    aes256Kw @0;      # was: aes256_kw
-    aes128Kw @1;      # was: aes128_kw
-    aes192Kw @2;      # was: aes192_kw
-
-    # AES Key Wrap with Padding (RFC 5649)
-    aes256Kwp @3;     # was: aes256_kwp
-    aes128Kwp @4;     # was: aes128_kwp
-    aes192Kwp @5;     # was: aes192_kwp
-
-    # RSA-OAEP
-    rsaOaepSha256 @6; # was: rsa_oaep_sha256
-    rsaOaepSha384 @7; # was: rsa_oaep_sha384
-    rsaOaepSha512 @8; # was: rsa_oaep_sha512
-
-    # Custom
-    custom @9;
-}
-
 struct WrapKeyRequest {
-    algorithm @0 :WrapAlgorithm;
+    algorithm @0 :Text;
     wrappingKey @1 :T.DataHandle;
     keyToWrap @2 :T.DataHandle;
     associatedData @3 :Data;  # For KWP
+    custom @4 :T.StringMap;
 }
 
 struct WrapKeyResult {
-    algorithm @0 :WrapAlgorithm;
-    wrappedKey @1 :Data;
+    algorithm @0 :Text;
+    wrappedKey @1 :T.DataHandle;
+    metadata @2 :T.StringMap;
 }
 
 struct UnwrapKeyRequest {
-    algorithm @0 :WrapAlgorithm;
+    algorithm @0 :Text;
     wrappingKey @1 :T.DataHandle;
     wrappedKey @2 :T.DataHandle;
-    associatedData @3 :Data;  # For KWP
-    expectedKeyLength @4 :UInt32;  # For validation
+    associatedData @3 :Data;
+    expectedKeyLength @4 :UInt32;
+    custom @5 :T.StringMap;
 }
 
 struct UnwrapKeyResult {
-    algorithm @0 :WrapAlgorithm;
-    key @1 :Data;
+    algorithm @0 :Text;
+    key @1 :T.DataHandle;
+    metadata @2 :T.StringMap;
 }
 
 # ─── Key Import/Export ───────────────────────────────────────────────
 
-enum KeyFormat {
-    pkcs8 @0;         # PKCS#8 (private key, DER/PEM)
-    spki @1;          # SubjectPublicKeyInfo (public key, DER/PEM)
-    pkcs12 @2;        # PKCS#12 / PFX (cert + key bundle)
-    jwk @3;           # JSON Web Key
-    pem @4;           # PEM-encoded (auto-detect key type)
-    der @5;           # DER-encoded (auto-detect key type)
-    openssh @6;       # OpenSSH public key format
-    custom @7;
-}
-
 struct ImportKeyRequest {
-  # Key data to import.
-  data @0 :T.DataHandle;
-  # Format of the input data.
-  format @1 :KeyFormat;
-  # Password for encrypted private keys (PKCS#8, PKCS#12).
-  password @2 :Data;
-  # Intended use (for JWK kty parameter hint).
-  intendedUse @3 :KeyUse;
-  # Validate key against intendedUse (may fail if mismatch).
-  validateUse @4 :Bool = true;
-  # Backend-specific import options.
-  custom @5 :T.StringMap;
+    # Key data to import.
+    data @0 :T.DataHandle;
+    # Encoding of the input data, open token ("der", "pem", "jwk", ...).
+    format @1 :Text;
+    # Password for encrypted private keys.
+    password @2 :Data;
+    # Intended use (a small closed set: the operations asymmetric
+    # cryptography itself defines).
+    intendedUse @3 :KeyUse;
+    # Validate key against intendedUse (may fail if mismatch).
+    validateUse @4 :Bool = true;
+    # Detected algorithm, reported by the backend as an open token.
+    algorithm @5 :Text;
+    custom @6 :T.StringMap;
 }
 
+# The four things a key can be for. Closed because public-key
+# cryptography closes it: a key signs, encrypts, agrees, or wraps. A new
+# use would be a new mathematical operation, not a marketing category.
 enum KeyUse {
-    signature @0;       # Signing/verification
-    encryption @1;      # Encryption/decryption
-    keyAgreement @2;    # Key agreement (ECDH)
-    keyWrapping @3;     # Key wrapping/unwrapping
-    any @4;
+    # Sentinel: an unset intended use means "undeclared", never
+    # "signature" — a backend asked to validate a key against an
+    # absent purpose must not assume one.
+    unspecified @0;
+    signature @1;       # Signing/verification
+    encryption @2;      # Encryption/decryption
+    keyAgreement @3;    # Key agreement
+    keyWrapping @4;     # Key wrapping/unwrapping
+    any @5;
 }
 
 struct ImportKeyResult {
     union {
         success @0 :ImportKeySuccess;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
 struct ImportKeySuccess {
-    # Detected algorithm.
-    algorithm @0 :AsymmetricAlgorithm;
-    # Public key (always present).
-    publicKey @1 :Data;
-    # Private key (only if private key was imported and backend supports export).
-    privateKey @2 :Data;
-    # Fingerprint of the imported key.
+    # Detected algorithm, open token.
+    algorithm @0 :Text;
+    publicKey @1 :T.DataHandle;
+    privateKey @2 :T.DataHandle;
     fingerprint @3 :T.KeyFingerprint;
-    # Key use hint.
     use @4 :KeyUse;
+    metadata @5 :T.StringMap;
 }
 
 struct ExportKeyRequest {
-    # Key data to export (private or public key).
     data @0 :T.DataHandle;
-    # Format to export to.
-    format @1 :KeyFormat;
-    # Password to encrypt private key on export.
+    format @1 :Text;
     password @2 :Data;
-    # Backend-specific export options.
     custom @3 :T.StringMap;
 }
 
@@ -808,17 +706,20 @@ struct ExportKeyResult {
     union {
         success @0 :ExportKeySuccess;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
 struct ExportKeySuccess {
-    # Exported key data.
-    data @0 :Data;
-    # Format used for export.
-    format @1 :KeyFormat;
+    data @0 :T.DataHandle;
+    format @1 :Text;
+    metadata @2 :T.StringMap;
 }
 
 # ─── Certificate Operations ──────────────────────────────────────────
+# ONE certificate representation for the tree: signature.capnp imports
+# this struct, so a chain verified here can be attached to a Signature
+# there without a conversion step no schema defined.
 
 struct CertificateInfo {
     subject @0 :Text;
@@ -826,13 +727,14 @@ struct CertificateInfo {
     serialNumber @2 :Data;
     notBefore @3 :T.Timestamp;
     notAfter @4 :T.Timestamp;
-    subjectPublicKeyAlgorithm @5 :AsymmetricAlgorithm;
-    subjectPublicKey @6 :Data;
+    # Open token naming the subject public key algorithm.
+    subjectPublicKeyAlgorithm @5 :Text;
+    subjectPublicKey @6 :T.DataHandle;
     extensions @7 :List(CertificateExtension);
-    # PEM or DER encoded full certificate.
-    der @8 :Data;
+    # The full certificate, as a handle: PEM of a chain is bulk and was
+    # being copied inline.
+    der @8 :T.DataHandle;
     pem @9 :Text;
-    # Fingerprints.
     sha256Fingerprint @10 :Data;
     sha1Fingerprint @11 :Data;
 }
@@ -843,60 +745,101 @@ struct CertificateExtension {
     value @2 :Data;
 }
 
+# Typed chain failure. Replaces `errors @1 :List(Text)`, which forced
+# every consumer to pattern-match free-form strings to learn why a chain
+# failed — while carrying no position and no underlying cause.
 struct VerifyChainResult {
     valid @0 :Bool;
-    errors @1 :List(Text);
+    errors @1 :List(ChainError);
     leafCertificate @2 :CertificateInfo;
     chain @3 :List(CertificateInfo);
 }
 
-# ─── Algorithm Support ───────────────────────────────────────────────
-
-struct AlgorithmSpec {
-    union {
-        hash @0 :HashAlgorithm;
-        kdf @1 :KdfAlgorithm;
-        aead @2 :AeadAlgorithm;
-        asymmetric @3 :AsymmetricAlgorithm;
-        signature @4 :SignatureAlgorithm;
-        wrap @5 :WrapAlgorithm;
-        # Audit-7: post-quantum algorithm variant.
-        postQuantum @6 :PostQuantumSpec;
-        custom @7 :Data;
-    }
+struct ChainError {
+    # Open token naming the failure class; see CONFORMANCE TOKENS.
+    kind @0 :Text;
+    # Position in the chain that failed (0 = leaf).
+    index @1 :UInt32;
+    # The underlying cause, so a consumer never string-parses to learn it.
+    error @2 :T.Error;
+    custom @3 :T.StringMap;
 }
 
-# Audit-7: post-quantum algorithm specification for capability queries.
-struct PostQuantumSpec {
-    # The post-quantum algorithm family.
-    algorithm @0 :PostQuantumAlgorithm;
-    # Key size in bits.
-    keyBits @1 :UInt32;
-    # Security level (1, 3, or 5 for NIST ML-KEM/ML-DSA).
-    securityLevel @2 :UInt32;
-}
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Nothing above depends on any declaration in this section. They are
+# published so today's tools have a discoverable spelling, and so two
+# backends have a shared name for an algorithm without the protocol
+# requiring one. An unrecognized token MUST be ignored, never rejected:
+# that is what lets a new construction be requested with no schema
+# change. This section can grow without touching a single ordinal.
+#
+# They are Text values, deliberately NOT enums: an enum here would be an
+# eternal commitment to today's spelling of a concept.
+# ══════════════════════════════════════════════════════════════════════
 
-enum PostQuantumAlgorithm {
-    mlKem @0;        # Module-Lattice Key Encapsulation (CRYSTALS-Kyber)
-    mlDsa @1;        # Module-Lattice Digital Signature (CRYSTALS-Dilithium)
-    slhDsa @2;       # Stateless Hash-Based Digital Signature (SPHINCS+)
-    hybrid @3;       # Hybrid classical + post-quantum
-    custom @4;
-}
+# Digests
+const hashSha256   :Text = "sha256";
+const hashSha384   :Text = "sha384";
+const hashSha512   :Text = "sha512";
+const hashSha3256 :Text = "sha3-256";
+const hashSha3512 :Text = "sha3-512";
+const hashBlake2b  :Text = "blake2b";
+const hashBlake3   :Text = "blake3";
 
-struct SupportedAlgorithms {
-    hashes @0 :List(HashAlgorithm);
-    kdfs @1 :List(KdfAlgorithm);
-    aeads @2 :List(AeadAlgorithm);
-    asymmetric @3 :List(AsymmetricAlgorithm);
-    signatures @4 :List(SignatureAlgorithm);
-    wraps @5 :List(WrapAlgorithm);
-    # Hardware acceleration hints.
-    hwAcceleration @6 :List(HwAcceleration);
-}
+# KDFs
+const kdfPbkdf2    :Text = "pbkdf2";
+const kdfArgon2id  :Text = "argon2id";
+const kdfScrypt    :Text = "scrypt";
+const kdfHkdf      :Text = "hkdf";
+const kdfKbkdf     :Text = "kbkdf";
 
-struct HwAcceleration {
-    algorithm @0 :AlgorithmSpec;
-    provider @1 :Text;  # e.g., "AES-NI", "ARMv8 Crypto", "Intel QAT", "NVIDIA GPU"
-    description @2 :Text;
-}
+# AEADs
+const aeadAes256Gcm       :Text = "aes-256-gcm";
+const aeadAes128Gcm       :Text = "aes-128-gcm";
+const aeadChaCha20Poly1305 :Text = "chacha20-poly1305";
+const aeadXChaCha20Poly1305 :Text = "xchacha20-poly1305";
+const aeadAes256Siv       :Text = "aes-256-siv";
+
+# Asymmetric / signature schemes
+const asymEd25519      :Text = "ed25519";
+const asymEcdsaP256    :Text = "ecdsa-p256";
+const asymEcdsaP384    :Text = "ecdsa-p384";
+const asymRsa2048      :Text = "rsa-2048";
+const asymRsaPssSha256 :Text = "rsa-pss-sha256";
+const asymX25519       :Text = "x25519";
+const asymMlKem768     :Text = "ml-kem-768";
+const asymMlDsa65      :Text = "ml-dsa-65";
+const asymSlhDsaSha2128s :Text = "slh-dsa-sha2-128s";
+
+# Key wrapping
+const wrapAes256Kw :Text = "aes-256-kw";
+const wrapAes256Kwp :Text = "aes-256-kwp";
+
+# Key encodings
+const fmtDer   :Text = "der";
+const fmtPem   :Text = "pem";
+const fmtPkcs8 :Text = "pkcs8";
+const fmtSpki  :Text = "spki";
+const fmtJwk   :Text = "jwk";
+
+# DRBG mechanisms
+const drbgHmacDrbg :Text = "hmac-drbg";
+const drbgCtrDrbg  :Text = "ctr-drbg";
+
+# Verification failure classes
+const verifyBadSignature   :Text = "bad-signature";
+const verifyUntrusted      :Text = "untrusted";
+const verifyExpired        :Text = "expired";
+const verifyUnknownAlgorithm :Text = "unknown-algorithm";
+const verifyMalformed      :Text = "malformed";
+const verifyWrongDomain    :Text = "wrong-domain";
+const verifyRevoked        :Text = "revoked";
+
+# Chain failure classes
+const chainExpired       :Text = "expired";
+const chainNotYetValid   :Text = "not-yet-valid";
+const chainUntrustedRoot :Text = "untrusted-root";
+const chainIncomplete    :Text = "incomplete";
+const chainBadSignature  :Text = "bad-signature";

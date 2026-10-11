@@ -4,7 +4,7 @@
 # Tunnel - a universal bidirectional async channel
 #
 # A tunnel is a typed async channel between two entities. It carries
-# typed frames with a Topic/Schema discriminator so receivers can route.
+# typed frames with a topic/schema discriminator so receivers can route.
 # Tunnels can be opened over any transport that the backend supports:
 # in-process, kernel IPC, Unix socket, TCP, wasm postMessage, anything.
 # The schema is timeless; backends may add transports freely.
@@ -12,24 +12,30 @@
 # Use cases span every layer: chat between users, IPC between services,
 # device-to-controller telemetry, sensor streams, web app dispatch.
 #
-# Improvements beyond the original schema (audit):
-#   - TunnelSpec.schemaId replaced with T.SchemaId typed wrapper.
-#   - TunnelHandle.id typed as T.TunnelId (promoted from local struct).
-#   - All Data frame fields use T.DataHandle for large payloads (>1KB).
-#   - TunnelInfo frame/byte counters typed appropriately.
-#   - All subscription interfaces have cancel method.
-#   - TunnelState enum has custom variant for forward compatibility.
-#   - FlowPolicy enum has custom variant for forward compatibility.
-#   - Added pullPaged method with T.Pagination for bounded frame retrieval.
-#
-# Audit-7 improvements:
-#   - Mesh topology for multi-node overlays (n-to-n mesh).
-#   - Multi-link bonding for failover and load balancing.
-#   - Tunnel security policy (encryption, authentication, key rotation).
-#   - QoS parameters (latency budget, jitter tolerance, bandwidth).
-#   - Tunnel metrics (latency percentiles, loss rate, throughput).
-#   - Health check for tunnel liveness monitoring.
-#   - Tunnel multiplexing for multiple logical streams over one connection.
+# Fixes this revision makes:
+#   - `TunnelHandle` is a pure reference again. It carried `subject`,
+#     `meshId` and `logicalId` — routing state on a handle, which
+#     DESIGN_PRINCIPLES names as the defect: a capability attenuated to
+#     a mesh still carried the mesh id, and two backends handed out
+#     handles that differed in fields consumers must not trust. The spec
+#     and the info carry that state now.
+#   - Health is a reported open token, not an enum: the batch carried
+#     three `HealthStatus` enums (this one, endpoint's, filesystem's)
+#     with two incompatible value sets.
+#   - `TunnelEncryption` named a 2024 standardisation generation
+#     (Kyber-768/1024, already renamed ML-KEM). Encryption is an open
+#     algorithm token plus parameters; a 2046 post-quantum scheme is a
+#     string.
+#   - `TunnelInfo` is now returned by a method instead of being a struct
+#     a consumer must assemble by hand from `getMetrics` and
+#     `healthCheck`.
+#   - `FlowPolicy` gained a neutral sentinel: an absent policy used to
+#     silently mean "reliable and ordered", the most expensive default
+#     for a lossy link.
+#   - Framing is stated: what happens when a frame exceeds
+#     `maxFrameSize`, and how `receive`'s `more` flag interacts with it.
+#   - Trusted peers are identified (NodeId), not a bag of opaque key
+#     bytes with no pairing to the peer they belong to.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
@@ -38,276 +44,276 @@ struct TunnelSpec {
     name @0 :Text;
     subject @1 :Text;
     schemaId @2 :T.SchemaId;
+    # Maximum frame size in bytes.
+    #
+    # Framing contract: a frame larger than this is rejected by the
+    # producer with `limitExceeded` — it is never silently truncated,
+    # and never silently accepted. On `receive`, `more` is true when the
+    # frame was continued from the previous call, so a consumer that
+    # ignores it would reassemble a stream per call rather than per
+    # frame; the limit bounds the message, and `more` bounds the
+    # reassembly.
     maxFrameSize @3 :UInt32;
     flow @4 :FlowPolicy;
-    # Security policy for this tunnel (empty = no encryption).
+    # Security policy for this tunnel.
     security @5 :TunnelSecurityPolicy;
     # QoS requirements for this tunnel.
     qos @6 :QoSParams;
+    metadata @7 :T.StringMap;
 }
 
 enum FlowPolicy {
-    reliableOrdered @0;
-    reliableUnordered @1;
-    lossyOldest @2;
-    lossyNewest @3;
-    atMostOnce @4;
-    custom @5;
+    unspecified @0;
+    reliableOrdered @1;
+    reliableUnordered @2;
+    lossyOldest @3;
+    lossyNewest @4;
+    atMostOnce @5;
+    custom @6;
 }
 
 interface TunnelService {
     open @0 (spec :TunnelSpec, recipient :Text) -> (handle :TunnelHandle);
     accept @1 () -> (handle :TunnelHandle);
     send @2 (handle :TunnelHandle, frame :T.DataHandle) -> (result :T.VoidResult);
-    receive @3 (handle :TunnelHandle) -> (frame :T.DataHandle, more :Bool);
+    receive @3 (handle :TunnelHandle) -> (result :TunnelFrameResult);
     subscribe @4 (handle :TunnelHandle) -> (subscription :TunnelSubscription);
     cancelSubscribe @5 (subscription :TunnelSubscription) -> T.VoidResult;
     close @6 (handle :TunnelHandle) -> (result :T.VoidResult);
 
     # ── Mesh topology ──
-    getMeshTopology @7 (handle :TunnelHandle) -> (topology :MeshTopology);
+    getMeshTopology @7 (handle :TunnelHandle) -> (result :MeshTopologyResult);
 
     # ── Tunnel metrics ──
     getMetrics @8 (handle :TunnelHandle) -> (metrics :TunnelMetrics);
 
     # ── Health check ──
-    healthCheck @9 (handle :TunnelHandle) -> (health :TunnelHealth);
+    healthCheck @9 (handle :TunnelHandle) -> (result :TunnelHealthResult);
+
+    # ── Info ──
+    # The aggregate descriptor a consumer would otherwise assemble by
+    # hand from getMetrics and healthCheck.
+    getInfo @10 (handle :TunnelHandle) -> (result :TunnelInfoResult);
 
     # ── Multiplexing ──
-    openLogical @10 (handle :TunnelHandle, name :Text) -> (logicalId :UInt32);
-    closeLogical @11 (handle :TunnelHandle, logicalId :UInt32) -> T.VoidResult;
-    listLogical @12 (handle :TunnelHandle) -> (logicals :List(LogicalTunnel));
+    openLogical @11 (handle :TunnelHandle, name :Text) -> (result :LogicalTunnelResult);
+    closeLogical @12 (handle :TunnelHandle, logical :LogicalTunnel) -> T.VoidResult;
+    listLogical @13 (handle :TunnelHandle, pagination :T.Pagination)
+               -> (logicals :List(LogicalTunnel), totalCount :UInt64);
 }
 
+struct TunnelFrameResult {
+    union {
+        frame @0 :TunnelFrame;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct TunnelFrame {
+    data @0 :T.DataHandle;
+    # True when this frame continues the previous one; the frame is
+    # complete when it is false (see the framing contract in TunnelSpec).
+    more @1 :Bool;
+    metadata @2 :T.StringMap;
+}
+
+# A pure reference: id only. The subject lives in TunnelSpec, the mesh in
+# MeshTopology, and the logical stream in LogicalTunnel.
 struct TunnelHandle {
     id @0 :T.TunnelId;
-    subject @1 :Text;
-    # Whether this tunnel is part of a mesh overlay.
-    meshId @2 :Text;
-    # Logical stream ID (0 = main stream, >0 = multiplexed).
-    logicalId @3 :UInt32;
 }
 
-interface TunnelSubscription {
-    # Unbounded pull — returns all available frames. For high-throughput
-    # tunnels, use pullPaged (ordinal @2) with T.Pagination to bound
-    # the result set.
-    pull @0 (handle :TunnelHandle) -> (frames :List(T.DataHandle));
-    cancel @1 () -> T.VoidResult;
-
-    # Paginated frame retrieval. Returns at most `pagination.limit` frames
-    # starting at `pagination.offset`. Caller should repeat with increasing
-    # offset until total frames are consumed or a zero-length batch is
-    # returned.
-    pullPaged @2 (handle :TunnelHandle, pagination :T.Pagination)
-              -> (frames :List(T.DataHandle), total :UInt64);
+struct TunnelInfoResult {
+    union {
+        info @0 :TunnelInfo;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
 
 struct TunnelInfo {
     handle @0 :TunnelHandle;
     peer @1 :Text;
     spec @2 :TunnelSpec;
-    state @3 :TunnelState;
+    # State as an open token ("open", "halfClosed", "closing", ...).
+    state @3 :Text;
     framesIn @4 :UInt64;
     framesOut @5 :UInt64;
     bytesIn @6 :UInt64;
     bytesOut @7 :UInt64;
-    # When this tunnel was created.
     createdAt @8 :T.Timestamp;
-    # Current metrics snapshot.
     metrics @9 :TunnelMetrics;
+    metadata @10 :T.StringMap;
 }
 
 enum TunnelState {
-    opening @0;
-    open @1;
-    halfClosed @2;
-    closing @3;
-    closed @4;
-    error @5;
-    custom @6;
+    unspecified @0;
+    opening @1;
+    open @2;
+    halfClosed @3;
+    closing @4;
+    closed @5;
+    error @6;
+    custom @7;
+}
+
+interface TunnelSubscription {
+    # Unbounded pull — returns all available frames. For high-throughput
+    # tunnels, use pullPaged (ordinal @2) with T.Pagination to bound the
+    # result set. Kept as the first ordinal for the existing wire shape.
+    pull @0 (handle :TunnelHandle) -> (frames :List(T.DataHandle));
+    cancel @1 () -> T.VoidResult;
+
+    # Paginated frame retrieval. Returns at most `pagination.limit`
+    # frames starting at `pagination.offset`.
+    pullPaged @2 (handle :TunnelHandle, pagination :T.Pagination)
+              -> (frames :List(T.DataHandle), totalCount :UInt64);
 }
 
 # ── Mesh Topology ────────────────────────────────────────────
 
+struct MeshTopologyResult {
+    union {
+        topology @0 :MeshTopology;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
 struct MeshTopology {
-    # Unique mesh identifier.
     meshId @0 :Text;
-    # This node's tunnel handle within the mesh.
+    # This node's tunnel handle within the mesh (a pure reference).
     localHandle @1 :TunnelHandle;
-    # All known peers in the mesh.
     peers @2 :List(TunnelPeer);
-    # Computed routing table.
     routes @3 :List(TunnelRoute);
-    # Mesh routing algorithm in use.
-    algorithm @4 :MeshAlgorithm;
+    # Routing algorithm as an open token ("flood", "gossip", ...):
+    # routing is backend-internal, and the protocol reports rather than
+    # instructs (TIMELESSNESS.md:84).
+    algorithm @4 :Text;
+    metadata @5 :T.StringMap;
 }
 
 struct TunnelPeer {
-    # Peer node identifier.
     peerId @0 :T.NodeId;
-    # Peer's endpoint address.
+    # Peer's endpoint address (opaque; see endpoint.capnp).
     endpoint @1 :Text;
-    # Capabilities this peer supports.
+    # Capabilities this peer supports, as open tokens.
     capabilities @2 :List(Text);
-    # Latency to this peer.
     latency @3 :T.Duration;
-    # When this peer was last seen.
     lastSeen @4 :T.Timestamp;
-    # Peer state.
     state @5 :TunnelPeerState;
+    metadata @6 :T.StringMap;
 }
 
 enum TunnelPeerState {
-    connected @0;
-    disconnected @1;
-    connecting @2;
-    failed @3;
-    custom @4;
+    unspecified @0;
+    connected @1;
+    disconnected @2;
+    connecting @3;
+    failed @4;
+    custom @5;
 }
 
 struct TunnelRoute {
-    # Destination peer.
     destination @0 :T.NodeId;
-    # Next hop toward destination.
     nextHop @1 :T.NodeId;
-    # Route metric (lower = preferred).
     metric @2 :UInt32;
-    # Route expiry (empty = static route).
     expiry @3 :T.Timestamp;
-}
-
-enum MeshAlgorithm {
-    flood @0;
-    gossip @1;
-    linkState @2;
-    distanceVector @3;
-    custom @4;
 }
 
 # ── Tunnel Security Policy ─────────────────────────────────
 
 struct TunnelSecurityPolicy {
-    # Encryption algorithm for tunnel frames.
-    encryption @0 :TunnelEncryption;
-    # Authentication method for tunnel endpoints.
-    authentication @1 :TunnelAuth;
-    # Key rotation interval (empty = no rotation).
+    # Encryption algorithm as an open token ("aes256GcmSiv",
+    # "chacha20Poly1305", "ml-kem-768-hybrid", ...). Naming a 2024
+    # standardisation generation is how this enum aged into a lie;
+    # a token cannot.
+    encryption @0 :Text;
+    # Authentication method as an open token ("psk", "certificate",
+    # "token", ...).
+    authentication @1 :Text;
+    # Key rotation interval (absent = no rotation).
     keyRotationInterval @2 :T.Duration;
     # Whether to verify peer identity.
     verifyPeer @3 :Bool;
-    # Trusted peer certificates/keys.
-    trustedPeers @4 :List(Data);
-}
-
-enum TunnelEncryption {
-    none @0;
-    # AES-128-GCM-SIV (RFC 8452).
-    aes128GcmSiv @1;
-    # AES-256-GCM-SIV.
-    aes256GcmSiv @2;
-    # ChaCha20-Poly1305 (RFC 8439).
-    chacha20Poly1305 @3;
-    # Post-quantum: Kyber-768 hybrid.
-    kyber768 @4;
-    # Post-quantum: Kyber-1024.
-    kyber1024 @5;
-    # Hybrid classical/PQ: X25519 + Kyber-768.
-    hybridX25519Kyber768 @6;
-    custom @7;
-}
-
-enum TunnelAuth {
-    none @0;
-    # Pre-shared key.
-    psk @1;
-    # Mutual TLS certificate.
-    certificate @2;
-    # Token-based (bearer, JWT).
-    token @3;
-    custom @4;
+    # Trusted peers, identified — the previous spelling was a bag of
+    # opaque key bytes with no pairing to the peer they belonged to.
+    trustedPeers @4 :List(T.NodeId);
+    # Backend-declared parameters (key sizes, modes, ...).
+    parameters @5 :T.StringMap;
 }
 
 # ── QoS Parameters ──────────────────────────────────────────
 
 struct QoSParams {
-    # Maximum acceptable latency (latency budget).
     latencyBudget @0 :T.Duration;
-    # Maximum acceptable jitter.
     jitterTolerance @1 :T.Duration;
     # Required bandwidth in bits per second (0 = unlimited).
     bandwidthBps @2 :UInt64;
     # Priority (0 = lowest, 255 = highest).
     priority @3 :UInt8;
-    # What to do when queue is full.
-    dropPolicy @4 :DropPolicy;
-}
-
-enum DropPolicy {
-    # Drop oldest frames.
-    dropOldest @0;
-    # Drop newest frames.
-    dropNewest @1;
-    # Drop lowest-priority frames.
-    dropLowest @2;
-    custom @3;
+    # What to do when the queue is full, as an open token.
+    dropPolicy @4 :Text;
+    metadata @5 :T.StringMap;
 }
 
 # ── Tunnel Metrics ──────────────────────────────────────────
 
 struct TunnelMetrics {
-    # Latency percentiles.
     latencyP50 @0 :T.Duration;
     latencyP99 @1 :T.Duration;
-    # Packet loss rate (0.0 = none, 1.0 = 100% loss).
     lossRate @2 :Float32;
-    # Current throughput in bits per second.
     throughputBps @3 :UInt64;
-    # Retransmission count (reliable flows only).
     retransmissions @4 :UInt64;
-    # When these metrics were last updated.
     lastUpdated @5 :T.Timestamp;
-    # Frames currently in flight.
     framesInFlight @6 :UInt32;
-    # Send queue depth.
     sendQueueDepth @7 :UInt32;
 }
 
 # ── Tunnel Health ───────────────────────────────────────────
 
-struct TunnelHealth {
-    # Round-trip time for health probe.
-    rtt @0 :T.Duration;
-    # Loss rate during health check window.
-    loss @1 :Float32;
-    # Jitter during health check window.
-    jitter @2 :T.Duration;
-    # When this health check was performed.
-    timestamp @3 :T.Timestamp;
-    # Overall health assessment.
-    status @4 :HealthStatus;
+struct TunnelHealthResult {
+    union {
+        health @0 :TunnelHealth;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
 
-enum HealthStatus {
-    healthy @0;
-    degraded @1;
-    unhealthy @2;
-    unknown @3;
-    custom @4;
+struct TunnelHealth {
+    rtt @0 :T.Duration;
+    loss @1 :Float32;
+    jitter @2 :T.Duration;
+    timestamp @3 :T.Timestamp;
+    # Reported status as an open token ("healthy", "degraded", ...).
+    status @4 :Text;
+    metadata @5 :T.StringMap;
 }
 
 # ── Multiplexed Logical Tunnel ──────────────────────────────
 
+struct LogicalTunnelResult {
+    union {
+        logical @0 :LogicalTunnel;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
 struct LogicalTunnel {
-    # Logical stream ID (unique within the parent tunnel).
-    logicalId @0 :UInt32;
-    # Human-readable name.
+    # Logical stream identity, unique within the parent tunnel. This is
+    # the one spelling: `openLogical` returns this struct, so no consumer
+    # has to track a bare UInt32 beside it.
+    logicalId @0 :LogicalTunnelId;
     name @1 :Text;
-    # Current state.
     state @2 :TunnelState;
-    # Bytes transferred on this logical stream.
     bytesIn @3 :UInt64;
     bytesOut @4 :UInt64;
-    # Flow policy for this logical stream.
     flow @5 :FlowPolicy;
+    metadata @6 :T.StringMap;
+}
+
+struct LogicalTunnelId {
+    id @0 :UInt32;
 }

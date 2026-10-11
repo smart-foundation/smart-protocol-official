@@ -2,18 +2,8 @@
 
 using T = import "types.capnp";
 
-# ─── Archive Hash Algorithm ───────────────────────────────────
-
-enum HashAlgorithm {
-    sha256 @0;
-    sha512 @1;
-    blake3 @2;
-    xxh64 @3;
-    custom @4;
-}
-
 # ═══════════════════════════════════════════════════════════════════════
-# Archive — archive extraction and creation (zip, tar, 7z, etc.).
+# Archive — archive extraction and creation.
 #
 # Zero backend assumptions: no libarchive, no 7-Zip, no libzip,
 # no tar, no gzip, no xz, no bzip2, no zstd. Backend provides
@@ -22,11 +12,51 @@ enum HashAlgorithm {
 # Common app need — every app reimplements this.
 #
 # Used by: package.capnp (package extraction), files.capnp (archive browsing)
+#
+# Fixes this revision makes:
+#   - The streaming pair actually streams. `CompressStream.write` and
+#     `DecompressStream.read` took and returned inline `Data`, so the
+#     feature added "for large archives with backpressure" copied every
+#     chunk into the message arena and defeated its own purpose. Both
+#     endpoints are `T.DataHandle` now.
+#   - Format is two open tokens, not 35 enumerated products. The old
+#     `ArchiveFormat` spelled out tar×codec combinatorics by hand
+#     (tarGz, tarBz2, tarXz, tarZst, tarLz4, tarLzma, ...), so every new
+#     codec added six ordinals forever and a 2046 container had no value.
+#     Container and compression are now independent strings plus
+#     parameters.
+#   - `CompressionMethod` (27 values, including 1990s ZIP curiosities
+#     like `reduced1..4`, `imploded` and `shrunk`, and one codec's fast/
+#     high modes frozen as separate values) is gone: compression is the
+#     same open token as in the format.
+#   - POSIX ownership is gone from entries. `uid`, `gid`, `uname`,
+#     `gname`, `mode` and `preserveOwnership` required a capability or
+#     browser backend to fabricate owner metadata consumers then
+#     trusted; what a backend genuinely knows, it reports in `metadata`.
+#   - Single-entry extraction uses the same destination vocabulary as
+#     everything else (regaining its `custom` variant).
+#   - Errors are T.Error everywhere in the integrity feature.
+#   - Diff and hash-verification results are bounded: a diff of two
+#     large archives used to be three unbounded lists in one message.
+#   - Implementation hints (`parallelism`, `sparseExtraction`) are gone:
+#     they describe HOW, not WHAT (the Agnostic test).
 # ═══════════════════════════════════════════════════════════════════════
+
+# Container and compression are independent open tokens. The
+# combination carries its own parameters, so "tar + zstd at level 19"
+# is data rather than an invented enum value.
+struct ArchiveFormat {
+    # Container token: "zip", "tar", "cpio", "ar", "7z", "iso", ...
+    container @0 :Text;
+    # Compression token: "gzip", "zstd", "xz", "bzip2", "lz4", "none", ...
+    compression @1 :Text;
+    # Codec parameters as backend-declared data (level, mode, dictionary).
+    parameters @2 :T.StringMap;
+}
 
 interface ArchiveService {
     # List entries in an archive.
-    listEntries @0 (request :ListEntriesRequest) -> (entries :List(ArchiveEntry), totalCount :UInt32);
+    listEntries @0 (request :ListEntriesRequest) -> (entries :List(ArchiveEntry), totalCount :UInt64);
 
     # Extract entire archive to a directory.
     extract @1 (request :ExtractRequest) -> (result :ExtractResult);
@@ -44,53 +74,46 @@ interface ArchiveService {
     deleteFromArchive @5 (request :DeleteFromArchiveRequest) -> T.VoidResult;
 
     # Test archive integrity.
-    testIntegrity @6 (archive :ArchiveSource) -> (result :IntegrityResult);
+    testIntegrity @6 (archive :ArchiveSource, format :ArchiveFormat) -> (result :IntegrityResult);
 
     # Get archive metadata.
-    getMetadata @7 (archive :ArchiveSource) -> (metadata :ArchiveMetadata);
+    getMetadata @7 (archive :ArchiveSource, format :ArchiveFormat) -> (result :ArchiveMetadataResult);
 
     # Convert archive format.
     convert @8 (request :ConvertRequest) -> (result :ConvertResult);
 
     # Stream-compress data (for large archives with backpressure).
-    compressStream @10 (request :CompressStreamRequest) -> (stream :CompressStream);
+    compressStream @9 (request :CompressStreamRequest) -> (stream :CompressStream);
 
     # Stream-decompress data (for large archives with backpressure).
-    decompressStream @11 (request :DecompressStreamRequest) -> (stream :DecompressStream);
+    decompressStream @10 (request :DecompressStreamRequest) -> (stream :DecompressStream);
 
     # Merge multiple archives into one.
-    mergeArchives @12 (request :MergeArchivesRequest) -> (result :MergeArchivesResult);
+    mergeArchives @11 (request :MergeArchivesRequest) -> (result :MergeArchivesResult);
 
     # Split a large archive into volumes.
-    splitArchive @13 (request :SplitArchiveRequest) -> (result :SplitArchiveResult);
+    splitArchive @12 (request :SplitArchiveRequest) -> (result :SplitArchiveResult);
 
     # Subscribe to archive operation progress.
-    subscribeProgress @9 (operationId :Text) -> (subscription :ProgressSubscription);
-
-    # ─── Archive Repair ────────────────────────────────────────
+    subscribeProgress @13 (operationId :ArchiveOperationId) -> (subscription :ProgressSubscription);
 
     # Repair a partially corrupted archive.
     repairArchive @14 (request :RepairArchiveRequest) -> (result :RepairArchiveResult);
 
-    # ─── Multi-Volume Reading ──────────────────────────────────
-
     # Read a split archive from a directory of parts.
-    readSplitArchive @15 (request :ReadSplitArchiveRequest) -> (entries :List(ArchiveEntry), totalCount :UInt32);
-
-    # ─── Archive Streaming Hash Verification ───────────────────
+    readSplitArchive @15 (request :ReadSplitArchiveRequest) -> (entries :List(ArchiveEntry), totalCount :UInt64);
 
     # Stream hash verification for entry contents.
     verifyEntryHashes @16 (request :StreamingHashRequest) -> (result :HashVerificationResult);
 
-    # ─── Archive Diff ─────────────────────────────────────────
-
-    # Compute diff between two archives.
-    diffArchives @17 (request :ArchiveDiffRequest) -> (result :ArchiveDiffResult);
+    # Compute diff between two archives (bounded — see the result type).
+    diffArchives @17 (request :ArchiveDiffRequest, page :T.Pagination) -> (result :ArchiveDiffResult);
 }
 
 interface CompressStream {
-    # Feed data into the stream compressor.
-    write @0 (data :Data) -> T.VoidResult;
+    # Feed data into the stream compressor, as a handle: the backpressure
+    # design is only zero-copy if the payload is.
+    write @0 (data :T.DataHandle) -> T.VoidResult;
     # Signal end of input and flush remaining compressed data.
     finish @1 () -> (result :CompressResult);
     # Cancel the stream operation.
@@ -99,15 +122,33 @@ interface CompressStream {
 
 interface DecompressStream {
     # Read decompressed data from the stream.
-    read @0 (maxBytes :UInt32) -> (data :Data, done :Bool);
+    read @0 (maxBytes :UInt32) -> (result :DecompressStreamResult);
     # Cancel the stream operation.
     cancel @1 () -> T.VoidResult;
+}
+
+struct DecompressStreamResult {
+    union {
+        chunk @0 :StreamChunk;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct StreamChunk {
+    data @0 :T.DataHandle;
+    # Whether this is the last chunk.
+    done @1 :Bool;
+    metadata @2 :T.StringMap;
 }
 
 interface ProgressSubscription {
     pull @0 () -> (progress :OperationProgress);
     cancel @1 () -> T.VoidResult;
 }
+
+# An operation is not a backup or an update: it gets its own typed id.
+struct ArchiveOperationId { id @0 :UInt64; }
 
 # ─── Archive Source ──────────────────────────────────────────────────
 
@@ -116,8 +157,8 @@ struct ArchiveSource {
         # Local file path.
         path @0 :Text;
 
-        # In-memory data (for small archives).
-        data @1 :Data;
+        # In-memory data (for small archives), as a handle.
+        data @1 :T.DataHandle;
 
         # Buffer reference (for large archives).
         buffer @2 :T.BufferId;
@@ -130,101 +171,10 @@ struct ArchiveSource {
     }
 }
 
-# ─── Archive Formats ─────────────────────────────────────────────────
-
-enum ArchiveFormat {
-    # Zip
-    zip @0;
-
-    # Tar variants
-    tar @1;
-    tarGz @2;       # was: tar_gz (.tar.gz / .tgz)
-    tarBz2 @3;      # was: tar_bz2 (.tar.bz2 / .tbz2)
-    tarXz @4;       # was: tar_xz (.tar.xz / .txz)
-    tarZst @5;      # was: tar_zst (.tar.zst / .tzst)
-    tarLz4 @6;      # was: tar_lz4 (.tar.lz4)
-    tarLzma @7;     # was: tar_lzma (.tar.lzma)
-
-    # 7-Zip
-    sevenz @8;
-
-    # RAR
-    rar @9;
-    rar5 @10;         # RAR version 5+
-
-    # CPIO
-    cpio @11;
-    cpioGz @12;     # was: cpio_gz
-
-    # AR/Debian
-    ar @13;
-    deb @14;
-
-    # RPM
-    rpm @15;
-
-    # ISO
-    iso @16;
-
-    # SquashFS
-    squashfs @17;
-
-    # Apple Disk Image
-    dmg @18;
-
-    # AppImage
-    appimage @19;
-
-    # XAR (Apple/IBM archive format, used by .pkg, .xar)
-    xar @20;
-
-    # Microsoft Cabinet
-    cab @21;
-
-    # Lzip (LZMA-based)
-    lzip @22;
-
-    # Zstandard (standalone, not tar+zstd)
-    zstd @23;
-
-    # LZ4 (standalone, not tar+lz4)
-    lz4 @24;
-
-    # LHA/LZH
-    lha @25;
-
-    # ARJ
-    arj @26;
-
-    # Zoo
-    zoo @27;
-
-    # ARC
-    arc @28;
-
-    # WARC (Web ARChive)
-    warc @29;
-
-    # Snap package (Ubuntu)
-    snap @30;
-
-    # Flatpak bundle
-    flatpak @31;
-
-    # EROFS (Enhanced Read-Only File System)
-    erofs @32;
-
-    # WIM (Windows Imaging Format)
-    wim @33;
-
-    # Custom
-    custom @34;
-}
-
 # ─── Archive Entry ───────────────────────────────────────────────────
 
 struct ArchiveEntry {
-    # Path within archive (relative, POSIX-style with /).
+    # Path within archive (relative, "/"-separated).
     path @0 :Text;
 
     # Entry size in bytes (uncompressed).
@@ -245,83 +195,40 @@ struct ArchiveEntry {
     # Last modified timestamp.
     lastModified @6 :T.Timestamp;
 
-    # File permissions (Unix mode bits, 0 if not applicable).
-    mode @7 :UInt32;
+    # Compression method used for this entry, as an open token.
+    compression @7 :Text;
 
-    # User ID (0 if not applicable).
-    uid @8 :UInt32;
-
-    # Group ID (0 if not applicable).
-    gid @9 :UInt32;
-
-    # User name (if stored).
-    uname @10 :Text;
-
-    # Group name (if stored).
-    gname @11 :Text;
-
-    # Compression method used for this entry.
-    compression @12 :CompressionMethod;
-
-    # CRC32 checksum (for zip).
-    crc32 @13 :UInt32;
+    # CRC32 checksum (for containers that carry one).
+    crc32 @8 :UInt32;
 
     # SHA256 hash (if computed/verified).
-    sha256 @14 :Data;
+    sha256 @9 :Data;
 
     # Whether entry is encrypted.
-    encrypted @15 :Bool;
+    encrypted @10 :Bool;
 
-    # Encryption algorithm (if encrypted).
-    encryptionAlgorithm @16 :Text;
+    # Encryption algorithm as an open token (if encrypted).
+    encryptionAlgorithm @11 :Text;
 
     # Entry offset in archive (for random access).
-    offset @17 :UInt64;
+    offset @12 :UInt64;
 
-    # Extended attributes.
-    xattrs @18 :T.StringMap;
-
-    # Backend-specific metadata.
-    metadata @19 :T.StringMap;
-}
-
-enum CompressionMethod {
-    stored @0;           # No compression
-    deflate @1;          # Zip deflate
-    deflate64 @2;        # Zip deflate64
-    bzip2 @3;            # bzip2
-    lzma @4;             # LZMA / xz
-    lzma2 @5;            # LZMA2
-    zstd @6;             # Zstandard
-    lz4 @7;              # LZ4
-    ppmd @8;             # PPMd
-    brotli @9;           # Brotli
-    shrunk @10;          # Old compress
-    reduced1 @11;        # was: reduced_1
-    reduced2 @12;        # was: reduced_2
-    reduced3 @13;        # was: reduced_3
-    reduced4 @14;        # was: reduced_4
-    imploded @15;
-    tokenized @16;
-    wavpack @17;
-    lzip @18;            # Lzip LZMA variant
-    xz @19;              # XZ Utils
-    lz5 @20;             # LZ5 (LZ4 predecessor)
-    lzham @21;           # LZHAM (LZMA-like, high ratio)
-    zpaq @22;            # ZPAQ (high compression)
-    zstdFast @23;        # was: zstd_fast (Zstandard fast mode)
-    zstdHigh @24;        # was: zstd_high (Zstandard high compression)
-    flzma @25;           # Fast LZMA
-    custom @26;
+    # Extended attributes and backend-declared ownership/permission
+    # detail. POSIX owner ids and mode bits lived here as required
+    # fields; they are backend metadata now, which is the only place a
+    # capability or browser backend can report them honestly.
+    metadata @13 :T.StringMap;
 }
 
 # ─── Requests ────────────────────────────────────────────────────────
 
 struct ListEntriesRequest {
     archive @0 :ArchiveSource;
-    format @1 :ArchiveFormat;  # Empty = auto-detect
-    # Password for encrypted archives.
-    password @2 :Data;
+    format @1 :ArchiveFormat;
+    # Password for encrypted archives: the caller's inline secret, as
+    # content. A backend that must never see it takes a key reference
+    # instead.
+    password @2 :T.DataHandle;
     # Path prefix filter (only entries under this path).
     prefix @3 :Text;
     # Include/exclude patterns (glob-style).
@@ -329,82 +236,84 @@ struct ListEntriesRequest {
     excludePatterns @5 :List(Text);
     # Pagination for large archives.
     pagination @6 :T.Pagination;
+    metadata @7 :T.StringMap;
 }
 
 struct ExtractRequest {
     archive @0 :ArchiveSource;
     format @1 :ArchiveFormat;
-    password @2 :Data;
+    password @2 :T.DataHandle;
     # Destination directory (must exist).
     destination @3 :Text;
-    # Preserve file permissions.
-    preservePermissions @4 :Bool = true;
     # Preserve timestamps.
-    preserveTimestamps @5 :Bool = true;
-    # Preserve ownership (requires privilege).
-    preserveOwnership @6 :Bool = false;
+    preserveTimestamps @4 :Bool = true;
     # Overwrite existing files.
-    overwrite @7 :Bool = true;
+    overwrite @5 :Bool = true;
     # Skip existing files.
-    skipExisting @8 :Bool = false;
+    skipExisting @6 :Bool = false;
     # Path prefix filter.
-    prefix @9 :Text;
+    prefix @7 :Text;
     # Include/exclude patterns.
-    includePatterns @10 :List(Text);
-    excludePatterns @11 :List(Text);
+    includePatterns @8 :List(Text);
+    excludePatterns @9 :List(Text);
     # Strip leading path components (like tar --strip-components).
-    stripComponents @12 :UInt32;
-    # Operation ID for progress tracking.
-    operationId @13 :Text;
-    # Parallel extraction hint (0 = auto, 1 = single-threaded).
-    parallelism @14 :UInt32 = 0;
-    # Enable sparse file extraction (for disk images).
-    sparseExtraction @15 :Bool = false;
+    stripComponents @10 :UInt32;
+    # Operation id for progress tracking.
+    operationId @11 :ArchiveOperationId;
+    metadata @12 :T.StringMap;
 }
+
+# Ownership and permission fidelity is deliberately absent: preserving a
+# uid/gid an archive happens to carry is a POSIX operation that a
+# capability backend cannot perform and should not fake. What a backend
+# knows, it reports in `ArchiveEntry.metadata`.
 
 struct ExtractResult {
     success @0 :Bool;
-    extractedCount @1 :UInt32;
-    failedCount @2 :UInt32;
+    extractedCount @1 :UInt64;
+    failedCount @2 :UInt64;
     errors @3 :List(ExtractError);
     # Total bytes extracted.
     bytesExtracted @4 :UInt64;
     duration @5 :T.Duration;
+    metadata @6 :T.StringMap;
 }
 
 struct ExtractError {
     path @0 :Text;
     error @1 :T.Error;
+    metadata @2 :T.StringMap;
 }
 
 struct ExtractEntryRequest {
     archive @0 :ArchiveSource;
     format @1 :ArchiveFormat;
-    password @2 :Data;
+    password @2 :T.DataHandle;
     # Entry path within archive.
     entryPath @3 :Text;
-    # Output destination.
-    union {
-        path @4 :Text;           # Write to file
-        buffer @5 :T.BufferId;   # Write to buffer
-        handle @6 :T.FileHandleId;  # Write to open handle
-    }
+    # Output destination — the same vocabulary as every other
+    # destination in this file (and it has a `custom` variant, which the
+    # previous inline union lacked).
+    destination @4 :ArchiveDestination;
     # Offset within entry (for partial extraction).
-    offset @7 :UInt64;
+    offset @5 :UInt64;
     # Length to extract (0 = rest of entry).
-    length @8 :UInt64;
+    length @6 :UInt64;
+    metadata @7 :T.StringMap;
 }
 
 struct ExtractEntryResult {
     union {
         success @0 :ExtractEntrySuccess;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
 struct ExtractEntrySuccess {
     bytesWritten @0 :UInt64;
     entry @1 :ArchiveEntry;
+    metadata @2 :T.StringMap;
 }
 
 struct CompressRequest {
@@ -413,30 +322,27 @@ struct CompressRequest {
     # Destination archive.
     destination @1 :ArchiveDestination;
     format @2 :ArchiveFormat;
-    # Default compression level (1-9, 0 = default).
+    # Default compression level (1-9, 0 = backend default); the level is
+    # also expressible as a format parameter.
     compressionLevel @3 :UInt8 = 6;
-    # Per-format compression method override.
-    compressionMethod @4 :CompressionMethod;
-    # Password for encryption.
-    password @5 :Data;
-    # Encryption algorithm.
-    encryptionAlgorithm @6 :ArchiveEncryptionAlgorithm;  # Typed enum (was bare Text)
-    # Preserve file permissions.
-    preservePermissions @7 :Bool = true;
+    password @4 :T.DataHandle;
+    # Encryption algorithm as an open token.
+    encryptionAlgorithm @5 :Text;
     # Preserve timestamps.
-    preserveTimestamps @8 :Bool = true;
+    preserveTimestamps @6 :Bool = true;
     # Follow symlinks (store target, not link).
-    followSymlinks @9 :Bool = false;
+    followSymlinks @7 :Bool = false;
     # Preserve hardlinks (maintain link relationships).
-    preserveHardlinks @14 :Bool = true;
+    preserveHardlinks @8 :Bool = true;
     # Include hidden files.
-    includeHidden @10 :Bool = true;
+    includeHidden @9 :Bool = true;
     # Exclude patterns.
-    excludePatterns @11 :List(Text);
-    # Operation ID for progress tracking.
-    operationId @12 :Text;
+    excludePatterns @10 :List(Text);
+    # Operation id for progress tracking.
+    operationId @11 :ArchiveOperationId;
     # Archive comment.
-    comment @13 :Text;
+    comment @12 :Text;
+    metadata @13 :T.StringMap;
 }
 
 struct CompressSource {
@@ -446,6 +352,7 @@ struct CompressSource {
     archivePath @1 :Text;
     # Whether to recurse into directories.
     recursive @2 :Bool = true;
+    metadata @3 :T.StringMap;
 }
 
 struct ArchiveDestination {
@@ -460,69 +367,94 @@ struct ArchiveDestination {
 struct CompressResult {
     success @0 :Bool;
     archiveSize @1 :UInt64;
-    entryCount @2 :UInt32;
+    entryCount @2 :UInt64;
     duration @3 :T.Duration;
     errors @4 :List(CompressError);
+    metadata @5 :T.StringMap;
 }
 
 struct CompressError {
     sourcePath @0 :Text;
     error @1 :T.Error;
+    metadata @2 :T.StringMap;
 }
 
 struct AddToArchiveRequest {
     archive @0 :ArchiveSource;
     format @1 :ArchiveFormat;
-    password @2 :Data;
+    password @2 :T.DataHandle;
     sources @3 :List(CompressSource);
     # Whether to update existing entries.
     update @4 :Bool = false;
     # Whether to only add newer files.
     freshen @5 :Bool = false;
+    metadata @6 :T.StringMap;
 }
 
 struct DeleteFromArchiveRequest {
     archive @0 :ArchiveSource;
     format @1 :ArchiveFormat;
-    password @2 :Data;
+    password @2 :T.DataHandle;
     # Entry paths to delete.
     entryPaths @3 :List(Text);
+    metadata @4 :T.StringMap;
 }
 
 struct IntegrityResult {
+    union {
+        result @0 :IntegrityOutcome;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct IntegrityOutcome {
     valid @0 :Bool;
     errors @1 :List(IntegrityError);
-    checkedEntries @2 :UInt32;
+    checkedEntries @2 :UInt64;
     duration @3 :T.Duration;
+    metadata @4 :T.StringMap;
 }
 
 struct IntegrityError {
     path @0 :Text;
-    error @1 :Text;
+    error @1 :T.Error;
     errorType @2 :IntegrityErrorType;
+    metadata @3 :T.StringMap;
 }
 
 enum IntegrityErrorType {
-    crcMismatch @0;
-    sizeMismatch @1;
-    compressionError @2;
-    encryptionError @3;
-    missingEntry @4;
-    extraEntry @5;
-    corruptedHeader @6;
-    custom @7;
+    unspecified @0;
+    crcMismatch @1;
+    sizeMismatch @2;
+    compressionError @3;
+    encryptionError @4;
+    missingEntry @5;
+    extraEntry @6;
+    corruptedHeader @7;
+    custom @8;
+}
+
+struct ArchiveMetadataResult {
+    union {
+        metadata @0 :ArchiveMetadata;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
 
 struct ArchiveMetadata {
     format @0 :ArchiveFormat;
     formatVersion @1 :Text;
     comment @2 :Text;
-    createdBy @3 :Text;          # Tool that created the archive
+    # Tool that created the archive, as reported data.
+    createdBy @3 :Text;
     createdAt @4 :T.Timestamp;
-    entryCount @5 :UInt32;
+    entryCount @5 :UInt64;
     totalSize @6 :UInt64;
     compressedSize @7 :UInt64;
     encrypted @8 :Bool;
+    # Encryption algorithm as an open token.
     encryptionAlgorithm @9 :Text;
     # Format-specific metadata.
     custom @10 :T.StringMap;
@@ -531,20 +463,28 @@ struct ArchiveMetadata {
 struct ConvertRequest {
     source @0 :ArchiveSource;
     sourceFormat @1 :ArchiveFormat;
-    sourcePassword @2 :Data;
+    sourcePassword @2 :T.DataHandle;
     destination @3 :ArchiveDestination;
     targetFormat @4 :ArchiveFormat;
-    targetPassword @5 :Data;
+    targetPassword @5 :T.DataHandle;
     targetCompressionLevel @6 :UInt8 = 6;
-    targetCompressionMethod @7 :CompressionMethod;
-    operationId @8 :Text;
+    operationId @7 :ArchiveOperationId;
+    metadata @8 :T.StringMap;
 }
 
 struct ConvertResult {
+    union {
+        result @0 :ConvertOutcome;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct ConvertOutcome {
     success @0 :Bool;
     sourceSize @1 :UInt64;
     targetSize @2 :UInt64;
-    entryCount @3 :UInt32;
+    entryCount @3 :UInt64;
     duration @4 :T.Duration;
 }
 
@@ -553,18 +493,20 @@ struct ConvertResult {
 struct CompressStreamRequest {
     format @0 :ArchiveFormat;
     compressionLevel @1 :UInt8 = 6;
-    compressionMethod @2 :CompressionMethod;
-    password @3 :Data;
-    encryptionAlgorithm @4 :Text;
-    operationId @5 :Text;
+    password @2 :T.DataHandle;
+    # Encryption algorithm as an open token.
+    encryptionAlgorithm @3 :Text;
+    operationId @4 :ArchiveOperationId;
+    metadata @5 :T.StringMap;
 }
 
 struct DecompressStreamRequest {
     archive @0 :ArchiveSource;
     format @1 :ArchiveFormat;
-    password @2 :Data;
+    password @2 :T.DataHandle;
     entryPath @3 :Text;  # Empty = first entry or stream of entries
-    operationId @4 :Text;
+    operationId @4 :ArchiveOperationId;
+    metadata @5 :T.StringMap;
 }
 
 # ─── Merge ────────────────────────────────────────────────────────
@@ -577,17 +519,27 @@ struct MergeArchivesRequest {
     targetCompressionLevel @4 :UInt8 = 6;
     # Deduplicate entries by path (keep latest).
     deduplicate @5 :Bool = true;
-    password @6 :Data;
-    operationId @7 :Text;
+    password @6 :T.DataHandle;
+    operationId @7 :ArchiveOperationId;
+    metadata @8 :T.StringMap;
 }
 
 struct MergeArchivesResult {
+    union {
+        result @0 :MergeOutcome;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct MergeOutcome {
     success @0 :Bool;
-    totalEntries @1 :UInt32;
-    duplicateEntries @2 :UInt32;
+    totalEntries @1 :UInt64;
+    duplicateEntries @2 :UInt64;
     outputSize @3 :UInt64;
     duration @4 :T.Duration;
     errors @5 :List(T.Error);
+    metadata @6 :T.StringMap;
 }
 
 # ─── Split ────────────────────────────────────────────────────────
@@ -595,78 +547,75 @@ struct MergeArchivesResult {
 struct SplitArchiveRequest {
     source @0 :ArchiveSource;
     sourceFormat @1 :ArchiveFormat;
-    password @2 :Data;
+    password @2 :T.DataHandle;
     destination @3 :Text;  # Directory to write split parts
     partSize @4 :UInt64;   # Size per part in bytes
     naming @5 :SplitNaming;
-    operationId @6 :Text;
+    operationId @6 :ArchiveOperationId;
+    metadata @7 :T.StringMap;
 }
 
 enum SplitNaming {
-    sequential @0;    # archive.part000, archive.part001, ...
-    numbered @1;      # archive.000, archive.001, ...
-    custom @2;
+    unspecified @0;
+    sequential @1;    # archive.part000, archive.part001, ...
+    numbered @2;      # archive.000, archive.001, ...
+    custom @3;
 }
 
 struct SplitArchiveResult {
+    union {
+        result @0 :SplitOutcome;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct SplitOutcome {
     success @0 :Bool;
     parts @1 :List(SplitPart);
     totalSize @2 :UInt64;
     duration @3 :T.Duration;
+    metadata @4 :T.StringMap;
 }
 
 struct SplitPart {
     path @0 :Text;
     size @1 :UInt64;
     partNumber @2 :UInt32;
+    metadata @3 :T.StringMap;
 }
 
 # ─── Operation Progress ──────────────────────────────────────────────
 
 struct OperationProgress {
-    operationId @0 :Text;
+    operationId @0 :ArchiveOperationId;
     phase @1 :OperationPhase;
-    progress @2 :Float32;  # 0.0 - 1.0
-    currentFile @3 :Text;
-    filesProcessed @4 :UInt32;
-    totalFiles @5 :UInt32;
-    bytesProcessed @6 :UInt64;
-    totalBytes @7 :UInt64;
-    elapsed @8 :T.Duration;
-    estimatedRemaining @9 :T.Duration;
-    errors @10 :List(Text);
-    done @11 :Bool;
+    currentFile @2 :Text;
+    filesProcessed @3 :UInt64;
+    totalFiles @4 :UInt64;
+    bytesProcessed @5 :UInt64;
+    totalBytes @6 :UInt64;
+    elapsed @7 :T.Duration;
+    estimatedRemaining @8 :T.Duration;
+    errors @9 :List(T.Error);
+    done @10 :Bool;
+    metadata @11 :T.StringMap;
 }
 
 enum OperationPhase {
-    initializing @0;
-    scanning @1;
-    extracting @2;
-    compressing @3;
-    encrypting @4;
-    decrypting @5;
-    verifying @6;
-    finalizing @7;
-    complete @8;
-    failed @9;
-    repairing @10;
-    custom @11;
-}
-
-# ─── Typed Encryption Algorithm ───────────────────────────────
-# Replaces bare Text in CompressRequest.encryptionAlgorithm.
-# Provides type safety for archive encryption.
-
-enum ArchiveEncryptionAlgorithm {
-    aes128 @0;        # AES-128
-    aes256 @1;        # AES-256
-    zipCrypto @2;     # ZipCrypto (weak, legacy)
-    tripleDes @3;     # 3DES
-    blowfish @4;      # Blowfish
-    twofish @5;       # Twofish
-    chacha20 @6;      # ChaCha20-Poly1305
-    none @7;          # No encryption
-    custom @8;
+    unspecified @0;
+    initializing @1;
+    scanning @2;
+    extracting @3;
+    compressing @4;
+    encrypting @5;
+    decrypting @6;
+    verifying @7;
+    finalizing @8;
+    complete @9;
+    failed @10;
+    repairing @11;
+    custom @12;
 }
 
 # ─── Archive Repair ───────────────────────────────────────────
@@ -674,21 +623,31 @@ enum ArchiveEncryptionAlgorithm {
 struct RepairArchiveRequest {
     archive @0 :ArchiveSource;
     format @1 :ArchiveFormat;
-    password @2 :Data;
+    password @2 :T.DataHandle;
     # Destination for repaired archive.
     destination @3 :ArchiveDestination;
     # Whether to attempt recovery of corrupted entries.
     recoverEntries @4 :Bool = true;
-    operationId @5 :Text;
+    operationId @5 :ArchiveOperationId;
+    metadata @6 :T.StringMap;
 }
 
 struct RepairArchiveResult {
+    union {
+        result @0 :RepairOutcome;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct RepairOutcome {
     success @0 :Bool;
-    repairedEntries @1 :UInt32;
-    unrecoverableEntries @2 :UInt32;
+    repairedEntries @1 :UInt64;
+    unrecoverableEntries @2 :UInt64;
     errors @3 :List(T.Error);
     outputSize @4 :UInt64;
     duration @5 :T.Duration;
+    metadata @6 :T.StringMap;
 }
 
 # ─── Multi-Volume Reading ─────────────────────────────────────
@@ -699,18 +658,45 @@ struct ReadSplitArchiveRequest {
     # Naming pattern (used to find parts).
     naming @1 :SplitNaming;
     # Password for encrypted archives.
-    password @2 :Data;
+    password @2 :T.DataHandle;
     # Pagination for large archives.
     pagination @3 :T.Pagination;
+    metadata @4 :T.StringMap;
 }
 
-# ─── Archive Streaming Hash Verification ───────────────────────
+# ─── Archive Streaming Hash Verification ─────────────────────
 
 struct StreamingHashRequest {
-    # Hash algorithm for verification.
-    algorithm @0 :HashAlgorithm;
+    # Hash algorithm as an open token ("sha256", "blake3", ...).
+    algorithm @0 :Text;
     # Entries to verify.
     entryPaths @1 :List(Text);
+    metadata @2 :T.StringMap;
+}
+
+struct HashVerificationResult {
+    union {
+        page @0 :HashVerificationPage;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct HashVerificationPage {
+    verified @0 :Bool;
+    entriesChecked @1 :UInt64;
+    entriesMatched @2 :UInt64;
+    # Bounded list of mismatches; `totalMismatches` says how many there
+    # were, so a fully-corrupted archive cannot be one enormous message.
+    mismatches @3 :List(HashMismatch);
+    totalMismatches @4 :UInt64;
+    metadata @5 :T.StringMap;
+}
+
+struct HashMismatch {
+    path @0 :Text;
+    expectedHash @1 :Data;
+    actualHash @2 :Data;
 }
 
 # ─── Archive Diff ─────────────────────────────────────────────
@@ -718,17 +704,31 @@ struct StreamingHashRequest {
 struct ArchiveDiffRequest {
     sourceA @0 :ArchiveSource;
     formatA @1 :ArchiveFormat;
-    passwordA @2 :Data;
+    passwordA @2 :T.DataHandle;
     sourceB @3 :ArchiveSource;
     formatB @4 :ArchiveFormat;
-    passwordB @5 :Data;
+    passwordB @5 :T.DataHandle;
+    metadata @6 :T.StringMap;
 }
 
 struct ArchiveDiffResult {
+    union {
+        page @0 :ArchiveDiffPage;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct ArchiveDiffPage {
     entriesAdded @0 :List(ArchiveEntry);
     entriesRemoved @1 :List(ArchiveEntry);
     entriesModified @2 :List(ModifiedEntry);
-    identicalEntries @3 :UInt32;
+    identicalEntries @3 :UInt64;
+    # Totals for each list, so a diff of two large archives is bounded.
+    totalAdded @4 :UInt64;
+    totalRemoved @5 :UInt64;
+    totalModified @6 :UInt64;
+    metadata @7 :T.StringMap;
 }
 
 struct ModifiedEntry {
@@ -737,17 +737,4 @@ struct ModifiedEntry {
     sizeB @2 :UInt64;
     hashA @3 :Data;
     hashB @4 :Data;
-}
-
-struct HashVerificationResult {
-    verified @0 :Bool;
-    entriesChecked @1 :UInt32;
-    entriesMatched @2 :UInt32;
-    mismatches @3 :List(HashMismatch);
-}
-
-struct HashMismatch {
-    path @0 :Text;
-    expectedHash @1 :Data;
-    actualHash @2 :Data;
 }

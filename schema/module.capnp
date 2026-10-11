@@ -18,11 +18,31 @@
 #   - Subscription cancel method added.
 #   - Pagination on list.
 #   - Custom variant on Kind and LoadState enums.
+#
+# Revamp removals (each names the rule it violated):
+#   - `LoadSpec.capabilities :List(Text)` -> capability REFERENCES.
+#     Permission strings as the authority mechanism (R3,
+#     DESIGN_PRINCIPLES.md:399); a Text cannot carry operations,
+#     constraints or expiry, so every host invented its own meaning and
+#     no two hosts agreed. It also disagreed with
+#     ModuleState.grantedCapabilities, which reported by id.
+#   - `ModuleLifecycleHook.command :List(Text)` / setLifecycleHook /
+#     removeLifecycleHook — DELETED. An arbitrary command line the host
+#     would execute with no capability anywhere in the file: the
+#     unauthenticated remote-code-execution path ai.capnp:324-327
+#     removed from its own ToolRegistry.
+#   - `LoadLimits.exclusiveDevices` default flipped true -> false: a
+#     capability granted silently on every load.
+#   - The marketplace, feature-flag and multi-tenancy blocks — DELETED.
+#     Product decisions, not module/host contract (R1).
+#   - `ModuleProfile.topFunctions` — DELETED. Presupposes a symbol
+#     table, which WASM/interpreted/JIT modules do not have
+#     (DESIGN_PRINCIPLES.md:228).
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
 using import "manifest.capnp".Manifest;
-using import "manifest.capnp".Semver;
 
 struct ModuleDesc {
     # Identifier of the module.
@@ -42,7 +62,10 @@ struct ModuleDesc {
     description @6 :Text;
     # Audit-8 additions:
     # Semantic version for the module.
-    version @7 :Semver;
+    # Semantic version for the module. `T.Version`, not a second version type:
+    # a 16-bit major wraps at 65535 and three files comparing versions with
+    # three structs is the one-home-per-type failure this tree removes.
+    version @7 :T.Version;
     # Runtime binding (which runtime version this module requires).
     runtimeBinding @8 :RuntimeBinding;
     # Module dependencies.
@@ -89,8 +112,9 @@ struct ModuleState {
     # Audit-8 additions:
     # Health status.
     health @6 :ModuleHealth;
-    # Actual granted capabilities.
-    grantedCapabilities @7 :List(T.CapabilityId);
+    # Actual granted capabilities, as references — the same type
+    # LoadSpec.capabilities prepares, so load and state agree.
+    grantedCapabilities @7 :List(Capability);
 }
 
 enum LoadState {
@@ -111,13 +135,29 @@ struct Counter {
     value @1 :UInt64;
 }
 
+# ── AUTHORITY IS A REFERENCE, NOT A NAME ─────────────────────────────────
+#
+# `capabilities @2 :List(Text)` was the authority a module was loaded
+# with, expressed as a list of names. DESIGN_PRINCIPLES.md:399 forbids
+# exactly this ("Do NOT define permission strings ... The capability
+# system IS the access control mechanism"): a `Text` cannot carry
+# operations, constraints, expiry or attenuation — all of which
+# capability.capnp:22-53 already models — so every host had to invent
+# what `"filesystem:read"` meant, and no two hosts agreed. It also
+# disagreed with `ModuleState.grantedCapabilities`, which reported
+# authority by T.CapabilityId, so the load path and the state path
+# described the same grant two different ways.
+#
+# Both are now capability references. Nothing is invented: the type
+# already exists and already carries the semantics.
 struct LoadSpec {
     # Loads from this location / blob.
     source @0 :Source;
     # Whether to verify signature.
     verifySignature @1 :Bool = true;
-    # Pre-allocated capability grant to give to the module.
-    capabilities @2 :List(Text);
+    # Pre-allocated capability grants to give to the module, as
+    # CAPABILITY REFERENCES.
+    capabilities @2 :List(Capability);
     # Limits applied at load time.
     limits @3 :LoadLimits;
     # Audit-8: sandbox configuration for untrusted modules.
@@ -133,6 +173,11 @@ struct Source {
         manifest @3 :T.ManifestName;
         # Audit-8: WebAssembly module source.
         wasm @4 :WasmModuleSource;
+        # Forward compatibility for a source form the contract has not
+        # named — a package index, an attestation-gated remote, a
+        # content-addressed store. Without this arm a new form reaches an
+        # old consumer as an unrecognisable member with no way to route it.
+        unknown @5 :T.UnknownEvent;
     }
 }
 
@@ -145,7 +190,11 @@ struct LoadLimits {
     maxThreads @3 :UInt32;
     # Maximum wall-clock time for the load operation.
     wallClock @4 :T.Duration;
-    exclusiveDevices @5 :Bool = true;
+    # Exclusive device access. Was a default-true Bool, i.e. a capability
+    # granted silently on every load — one module's default overriding
+    # every other module's access with no reference to attenuate. It is
+    # now an explicit, revocable grant in LoadSpec.capabilities.
+    exclusiveDevices @5 :Bool = false;
 }
 
 struct LoadResult {
@@ -182,38 +231,14 @@ interface ModuleService {
     # Audit-8: migrate a module to a different kind.
     migrateModule @11 (moduleId :T.ModuleId, targetKind :Kind) -> (migrated :T.ModuleId);
 
-    # Audit-9: search for modules in a marketplace/repository.
-    searchMarketplace @12 (query :ModuleMarketplaceQuery) -> (results :List(ModuleMarketplaceResult), total :UInt32);
-
-    # Audit-9: install a module from the marketplace.
-    installFromMarketplace @13 (moduleId :Text, version :T.Version) -> (result :LoadResult);
-
     # Audit-9: profile CPU/memory usage of a module.
-    profileModule @14 (moduleId :T.ModuleId, duration :T.Duration) -> (profile :ModuleProfile);
-
-    # Audit-9: set a lifecycle hook for a module.
-    setLifecycleHook @15 (moduleId :T.ModuleId, hook :ModuleLifecycleHook) -> (hookId :Text);
-
-    # Audit-9: remove a lifecycle hook.
-    removeLifecycleHook @16 (moduleId :T.ModuleId, hookId :Text) -> T.VoidResult;
+    profileModule @12 (moduleId :T.ModuleId, duration :T.Duration) -> (profile :ModuleProfile);
 
     # Audit-9: replay module events from a saved event log.
-    replayEvents @17 (moduleId :T.ModuleId, fromIndex :UInt64) -> T.VoidResult;
+    replayEvents @13 (moduleId :T.ModuleId, fromIndex :UInt64) -> (result :T.VoidResult);
 
     # Audit-9: get the event log for a module.
-    getEventLog @18 (moduleId :T.ModuleId, pagination :T.Pagination) -> (events :List(ModuleEventEntry), total :UInt32);
-
-    # Audit-9: set a feature flag for a module.
-    setFeatureFlag @19 (moduleId :T.ModuleId, flag :ModuleFeatureFlag) -> T.VoidResult;
-
-    # Audit-9: get feature flags for a module.
-    getFeatureFlags @20 (moduleId :T.ModuleId) -> (flags :List(ModuleFeatureFlag));
-
-    # Audit-9: set multi-tenancy configuration for a module.
-    setTenancyConfig @21 (moduleId :T.ModuleId, config :ModuleTenancyConfig) -> T.VoidResult;
-
-    # Audit-9: get multi-tenancy configuration for a module.
-    getTenancyConfig @22 (moduleId :T.ModuleId) -> (config :ModuleTenancyConfig);
+    getEventLog @14 (moduleId :T.ModuleId, pagination :T.Pagination) -> (events :List(ModuleEventEntry), total :UInt32);
 }
 
 interface ModuleSubscription {
@@ -221,13 +246,23 @@ interface ModuleSubscription {
     cancel @1 () -> T.VoidResult;
 }
 
+# A union with an `unknown` arm. The previous shape had no forward-compat
+# variant, so a backend adding "a module crashed its host and was
+# quarantined" or "a dependency failed to resolve" had to overload
+# `stateChanged` (ai.capnp:533-550 is the template).
 struct ModuleEvent {
     union {
         loaded @0 :ModuleState;
         unloaded @1 :T.ModuleId;
         stateChanged @2 :ModuleState;
         failed @3 :ModuleFailure;
+        unknown @4 :UnknownModuleEvent;
     }
+}
+
+struct UnknownModuleEvent {
+    typeId @0 :UInt64;
+    payload @1 :Data;
 }
 
 struct ModuleFailure {
@@ -254,8 +289,8 @@ struct ModuleSandboxConfig {
 # Audit-8: runtime binding for module version compatibility.
 struct RuntimeBinding {
     runtimeName @0 :Text;
-    minVersion @1 :Semver;
-    maxVersion @2 :Semver;
+    minVersion @1 :T.Version;
+    maxVersion @2 :T.Version;
 }
 
 # Audit-8: WebAssembly module source.
@@ -278,104 +313,6 @@ struct ModuleTestResult {
 # feature flags, and multi-tenancy.
 # ═══════════════════════════════════════════════════════════════════════
 
-# ── Module Marketplace ────────────────────────────────────────
-
-struct ModuleMarketplaceQuery {
-    # Search text (name, description, author).
-    search @0 :Text;
-    # Filter by module kind.
-    kind @1 :Kind;
-    # Filter by author.
-    author @2 :Text;
-    # Filter by tag/keyword.
-    tag @3 :Text;
-    # Sort order.
-    sortBy @4 :ModuleSortField;
-}
-
-enum ModuleSortField {
-    name @0;
-    version @1;
-    downloads @2;
-    rating @3;
-    updated @4;
-    custom @5;
-}
-
-struct ModuleMarketplaceResult {
-    # Module ID in the marketplace.
-    moduleId @0 :Text;
-    # Display name.
-    name @1 :Text;
-    # Description.
-    description @2 :Text;
-    # Author.
-    author @3 :Text;
-    # Latest version.
-    version @4 :T.Version;
-    # Module kind.
-    kind @5 :Kind;
-    # Download count.
-    downloads @6 :UInt64;
-    # Rating (0.0-5.0).
-    rating @7 :Float32;
-    # When last updated.
-    updatedAt @8 :T.Timestamp;
-}
-
-# ── Module Profiling ──────────────────────────────────────────
-
-struct ModuleProfile {
-    # Module being profiled.
-    moduleId @0 :T.ModuleId;
-    # Profiling duration.
-    duration @1 :T.Duration;
-    # CPU time consumed.
-    cpuTime @2 :T.Duration;
-    # Peak memory usage in bytes.
-    peakMemoryBytes @3 :UInt64;
-    # Average memory usage in bytes.
-    avgMemoryBytes @4 :UInt64;
-    # Number of function calls.
-    callCount @5 :UInt64;
-    # Top functions by time.
-    topFunctions @6 :List(ModuleFunctionProfile);
-}
-
-struct ModuleFunctionProfile {
-    # Function name.
-    name @0 :Text;
-    # Time spent in this function.
-    time @1 :T.Duration;
-    # Number of calls.
-    calls @2 :UInt64;
-    # Memory allocated by this function.
-    memoryBytes @3 :UInt64;
-}
-
-# ── Module Lifecycle Hooks ────────────────────────────────────
-
-struct ModuleLifecycleHook {
-    # Hook name.
-    name @0 :Text;
-    # When the hook fires.
-    phase @1 :ModuleHookPhase;
-    # Command or script to execute.
-    command @2 :List(Text);
-    # Timeout for the hook.
-    timeout @3 :T.Duration;
-}
-
-enum ModuleHookPhase {
-    preLoad @0;
-    postLoad @1;
-    preUnload @2;
-    postUnload @3;
-    preReload @4;
-    postReload @5;
-    custom @6;
-}
-
 # ── Module Event Sourcing ─────────────────────────────────────
 
 struct ModuleEventEntry {
@@ -383,36 +320,56 @@ struct ModuleEventEntry {
     index @0 :UInt64;
     # Event type.
     type @1 :Text;
-    # Event payload (serialized).
+    # Event payload (serialized). Opaque, so event-log replay does not
+    # force a schema per event type.
     payload @2 :Data;
     # Timestamp of the event.
     timestamp @3 :T.Timestamp;
 }
 
-# ── Module Feature Flags ──────────────────────────────────────
-
-struct ModuleFeatureFlag {
-    # Flag name.
-    name @0 :Text;
-    # Whether the flag is enabled.
-    enabled @1 :Bool;
-    # Percentage of users to enable for (0-100, 100 = all).
-    percentage @2 :UInt32;
-    # Human-readable description.
-    description @3 :Text;
+# ── Module Profile ────────────────────────────────────────────
+#
+# `topFunctions :List(ModuleFunctionProfile)` was DELETED. Per-function
+# profiling presupposes a compiled language with a symbol table, which
+# DESIGN_PRINCIPLES.md:228 already rejects for exactly this reason
+# ("WASM, interpreted, and JIT languages don't have this"): a
+# transpiled, JIT-compiled or interpreted module has no stable function
+# names, so the field was unanswerable — and it was also the one list in
+# the file that grows without bound with module complexity.
+struct ModuleProfile {
+    # Identifier of the module profiled.
+    moduleId @0 :T.ModuleId;
+    # Duration the profile covers.
+    duration @1 :T.Duration;
+    # Memory used over the profile window, in bytes.
+    memoryBytes @2 :UInt64;
+    # CPU time consumed.
+    cpuTime @3 :T.Duration;
+    # Number of events processed.
+    eventCount @4 :UInt64;
 }
 
-# ── Module Multi-Tenancy ──────────────────────────────────────
-
-struct ModuleTenancyConfig {
-    # Whether multi-tenancy is enabled.
-    enabled @0 :Bool;
-    # Maximum number of tenants.
-    maxTenants @1 :UInt32;
-    # Whether tenants have isolated state.
-    isolatedState @2 :Bool;
-    # Whether tenants have isolated memory.
-    isolatedMemory @3 :Bool;
-    # Resource limits per tenant.
-    perTenantLimits @4 :LoadLimits;
-}
+# ── Module Marketplace / Feature Flags / Multi-Tenancy — DELETED ─────────
+#
+# Three blocks removed from this file, all the same class of defect:
+# they are PRODUCT decisions, not the contract between a module and its
+# host. The Agnostic/Timeless Test's litmus #2 (DESIGN_PRINCIPLES.md:110)
+# is "does a consumer need this to interoperate with a provider?" — and
+# no consumer needs a download count, a star rating, an A/B rollout
+# percentage or a tenant cap in order to load a module.
+#
+#   * `ModuleMarketplaceQuery/Result` with download counts and ratings,
+#     plus `searchMarketplace` / `installFromMarketplace`: repository
+#     search is package.capnp's job, and `installFromMarketplace` also
+#     bypassed the signature verification that `LoadSpec.verifySignature`
+#     exists to provide on the load path.
+#   * `ModuleFeatureFlag` with a percentage-of-users rollout: an
+#     internal product mechanism (the class DESIGN_PRINCIPLES.md:64
+#     rejects — "Add CFS scheduler tuning knobs | KEEPS OUT"). A 2046
+#     module with no user population has no percentage.
+#   * `ModuleTenancyConfig` with maxTenants/isolatedState/isolatedMemory:
+#     a hosting-product concern with no interoperability content.
+#
+# A 2046 loader that is not marketplace-shaped (a firmware image, a
+# signed in-tree module, a peer fetch) had no representation before; it
+# has one now.

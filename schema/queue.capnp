@@ -1,166 +1,195 @@
 @0xa1b2c3d4e5f60030;
 
+# ═══════════════════════════════════════════════════════════════════════
+# Queue — message queue lifecycle, enqueue/dequeue, subscriptions.
+#
+# The core is one of the best citizens in the protocol: `T.DataHandle`
+# payloads (correct zero-cost choice), `T.Pagination` on the bounded
+# queries, typed ids throughout, ack/nack with a structured handle,
+# dead-letter routing, declared flow control. This revamp keeps that and
+# deletes the distributed message broker welded onto it.
+#
+# ── THE IMPOSSIBLE PROMISE, REMOVED ────────────────────────────────────
+#
+# `DeliveryMode.exactlyOnce` could not be kept. Exactly-once delivery
+# over a lossy channel is the two-generals problem: it can only be
+# approximated, and the approximation is a design decision. Two backends
+# therefore answered the same value with different duplicate/loss
+# profiles, and a consumer could not write a portable handler.
+#
+# What remains: `atMostOnce`, `atLeastOnce`, and `custom`, plus the two
+# honest mechanisms that make at-least-once usable — `DeduplicationKey`
+# (producer-chosen idempotence key, checked by `deduplicate`) and the
+# ack/nack window. A consumer that needs exactly-once effects makes its
+# handler idempotent, which is where that property has always lived.
+#
+# ── THE BROKER INFRASTRUCTURE, DELETED ─────────────────────────────────
+#
+# Federation, replication with leader election, failover policy and
+# status, cross-queue transactions, a schema registry with automatic
+# migration, a routing-rule engine (with `xpath`/`jsonPath`/`regex`
+# match syntaxes), message traceability and trace-context injection.
+#
+# A single-device OS — this protocol's core audience — must stub twelve
+# methods naming a cluster it does not have. Election timeouts, replica
+# lag and failover states are one algorithm's steps; a different 2046
+# algorithm could not express its own. Deleted with them: the
+# `QueueTransaction`/`QueueOperation`/`TransactionStatus`,
+# `RoutingRule`/`RoutingMatch`/`HeaderMatch`/`ContentMatch`/`TopicMatch`/
+# `StringOperator`, `MessageSchema`/`SchemaCompatibility`/
+# `SchemaMigrationStrategy`/`SchemaMigrationMode`, `QueueFederation`/
+# `FederationDirection`, `QueueReplica`/`ReplicaRole`, `FailoverPolicy`/
+# `FailoverAction`/`FailoverStatus`/`FailoverState`, `MessageTrace`/
+# `CorrelationBaggageEntry`, `QueuePartition` and `QueueNamespace`
+# families.
+#
+# `QueueNamespace.accessPolicy :Text` went for a second reason: an access
+# policy as free text is the authority-by-string pattern capability.capnp
+# replaces.
+#
+# ── THE OTHER FIXES ────────────────────────────────────────────────────
+#
+#   * `ReplayOffset` had three competing position identifiers and no
+#     precedence. It now has ONE authoritative position (`sequence`) plus
+#     optional hints the backend may ignore.
+#   * No maximum message size was declared anywhere, so a producer
+#     learned its limit by failing. `QueueInfo.maxMessageBytes` is it.
+#   * `dequeue`'s zero-timeout semantics were undocumented. Stated below.
+#   * `enqueueAll` was an unbounded bulk enqueue. It is now bounded by the
+#     queue's `FlowControl.maxInflight`.
+#   * `commitTransaction` took a raw UInt64 for an id the interface had
+#     just returned as a reference — the two-authority-paths defect. With
+#     transactions gone, the pattern is gone with them; every remaining
+#     method takes the reference or the typed id, never both.
+#   * `QueueMessage.mimeType :Text` → `T.MimeType`;
+#     `QueueEncryption.keyId :Text` → `T.KeyId`.
+#   * `QueueStats` renamed `QueueStatistics` (the name collided with
+#     notification.capnp's unrelated `QueueStats`).
+# ═══════════════════════════════════════════════════════════════════════
+
 using T = import "types.capnp";
 
-# ═══════════════════════════════════════════════════════════════════════
-# Queue - message queue lifecycle, enqueue/dequeue, subscriptions.
-#
-# Improvements beyond the original schema:
-#   - QueueId typed ID replaces bare Text for queue names.
-#   - QueueMessageId typed ID replaces bare Text for message IDs.
-#   - T.Duration for dequeue timeout (was raw UInt64 milliseconds).
-#   - DataHandle for message data that may exceed 1KB.
-#   - Subscription cancel method added.
-#   - Pagination on listQueues, peek, and QueueSubscription.pull (audit-3).
-#
-# Audit-8 enhancements:
-#   - DeliveryMode: atMostOnce, atLeastOnce, exactlyOnce semantics.
-#   - AckHandle: structured acknowledgment for reliable delivery.
-#   - DeadLetterPolicy: dead letter routing for failed messages.
-#   - MessageTTL: time-to-live for automatic message expiry.
-#   - QueueEncryption: encryption declaration for queue contents.
-#   - ReplayOffset: replay messages from a specific position.
-#   - QueueOrdering: explicit ordering guarantees.
-#   - FlowControl: backpressure and rate limiting.
-#   - QueueNamespace: multi-tenant queue isolation.
-#   - MessageStatus: typed message lifecycle states.
-# ═══════════════════════════════════════════════════════════════════════
-
 interface Queue {
+    # Enqueue one message.
     enqueue @0 (queueId :T.QueueId, message :QueueMessage) -> (id :T.QueueMessageId);
+
+    # Dequeue one message.
+    #
+    # ZERO-TIMEOUT SEMANTICS (declared, so no consumer has to guess):
+    # timeout zero returns immediately. If a message is available it is
+    # returned; if not, the call succeeds with an empty message (id zero)
+    # rather than blocking. Any non-zero timeout blocks until a message
+    # arrives or the timeout elapses; on elapse the same empty message is
+    # returned.
     dequeue @1 (queueId :T.QueueId, timeout :T.Duration) -> (message :QueueMessage);
+
+    # Bounded peek: examine without dequeuing.
     peek @2 (queueId :T.QueueId, pagination :T.Pagination) -> (messages :List(QueueMessage), total :UInt32);
 
     getQueue @3 (queueId :T.QueueId) -> (info :QueueInfo);
+    # Remove all pending messages but keep the queue and its statistics.
     clearQueue @4 (queueId :T.QueueId) -> T.VoidResult;
-
+    # Remove the queue itself.
     deleteQueue @5 (queueId :T.QueueId) -> T.VoidResult;
     listQueues @6 (pagination :T.Pagination) -> (queues :List(QueueInfo), total :UInt32);
 
+    # Live stream. Holding the subscription IS the authority to pull.
     subscribeQueue @7 (queueId :T.QueueId) -> (subscription :QueueSubscription);
+    subscribeWithFilter @8 (queueId :T.QueueId, filter :MessageFilter) -> (subscription :QueueSubscription);
 
-    getStats @8 (queueId :T.QueueId) -> (stats :QueueStats);
+    getStatistics @9 (queueId :T.QueueId) -> (stats :QueueStatistics);
 
-    # Batch enqueue: submit multiple messages atomically.
-    # If any message fails, the entire batch is rejected (atomic semantics).
-    enqueueAll @9 (queueId :T.QueueId, messages :List(QueueMessage))
-               -> (ids :List(T.QueueMessageId));
+    # Batch enqueue: at most `FlowControl.maxInflight` messages. A caller
+    # that submits more has the excess rejected with limitExceeded rather
+    # than silently truncated.
+    enqueueAll @10 (queueId :T.QueueId, messages :List(QueueMessage)) -> (ids :List(T.QueueMessageId));
 
-    # -- Audit-8: Acknowledgment-based delivery --
-    # Dequeue with acknowledgment handle. Consumer must ack/nack within timeout.
-    dequeueAck @10 (queueId :T.QueueId, timeout :T.Duration)
-               -> (message :QueueMessage, ackHandle :AckHandle);
+    # -- Acknowledgment-based delivery --
+    # Dequeue with an acknowledgment handle. The consumer MUST call ack
+    # or nack within the handle's window, or the message is redelivered.
+    dequeueAck @11 (queueId :T.QueueId, timeout :T.Duration) -> (message :QueueMessage, ackHandle :AckHandle);
 
     # Acknowledge successful processing — message is removed from queue.
-    ack @11 (handle :AckHandle) -> T.VoidResult;
-
+    ack @12 (handle :AckHandle) -> T.VoidResult;
     # Negative acknowledge — message is requeued for redelivery.
-    nack @12 (handle :AckHandle) -> T.VoidResult;
+    nack @13 (handle :AckHandle) -> T.VoidResult;
 
-    # -- Audit-8: Replay --
-    # Replay messages from a specific offset (timestamp or message ID).
-    replay @13 (queueId :T.QueueId, offset :ReplayOffset, pagination :T.Pagination)
-           -> (messages :List(QueueMessage), total :UInt32);
+    # -- Replay --
+    # Replay from a position. `offset.sequence` is the authoritative
+    # position; the hints are advisory.
+    replay @14 (queueId :T.QueueId, offset :ReplayOffset, pagination :T.Pagination)
+             -> (messages :List(QueueMessage), total :UInt32);
 
-    # -- Audit-8: Queue configuration --
-    setDeliveryMode @14 (queueId :T.QueueId, mode :DeliveryMode) -> T.VoidResult;
-    setDeadLetterPolicy @15 (queueId :T.QueueId, policy :DeadLetterPolicy) -> T.VoidResult;
-    setOrdering @16 (queueId :T.QueueId, ordering :QueueOrdering) -> T.VoidResult;
-    setEncryption @17 (queueId :T.QueueId, encryption :QueueEncryption) -> T.VoidResult;
-    setMessageTtl @18 (queueId :T.QueueId, ttl :MessageTTL) -> T.VoidResult;
-    setFlowControl @19 (queueId :T.QueueId, control :FlowControl) -> T.VoidResult;
+    # -- Queue configuration --
+    setDeliveryMode @15 (queueId :T.QueueId, mode :DeliveryMode) -> T.VoidResult;
+    setDeadLetterPolicy @16 (queueId :T.QueueId, policy :DeadLetterPolicy) -> T.VoidResult;
+    setOrdering @17 (queueId :T.QueueId, ordering :QueueOrdering) -> T.VoidResult;
+    setEncryption @18 (queueId :T.QueueId, encryption :QueueEncryption) -> T.VoidResult;
+    setMessageTtl @19 (queueId :T.QueueId, ttl :MessageTTL) -> T.VoidResult;
+    setFlowControl @20 (queueId :T.QueueId, control :FlowControl) -> T.VoidResult;
 
-    # -- Audit-8: Dead letter queue --
-    # List messages in the dead letter queue for a given queue.
-    listDeadLetters @20 (queueId :T.QueueId, pagination :T.Pagination)
-                    -> (messages :List(QueueMessage), total :UInt32);
-
+    # -- Dead letter queue --
+    # Messages in the dead letter queue for a given queue.
+    listDeadLetters @21 (queueId :T.QueueId, pagination :T.Pagination)
+                   -> (messages :List(QueueMessage), total :UInt32);
     # Retry a dead-lettered message — requeue it to the original queue.
-    retryDeadLetter @21 (queueId :T.QueueId, messageId :T.QueueMessageId) -> T.VoidResult;
+    retryDeadLetter @22 (queueId :T.QueueId, messageId :T.QueueMessageId) -> T.VoidResult;
 
-    # Audit-9: consumer group management.
-    createConsumerGroup @22 (queueId :T.QueueId, name :Text, strategy :ConsumerStrategy) -> (group :ConsumerGroup);
-    deleteConsumerGroup @23 (groupId :UInt64) -> T.VoidResult;
-    getConsumerGroup @24 (groupId :UInt64) -> (group :ConsumerGroup);
-    listConsumerGroups @25 (queueId :T.QueueId, pagination :T.Pagination) -> (groups :List(ConsumerGroup), total :UInt32);
-    addConsumerToGroup @26 (groupId :UInt64, consumerId :T.ProcessId) -> T.VoidResult;
-    removeConsumerFromGroup @27 (groupId :UInt64, consumerId :T.ProcessId) -> T.VoidResult;
-    dequeueFromGroup @28 (groupId :UInt64, timeout :T.Duration) -> (message :QueueMessage, ackHandle :AckHandle);
+    # -- Consumer groups --
+    # Multiple consumers share a queue; each message is delivered to
+    # exactly one member (the work-queue pattern).
+    createConsumerGroup @23 (queueId :T.QueueId, name :Text, strategy :ConsumerStrategy) -> (group :ConsumerGroup);
+    deleteConsumerGroup @24 (groupId :T.GroupId) -> T.VoidResult;
+    getConsumerGroup @25 (groupId :T.GroupId) -> (group :ConsumerGroup);
+    listConsumerGroups @26 (queueId :T.QueueId, pagination :T.Pagination) -> (groups :List(ConsumerGroup), total :UInt32);
+    addConsumerToGroup @27 (groupId :T.GroupId, consumerId :T.ProcessId) -> T.VoidResult;
+    removeConsumerFromGroup @28 (groupId :T.GroupId, consumerId :T.ProcessId) -> T.VoidResult;
+    dequeueFromGroup @29 (groupId :T.GroupId, timeout :T.Duration) -> (message :QueueMessage, ackHandle :AckHandle);
 
-    # Audit-9: message deduplication.
-    deduplicate @29 (queueId :T.QueueId, key :DeduplicationKey) -> (isDuplicate :Bool);
-
-    # Audit-9: queue partitioning.
-    createPartition @30 (queueId :T.QueueId, partitionId :UInt32) -> (partition :QueuePartition);
-    getPartition @31 (queueId :T.QueueId, partitionId :UInt32) -> (partition :QueuePartition);
-    listPartitions @32 (queueId :T.QueueId, pagination :T.Pagination) -> (partitions :List(QueuePartition), total :UInt32);
-    deletePartition @33 (queueId :T.QueueId, partitionId :UInt32) -> T.VoidResult;
-
-    # Audit-9: queue federation.
-    createFederation @34 (localQueueId :T.QueueId, remoteEndpoint :Text, direction :FederationDirection) -> (federation :QueueFederation);
-    deleteFederation @35 (federationId :UInt64) -> T.VoidResult;
-    listFederations @36 (pagination :T.Pagination) -> (federations :List(QueueFederation), total :UInt64);
-
-    # Audit-9: queue mirroring/replication.
-    createReplica @37 (queueId :T.QueueId, nodeId :Text) -> (replica :QueueReplica);
-    removeReplica @38 (replicaId :UInt64) -> T.VoidResult;
-    listReplicas @39 (queueId :T.QueueId, pagination :T.Pagination) -> (replicas :List(QueueReplica), total :UInt64);
-    promoteReplica @40 (replicaId :UInt64) -> T.VoidResult;
-
-    # Audit-9: message schema evolution.
-    registerSchema @41 (schema :MessageSchema) -> (schemaId :Text);
-    getSchema @42 (schemaId :Text) -> (schema :MessageSchema);
-    listSchemas @43 (pagination :T.Pagination) -> (schemas :List(MessageSchema), total :UInt64);
-
-    # Audit-9: message filtering.
-    subscribeWithFilter @44 (queueId :T.QueueId, filter :MessageFilter) -> (subscription :QueueSubscription);
-
-    # Audit-9: transaction support.
-    beginTransaction @45 () -> (transaction :QueueTransaction);
-    commitTransaction @46 (transactionId :UInt64) -> T.VoidResult;
-    abortTransaction @47 (transactionId :UInt64) -> T.VoidResult;
-
-    # Audit-9: message routing.
-    createRoutingRule @48 (rule :RoutingRule) -> (ruleId :UInt64);
-    deleteRoutingRule @49 (ruleId :UInt64) -> T.VoidResult;
-    listRoutingRules @50 (pagination :T.Pagination) -> (rules :List(RoutingRule), total :UInt64);
-
-    # Audit-9: message traceability.
-    traceMessage @51 (messageId :T.QueueMessageId) -> (trace :MessageTrace);
-    injectTraceContext @52 (message :QueueMessage, trace :MessageTrace) -> (tracedMessage :QueueMessage);
-
-    # Audit-10: HA failover configuration for replicas.
-    setFailoverPolicy @53 (queueId :T.QueueId, policy :FailoverPolicy) -> T.VoidResult;
-    getFailoverPolicy @54 (queueId :T.QueueId) -> (policy :FailoverPolicy);
-    triggerFailover @55 (queueId :T.QueueId) -> T.VoidResult;
-    getFailoverStatus @56 (queueId :T.QueueId) -> (status :FailoverStatus);
-
-    # Audit-10: automatic schema migration for consumers/producers.
-    setSchemaMigration @57 (queueId :T.QueueId, strategy :SchemaMigrationStrategy) -> T.VoidResult;
-    getSchemaMigration @58 (queueId :T.QueueId) -> (strategy :SchemaMigrationStrategy);
-    migrateMessages @59 (queueId :T.QueueId, fromVersion :UInt32, toVersion :UInt32) -> (migratedCount :UInt64);
+    # -- Idempotence --
+    # The honest half of exactly-once: ask whether a producer-chosen key
+    # has been seen. The backend keeps the window for
+    # `DeduplicationKey.window`.
+    deduplicate @30 (queueId :T.QueueId, key :DeduplicationKey) -> (isDuplicate :Bool);
 }
 
 interface QueueSubscription {
-    pull @0 (pagination :T.Pagination) -> (messages :List(QueueMessage), total :UInt32);
+    # Bounded pull: the caller states how many messages it will take.
+    pull @0 (maxMessages :UInt32) -> (messages :List(QueueMessage), total :UInt32);
     cancel @1 () -> T.VoidResult;
 }
 
 struct QueueMessage {
     id @0 :T.QueueMessageId;
-    # Message payload — use buffer handle for payloads >1KB.
+    # Message payload — use the buffer reference for payloads >1KB.
     data @1 :T.DataHandle;
-    mimeType @2 :Text;
+    # Content type, so a consumer can decode without guessing.
+    mimeType @2 :T.MimeType;
     # Priority 0 (lowest) to 255 (highest). Default is 128.
     priority @3 :UInt8;
     createdAt @4 :T.Timestamp;
     headers @5 :T.StringMap;
-    # Audit-8: current lifecycle status of this message.
+    # Current lifecycle status of this message.
     status @6 :MessageStatus;
-    # Audit-8: delivery semantics for this message.
+    # Delivery semantics for this message.
     deliveryMode @7 :DeliveryMode;
-    # Audit-8: per-message TTL override (null = use queue default).
+    # Per-message TTL override (zero = use queue default).
     ttl @8 :T.Duration;
+    # Monotonic position in the queue, for replay and gap detection.
+    sequence @9 :UInt64;
+    # Producer-chosen idempotence key (zero = none).
+    dedupeKey @10 :UInt64;
+}
+
+struct MessageFilter {
+    # Only deliver messages in these statuses (empty = all).
+    statuses @0 :List(MessageStatus);
+    # Only deliver messages at or above this priority.
+    minPriority @1 :UInt8;
+    # Only deliver messages created after this time.
+    since @2 :T.Timestamp;
+    # Only deliver messages at or above this sequence.
+    afterSequence @3 :UInt64;
 }
 
 struct QueueInfo {
@@ -171,23 +200,30 @@ struct QueueInfo {
     totalDequeued @4 :UInt64;
     oldestMessage @5 :T.Timestamp;
     created @6 :T.Timestamp;
-    # Audit-8: delivery semantics configured for this queue.
+    # Delivery semantics configured for this queue.
     deliveryMode @7 :DeliveryMode;
-    # Audit-8: dead letter routing policy.
+    # Dead letter routing policy.
     deadLetterPolicy @8 :DeadLetterPolicy;
-    # Audit-8: message ordering guarantee.
+    # Message ordering guarantee.
     ordering @9 :QueueOrdering;
-    # Audit-8: encryption status.
+    # Encryption status.
     encryption @10 :QueueEncryption;
-    # Audit-8: namespace for multi-tenant isolation.
-    namespace @11 :QueueNamespace;
-    # Audit-8: default message TTL.
-    messageTtl @12 :MessageTTL;
-    # Audit-8: flow control configuration.
-    flowControl @13 :FlowControl;
+    # Default message TTL.
+    messageTtl @11 :MessageTTL;
+    # Flow control configuration — also bounds enqueueAll.
+    flowControl @12 :FlowControl;
+    # The largest message this queue accepts, in bytes. A producer can
+    # pre-check instead of discovering the limit by failing. Zero means
+    # the backend declares none.
+    maxMessageBytes @13 :UInt64;
+    # Highest sequence ever assigned, for replay positioning.
+    latestSequence @14 :UInt64;
 }
 
-struct QueueStats {
+# Named `QueueStatistics` because notification.capnp has an unrelated
+# `QueueStats` with disjoint fields: the same name for two different
+# measurements is a codegen collision.
+struct QueueStatistics {
     id @0 :T.QueueId;
     name @1 :Text;
     messages @2 :UInt64;
@@ -198,28 +234,35 @@ struct QueueStats {
     enqueuedTotal @5 :UInt64;
     dequeuedTotal @6 :UInt64;
     failedTotal @7 :UInt64;
+    # Messages the queue dropped because it was full, since creation. A
+    # consumer that reads a sequence gap can tell which side dropped.
+    droppedTotal @8 :UInt64;
+    metadata @9 :T.StringMap;
 }
 
-# ── Audit-8: Delivery Semantics ───────────────────────────────────────
-# Typed delivery guarantee replacing implicit destructive dequeue.
+# ── Delivery semantics ──────────────────────────────────────────────────
+
 enum DeliveryMode {
-    atMostOnce @0;
-    atLeastOnce @1;
-    exactlyOnce @2;
+    unknown @0;
+    atMostOnce @1;
+    atLeastOnce @2;
     custom @3;
 }
 
-# ── Audit-8: Acknowledgment Handle ────────────────────────────────────
-# Structured ack handle for at-least-once delivery. Consumer must call
-# ack() or nack() within the timeout window, or the message is redelivered.
+# ── Acknowledgment handle ───────────────────────────────────────────────
+# Structured ack handle for at-least-once delivery. The consumer must
+# call ack() or nack() within the window, or the message is redelivered.
 struct AckHandle {
     messageId @0 :T.QueueMessageId;
     queueId @1 :T.QueueId;
-    expiresAt @2 :T.Timestamp;
+    # Position of the message in the queue.
+    sequence @2 :UInt64;
+    # When this handle expires. After that, ack/nack MAY answer notFound.
+    expiresAt @3 :T.Timestamp;
 }
 
-# ── Audit-8: Dead Letter Policy ───────────────────────────────────────
-# Configures dead letter routing for messages that fail processing.
+# ── Reliability configuration ───────────────────────────────────────────
+
 struct DeadLetterPolicy {
     enabled @0 :Bool;
     maxRetries @1 :UInt32;
@@ -228,314 +271,104 @@ struct DeadLetterPolicy {
     maxAge @4 :T.Duration;
 }
 
-# ── Audit-8: Message TTL ──────────────────────────────────────────────
-# Message time-to-live configuration. Messages expire after their TTL
-# and are removed from the queue automatically.
 struct MessageTTL {
     defaultTtl @0 :T.Duration;
     perMessageTtl @1 :T.Duration;
 }
 
-# ── Audit-8: Queue Encryption ─────────────────────────────────────────
-# Encryption declaration for queue contents. Backend handles actual
-# encryption; this struct declares configuration for key management.
 struct QueueEncryption {
     enabled @0 :Bool;
-    keyId @1 :Text;
+    # Typed key reference (canonical), not free text.
+    keyId @1 :T.KeyId;
+    # Open algorithm token — a 2046 cipher needs no ordinal.
     algorithm @2 :Text;
 }
 
-# ── Audit-8: Replay Offset ────────────────────────────────────────────
-# Identifies a position in the queue for replay operations.
 struct ReplayOffset {
-    messageId @0 :T.QueueMessageId;
-    timestamp @1 :T.Timestamp;
-    offset @2 :UInt64;
+    # The ONE authoritative position: the monotonic sequence of the first
+    # message to replay. A backend that cannot honour it answers with an
+    # error rather than guessing which of several identifiers the caller
+    # meant (the pre-revamp struct carried three and no precedence).
+    sequence @0 :UInt64;
+    # Optional hint: the message id the caller believes is at that
+    # position. Ignored when `sequence` is set.
+    messageIdHint @1 :T.QueueMessageId;
+    # Optional hint: a timestamp the caller believes is at that position.
+    timestampHint @2 :T.Timestamp;
 }
 
-# ── Audit-8: Queue Ordering ───────────────────────────────────────────
-# Explicit ordering guarantee for message delivery.
 enum QueueOrdering {
-    fifo @0;
-    lifo @1;
-    priority @2;
-    timestamp @3;
-    custom @4;
+    unknown @0;
+    fifo @1;
+    lifo @2;
+    priority @3;
+    timestamp @4;
+    custom @5;
 }
 
-# ── Audit-8: Flow Control ─────────────────────────────────────────────
-# Backpressure and rate limiting for producers and consumers.
 struct FlowControl {
     maxInflight @0 :UInt32;
     rateLimitPerProducer @1 :UInt32;
     backpressureThreshold @2 :UInt32;
+    # What the queue does when full: drop the newest, drop the oldest, or
+    # refuse. Declared, so a producer can reason instead of discovering.
+    whenFull @3 :OverflowPolicy;
 }
 
-# ── Audit-8: Queue Namespace ──────────────────────────────────────────
-# Multi-tenant queue isolation. Different teams, apps, or environments
-# share a queue infrastructure with namespace-level isolation.
-struct QueueNamespace {
-    namespaceId @0 :Text;
-    description @1 :Text;
-    accessPolicy @2 :Text;
+enum OverflowPolicy {
+    refuseNewest @0;
+    dropOldest @1;
+    blockProducer @2;
+    custom @3;
 }
 
-# ── Audit-8: Message Status ───────────────────────────────────────────
-# Typed message lifecycle beyond simple dequeue.
+# ── Message lifecycle ───────────────────────────────────────────────────
+
 enum MessageStatus {
-    pending @0;
-    processing @1;
-    completed @2;
-    failed @3;
-    deadLettered @4;
-    custom @5;
+    unknown @0;
+    pending @1;
+    processing @2;
+    completed @3;
+    failed @4;
+    deadLettered @5;
+    custom @6;
 }
 
-# ── Audit-9: Consumer Groups ───────────────────────────────────────────
-# Multiple consumers share a queue, each message delivered to exactly
-# one consumer (work queue pattern like RabbitMQ, Kafka consumer groups).
+# ── Consumer groups ─────────────────────────────────────────────────────
+
 struct ConsumerGroup {
-    groupId @0 :UInt64;
+    groupId @0 :T.GroupId;
     queueId @1 :T.QueueId;
     name @2 :Text;
-    consumers @3 :List(T.ProcessId);
-    strategy @4 :ConsumerStrategy;
-    maxPoll @5 :UInt32;
+    strategy @3 :ConsumerStrategy;
+    members @4 :List(T.ProcessId);
+    # Position the group last consumed to, for resumption.
+    committedSequence @5 :UInt64;
 }
 
 enum ConsumerStrategy {
-    roundRobin @0;
-    sticky @1;
-    fair @2;
-    custom @3;
+    unknown @0;
+    roundRobin @1;
+    leastBusy @2;
+    priority @3;
+    custom @4;
 }
 
-# ── Audit-9: Message Deduplication ─────────────────────────────────────
-# Idempotent processing via deduplication keys stored for a TTL.
+# ── Idempotence ─────────────────────────────────────────────────────────
+
 struct DeduplicationKey {
-    key @0 :Text;
-    ttl @1 :T.Duration;
+    # Producer-chosen key. Two producers using the same key are treated as
+    # one logical producer, so a key must be unique per logical sender.
+    key @0 :UInt64;
+    # How long the backend remembers this key (zero = queue lifetime).
+    window @1 :T.Duration;
+    # What to do when the key is seen again.
+    onDuplicate @2 :DuplicateAction;
 }
 
-# ── Audit-9: Queue Partitioning ─────────────────────────────────────────
-struct QueuePartition {
-    partitionId @0 :UInt32;
-    queueId @1 :T.QueueId;
-    messageCount @2 :UInt64;
-    totalEnqueued @3 :UInt64;
-}
-
-# ── Audit-9: Queue Federation ───────────────────────────────────────────
-struct QueueFederation {
-    federationId @0 :UInt64;
-    localQueueId @1 :T.QueueId;
-    remoteEndpoint @2 :Text;
-    direction @3 :FederationDirection;
-}
-
-enum FederationDirection {
-    localToRemote @0;
-    remoteToLocal @1;
-    bidirectional @2;
+enum DuplicateAction {
+    unknown @0;
+    reject @1;
+    returnExisting @2;
     custom @3;
-}
-
-# ── Audit-9: Queue Mirroring/Replication ────────────────────────────────
-# High-availability message replication across nodes.
-struct QueueReplica {
-    replicaId @0 :UInt64;
-    queueId @1 :T.QueueId;
-    nodeId @2 :Text;
-    role @3 :ReplicaRole;
-    lag @4 :T.Duration;
-}
-
-enum ReplicaRole {
-    primary @0;
-    sync @1;
-    async @2;
-    witness @3;
-    custom @4;
-}
-
-# ── Audit-9: Message Schema Evolution ───────────────────────────────────
-# Schema registry integration for producer/consumer evolution.
-struct MessageSchema {
-    schemaId @0 :Text;
-    version @1 :UInt32;
-    definition @2 :Data;
-    compatibility @3 :SchemaCompatibility;
-}
-
-enum SchemaCompatibility {
-    backward @0;
-    forward @1;
-    full @2;
-    none @3;
-    custom @4;
-}
-
-# ── Audit-9: Message Filtering ────────────────────────────────────────────
-# Consumers filter messages by header, content, or pattern.
-struct MessageFilter {
-    expression @0 :Text;
-    filterType @1 :MessageFilterType;
-}
-
-enum MessageFilterType {
-    header @0;
-    content @1;
-    xpath @2;
-    jsonPath @3;
-    regex @4;
-    custom @5;
-}
-
-# ── Audit-9: Transaction Support ─────────────────────────────────────────
-# Atomic multi-queue operations.
-struct QueueTransaction {
-    transactionId @0 :UInt64;
-    operations @1 :List(QueueOperation);
-    status @2 :TransactionStatus;
-}
-
-struct QueueOperation {
-    opType @0 :QueueOperationType;
-    queueId @1 :T.QueueId;
-    message @2 :QueueMessage;
-}
-
-enum QueueOperationType {
-    enqueue @0;
-    dequeue @1;
-    ack @2;
-    nack @3;
-    custom @4;
-}
-
-enum TransactionStatus {
-    open @0;
-    committed @1;
-    aborted @2;
-    custom @3;
-}
-
-# ── Audit-9: Message Routing ─────────────────────────────────────────────
-# Content-based, header-based, and topic-based routing.
-struct RoutingRule {
-    ruleId @0 :UInt64;
-    name @1 :Text;
-    match @2 :RoutingMatch;
-    destination @3 :T.QueueId;
-    priority @4 :UInt8;
-}
-
-struct RoutingMatch {
-    union {
-        header @0 :HeaderMatch;
-        content @1 :ContentMatch;
-        topic @2 :TopicMatch;
-        custom @3 :Data;
-    }
-}
-
-struct HeaderMatch {
-    key @0 :Text;
-    operator @1 :StringOperator;
-    value @2 :Text;
-}
-
-struct ContentMatch {
-    field @0 :Text;
-    operator @1 :StringOperator;
-    value @2 :Text;
-}
-
-struct TopicMatch {
-    topic @0 :Text;
-    pattern @1 :Bool;
-}
-
-enum StringOperator {
-    equals @0;
-    contains @1;
-    startsWith @2;
-    endsWith @3;
-    regex @4;
-    custom @5;
-}
-
-# ── Audit-9: Message Traceability ────────────────────────────────────────
-# End-to-end tracing with correlation IDs and span IDs.
-struct MessageTrace {
-    traceId @0 :Text;
-    spanId @1 :Text;
-    parentSpanId @2 :Text;
-    correlationId @3 :Text;
-    baggage @4 :List(CorrelationBaggageEntry);
-}
-
-struct CorrelationBaggageEntry {
-    key @0 :Text;
-    value @1 :Text;
-}
-
-# ── Audit-10: HA Failover ─────────────────────────────────────────────────
-# Automatic failover between replicas for high availability.
-struct FailoverPolicy {
-    enabled @0 :Bool;
-    # Timeout before promoting a new primary.
-    electionTimeout @1 :T.Duration;
-    # Maximum acceptable replica lag before demotion.
-    maxAcceptableLag @2 :T.Duration;
-    # What to do when failover occurs.
-    onFailover @3 :FailoverAction;
-    # Whether to automatically attempt failover.
-    automatic @4 :Bool;
-}
-
-enum FailoverAction {
-    notify @0;           # Notify but do not act
-    promote @1;           # Promote best replica to primary
-    switchover @2;        # Switch to a specific replica
-    shutdown @3;          # Shut down queue on failure
-}
-
-struct FailoverStatus {
-    state @0 :FailoverState;
-    lastFailoverAt @1 :T.Timestamp;
-    failoverCount @2 :UInt64;
-    currentPrimary @3 :UInt64;
-    candidates @4 :List(UInt64);
-}
-
-enum FailoverState {
-    normal @0;            # No failover in progress
-    detecting @1;         # Detecting primary failure
-    electing @2;          # Electing new primary
-    promoting @3;         # Promoting new primary
-    reconfiguring @4;     # Reconfiguring followers
-    completed @5;         # Failover completed successfully
-    failed @6;            # Failover failed
-}
-
-# ── Audit-10: Schema Migration ───────────────────────────────────────────
-# Automatic message schema migration when consumers/producers differ.
-struct SchemaMigrationStrategy {
-    enabled @0 :Bool;
-    # Migration mode.
-    mode @1 :SchemaMigrationMode;
-    # Timeout for each migration.
-    timeout @2 :T.Duration;
-    # Whether to fail on incompatible schema.
-    failOnIncompatible @3 :Bool;
-    # Batch size for migration.
-    batchSize @4 :UInt32;
-}
-
-enum SchemaMigrationMode {
-    none @0;              # No automatic migration
-    additive @1;          # Add new fields with defaults
-    backward @2;          # Strip unknown fields, preserve compatibility
-    full @3;              # Full bidirectional transformation
 }

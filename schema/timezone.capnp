@@ -1,13 +1,32 @@
 @0xa1b2c3d4e5f60100;
 
 using T = import "types.capnp";
+# calendar.capnp owns the recurrence vocabulary: its `Cal.RecurrenceFrequency`
+# (with the `unspecified` sentinel) is the one spelling. This file's
+# `RRule` is a DIFFERENT shape — the RFC 5545 resolver input, with byDay /
+# byMonthDay / byMonth — so it keeps its own name rather than pretending to
+# be calendar's structured `Recurrence`.
+using Cal = import "calendar.capnp";
 
 # ═══════════════════════════════════════════════════════════════════════
 # Timezone — IANA timezone database operations, DST transitions,
 # UTC offset queries, and timestamp conversion between zones.
 #
 # Zero backend assumptions: no POSIX TZ env, no system zoneinfo
-# dependencies. Backend provides IANA tzdb or equivalent.
+# dependencies. Backend provides IANA tzdb or equivalent. The protocol
+# takes tzdb (or an equivalent) as INPUT; it does not mandate how the
+# data is delivered — the previous header promised an independence no
+# implementation has.
+#
+# Canonical homes declared here (the batch's duplicate surfaces were
+# collapsed onto them):
+#   - `TaiTimestamp` and the UTC/TAI conversion pair. One epoch
+#     (Unix, 1970), one type, one converter — see the type's comment.
+#   - leap-second announcements and entries (time.capnp's copies deleted).
+#   - `TimezoneInfo` as the one timezone descriptor (time.capnp's smaller
+#     local struct deleted).
+#   - business hours for a zone.
+#   - the system's default timezone.
 #
 # Used by: calendar.capnp (timezone fields), time.capnp (clock mgmt)
 # ═══════════════════════════════════════════════════════════════════════
@@ -22,7 +41,7 @@ interface TimezoneService {
     # Convert a timestamp from one timezone to another.
     # sourceZone and targetZone are IANA timezone IDs.
     # If sourceZone is empty, timestamp is treated as UTC.
-    convertTimestamp @2 (timestamp :T.Timestamp, sourceZone :Text, targetZone :Text) -> (result :ConvertResult);
+    convertTimestamp @2 (timestamp :T.Timestamp, sourceZone :Text, targetZone :Text) -> (result :ZoneConversionResult);
 
     # Get DST transitions for a timezone within a time range.
     getDstTransitions @3 (timezoneId :Text, range :T.TimeRange) -> (transitions :List(DstTransition));
@@ -33,7 +52,13 @@ interface TimezoneService {
     # Get the system's default timezone.
     getDefaultTimezone @5 () -> (timezoneId :Text);
 
-    # Set the system's default timezone (requires privilege).
+    # Set the system's default timezone.
+    #
+    # Authority: the caller must hold a TimezoneService reference granted
+    # for administration (the capability system is the access-control
+    # mechanism — capability.capnp). There is deliberately no per-method
+    # permission token here: holding this reference, obtained through
+    # that grant, IS the authority.
     setDefaultTimezone @6 (timezoneId :Text) -> T.VoidResult;
 
     # Search timezones by partial match (e.g., "America/New", "Europe/").
@@ -43,7 +68,8 @@ interface TimezoneService {
     subscribeTimezones @8 () -> (subscription :TimezoneSubscription);
 
     # Get all timezones that have DST transitions within a given range.
-    getTimezonesWithDst @9 (range :T.TimeRange) -> (timezones :List(TimezoneInfo));
+    getTimezonesWithDst @9 (range :T.TimeRange, pagination :T.Pagination)
+        -> (timezones :List(TimezoneInfo), totalCount :UInt32);
 
     # Get the next N DST transitions for a timezone (for scheduling).
     getNextDstTransitions @10 (timezoneId :Text, count :UInt32) -> (transitions :List(DstTransition));
@@ -70,7 +96,7 @@ interface TimezoneService {
     getBusinessHours @16 (timezoneId :Text) -> (hours :TimezoneBusinessHours);
 
     # Audit-8: Get timezone closest to geographic coordinates.
-    getTimezoneForCoordinates @17 (latitude :Float64, longitude :Float64)
+    getTimezoneForCoordinates @17 (coordinates :T.GeoCoordinate)
         -> (timezoneId :Text, distanceKm :Float32);
 
     # Audit-8: Get historical UTC offset at a specific date.
@@ -107,11 +133,11 @@ interface TimezoneService {
         -> (timezones :List(TimezoneInfo), totalCount :UInt32);
 
     # Audit-9: Get ranked list of closest timezones to coordinates.
-    getRankedTimezones @27 (latitude :Float64, longitude :Float64, count :UInt32)
+    getRankedTimezones @27 (coordinates :T.GeoCoordinate, count :UInt32)
         -> (ranked :List(RankedTimezone));
 
     # Audit-10: Resolve a recurring event using a full iCalendar RRULE.
-    resolveRecurringEventRRULE @28 (timezoneId :Text, rule :RecurrenceRule,
+    resolveRecurringEventRRULE @28 (timezoneId :Text, rule :RRule,
         startDate :T.Date, exceptions :List(RecurrenceException), maxOccurrences :UInt32)
         -> (occurrences :List(ResolvedRRuleEvent));
 
@@ -161,7 +187,7 @@ struct TimezoneInfo {
     countryCode @10 :Text;
 
     # Geographic coordinates of the timezone's reference location.
-    coordinates @11 :T.Vec2;
+    coordinates @11 :T.GeoCoordinate;
 
     # Historical aliases (e.g., "US/Eastern" → "America/New_York").
     aliases @12 :List(Text);
@@ -188,6 +214,7 @@ struct HistoricalOffset {
     abbreviation @2 :Text;
     # Whether DST was in effect.
     isDst @3 :Bool;
+    metadata @4 :T.StringMap;
 }
 
 # ─── UTC Offset ──────────────────────────────────────────────────────
@@ -207,6 +234,7 @@ struct UtcOffset {
 
     # Timestamp when this offset ceases (0 = indefinite).
     effectiveUntil @4 :T.Timestamp;
+    metadata @5 :T.StringMap;
 }
 
 # ─── DST Transition ──────────────────────────────────────────────────
@@ -232,6 +260,7 @@ struct DstTransition {
 
     # Transition type.
     type @6 :DstTransitionType;
+    metadata @7 :T.StringMap;
 }
 
 enum DstTransitionType {
@@ -244,10 +273,11 @@ enum DstTransitionType {
 
 # ─── Timestamp Conversion Result ─────────────────────────────────────
 
-struct ConvertResult {
+struct ZoneConversionResult {
     union {
         success @0 :ConvertSuccess;
         error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
@@ -260,6 +290,7 @@ struct ConvertSuccess {
 
     # Source timezone info at the original time.
     sourceZoneInfo @2 :TimezoneInfo;
+    metadata @3 :T.StringMap;
 }
 
 # ─── Timezone Update Events ──────────────────────────────────────────
@@ -285,27 +316,30 @@ struct DatabaseUpdate {
     previousVersion @1 :Text;
     changedZones @2 :List(Text);  # IANA IDs that changed
     timestamp @3 :T.Timestamp;
+    metadata @4 :T.StringMap;
 }
 
 struct DefaultChange {
     oldTimezone @0 :Text;
     newTimezone @1 :Text;
     timestamp @2 :T.Timestamp;
+    metadata @3 :T.StringMap;
 }
 
 struct DefinitionChange {
     timezoneId @0 :Text;
     changedFields @1 :List(Text);  # Which fields changed
     timestamp @2 :T.Timestamp;
+    metadata @3 :T.StringMap;
 }
 
-# ─── Time Range Helper ──────────────────────────────────────────────
-
-# (Re-exported from types.capnp conceptually; defined here for self-containment)
-struct TimeRange {
-    start @0 :T.Timestamp;
-    end @1 :T.Timestamp;
-}
+# ─── Time units ───────────────────────────────────────────────────────
+# Every duration in this file is a T.Duration (nanoseconds) EXCEPT the
+# SOA refresh/retry/expire and record TTLs below, which are UInt32
+# seconds because that is the DNS-inherited unit the data is defined in.
+# The previous header claimed these had been converted to T.Duration
+# while the fields stayed UInt32 seconds — a 10^9 trap for a consumer
+# that believed the comment.
 
 # ─── Leap Second ─────────────────────────────────────────────────────
 
@@ -318,6 +352,7 @@ struct TimezoneLeapSecond {
     positive @2 :Bool;
     # Timezone this leap second applies to (empty = all).
     timezoneId @3 :Text;
+    metadata @4 :T.StringMap;
 }
 
 # ─── Abbreviation Info ───────────────────────────────────────────────
@@ -333,6 +368,7 @@ struct AbbreviationInfo {
     active @3 :Bool;
     # Whether this abbreviation represents DST.
     isDst @4 :Bool;
+    metadata @5 :T.StringMap;
 }
 
 # ─── Business Hours ──────────────────────────────────────────────────
@@ -348,6 +384,7 @@ struct TimezoneBusinessHours {
     workStartHour @3 :UInt8;
     # Working hours end (hour 0-23).
     workEndHour @4 :UInt8;
+    metadata @5 :T.StringMap;
 }
 
 # ─── Timezone Comparison ─────────────────────────────────────────────
@@ -392,36 +429,28 @@ struct LeapSecondAnnouncement {
     positive @2 :Bool;
     # Published by (IERS, NIST, etc.).
     publishedBy @3 :Text;
+    metadata @4 :T.StringMap;
 }
 
 # ─── TAI-UTC Conversion (audit-9) ───────────────────────────
 
+# THE canonical TAI representation, and the only one in the protocol.
+#
+# The epoch is the Unix epoch (1970-01-01 00:00:00 TAI) — the same epoch
+# as `T.Timestamp` (nanoseconds since 1970-01-01 UTC) — so the two are
+# commensurable by construction. The previous revision of time.capnp
+# declared a second, near-identically-named TAI struct on a 1958 epoch;
+# both were bare UInt64 seconds, so a consumer could pass one to the
+# other's converter and receive a timestamp ~120 years wrong with no
+# compile error. That struct and this file's role as the only TAI home
+# are the fix: one type, one epoch, one conversion surface
+# (`convertToTai` / `convertFromTai` below).
 struct TaiTimestamp {
-    # TAI seconds since Unix epoch (1970-01-01 00:00:00 TAI).
+    # Seconds since the Unix epoch (1970-01-01 00:00:00 TAI).
     taiSeconds @0 :UInt64;
     # Nanoseconds within the second.
     nanoseconds @1 :UInt32;
-}
-
-struct TaiUtcConversion {
-    taiTimestamp @0 :TaiTimestamp;
-    utcTimestamp @1 :T.Timestamp;
-    # Current TAI-UTC offset in seconds.
-    currentOffset @2 :UInt16;
-    # Whether a leap second is pending.
-    leapSecondPending @3 :Bool;
-}
-
-# ─── Timezone Region (audit-9) ─────────────────────────────
-
-enum TimezoneRegion {
-    africa @0;
-    americas @1;
-    asia @2;
-    europe @3;
-    oceania @4;
-    antarctica @5;
-    custom @6;
+    metadata @2 :T.StringMap;
 }
 
 # ─── Ranked Timezone (audit-9) ─────────────────────────────
@@ -430,20 +459,13 @@ struct RankedTimezone {
     timezoneId @0 :Text;
     distanceKm @1 :Float32;
     rank @2 :UInt32;
+    metadata @3 :T.StringMap;
 }
 
 # ─── RRULE Recurring Event (audit-10) ──────────────────────
 
-enum RecurrenceFrequency {
-    daily @0;
-    weekly @1;
-    monthly @2;
-    yearly @3;
-    custom @4;
-}
-
-struct RecurrenceRule {
-    frequency @0 :RecurrenceFrequency;
+struct RRule {
+    frequency @0 :Cal.RecurrenceFrequency;
     # Interval between occurrences (e.g., every 2 weeks).
     interval @1 :UInt32;
     # Day of week (1=Monday, 7=Sunday). Empty = all days.
@@ -498,4 +520,5 @@ struct TzdbUpdate {
     timestamp @3 :T.Timestamp;
     # IANA zone IDs that changed.
     changedZoneIds @4 :List(Text);
+    metadata @5 :T.StringMap;
 }

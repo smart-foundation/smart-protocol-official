@@ -1,118 +1,107 @@
 @0xa1b2c3d4e5f60020;
 
-# ═══════════════════════════════════════════════════════════════════════
-# Web — HTTP fetch, WebSocket, URL and HTML parsing primitives.
-#
-# Backend-agnostic. The HTTP transport may be elio, libcurl, a custom
-# Rust reqwest clone, or a synthetic offline backend for tests. The
-# protocol describes request/response and lifecycle — never the transport.
-#
-# Improvements beyond the original:
-#   - HttpRequest.timeout is now T.Duration (was raw UInt64 ms).
-#   - HttpRequest.body / HttpResponse.body are T.DataHandle
-#     (inline <1KB or buffer-handle for large payloads).
-#   - WebSocketConnection.close.code uses a typed WebSocketCloseCode
-#     union instead of bare UInt16.
-#   - All subscription interfaces have cancel.
-#   - HTTP method is a typed enum (method :Text -> method :HttpMethod).
-#   - MessagesSubscription has cancel.
-# ═══════════════════════════════════════════════════════════════════════
-
 using T = import "types.capnp";
+using S = import "socket.capnp";
+
+# ═══════════════════════════════════════════════════════════════════════
+# Web — HTTP fetch, WebSocket, URL primitives.
+#
+# Backend-agnostic. The HTTP transport may be any library, a custom
+# stack, or a synthetic offline backend for tests. The protocol
+# describes request/response and lifecycle — never the transport.
+#
+# Fixes this revision makes:
+#   - `fetch` can FAIL. The result was a bare `HttpResponse`, so a
+#     refused connection, a DNS failure and a TLS failure all had to be
+#     encoded as a `status` code — meaning "server answered 500" and "we
+#     never reached the server" were the same shape. The result is now a
+#     union carrying T.Error; `status` keeps its HTTP meaning.
+#   - Transport security is expressible: `wss://` and any secure fetch
+#     take the canonical TlsConfig from socket.capnp, which is where the
+#     verification semantics are defined. Previously the URL implied TLS
+#     and nothing said whether the peer certificate must be checked.
+#   - WebSocket binary payloads are T.DataHandle. Binary frames are
+#     arbitrary length; both directions were inline Data in a file whose
+#     HTTP bodies had already been converted.
+#   - `getStreamReader` takes a stream. It used to take a *chunk*, which
+#     cannot be implemented as written without an out-of-band
+#     chunk-to-stream map.
+#   - WebRTC session state is observable (a typed session with typed
+#     states), and SDP has one representation (the typed structs), not
+#     one typed and one raw.
+#   - Deleted: the service-worker block (a browser-runtime mechanism an
+#     OS-level fetch service has no equivalent for), HTTP/2 server push
+#     keyed by raw stream ids with no stream object, and five types
+#     returned by no method (Http2Stream, CspReport, AbortSignal,
+#     StorageEstimate, ServiceWorkerInfo).
+#   - The local ProxyConfig/ProxyType are gone in favour of socket's,
+#     which is now the single proxy home.
+# ═══════════════════════════════════════════════════════════════════════
 
 interface WebService {
 
-    fetch       @0 (request :HttpRequest)  -> (response :HttpResponse);
-    fetchStream @1 (request :HttpRequest)  -> (stream :HttpStream);
+    fetch @0 (request :HttpRequest) -> (result :HttpFetchResult);
+    fetchStream @1 (request :HttpRequest) -> (stream :HttpStream);
 
-    openWebSocket @2 (url :Text, protocols :List(Text))
+    # `security` configures the channel for `wss://` (and any future
+    # secure scheme). Absent = the backend's default, which MUST still
+    # verify the peer unless the config says otherwise — see the
+    # verification semantics in socket.capnp.
+    openWebSocket @2 (url :Text, protocols :List(Text), security :S.TlsConfig)
                      -> (connection :WebSocketConnection);
 
     resolveUrl @3 (url :Text, baseUrl :Text) -> (resolved :Text);
-    encodeUrl  @4 (url :Text)                 -> (encoded :Text);
-    decodeUrl  @5 (url :Text)                 -> (decoded :Text);
+    encodeUrl  @4 (url :Text) -> (encoded :Text);
+    decodeUrl  @5 (url :Text) -> (decoded :Text);
 
-    parseHtml @6 (html :Text) -> (parsed :ParsedHtml);
+    # Parse an HTML document. The document is content (T.DataHandle),
+    # not an inline string.
+    parseHtml @6 (html :T.DataHandle) -> (parsed :ParsedHtml);
 
-    # Audit-8: Register a service worker.
-    registerServiceWorker @7 (scope :Text, scriptUrl :Text)
-        -> (registration :ServiceWorkerRegistration);
+    # ── Proxy (canonical home: socket.capnp) ──
+    setProxyConfig @7 (config :S.ProxyConfig) -> T.VoidResult;
+    getProxyConfig @8 () -> (config :S.ProxyConfig);
 
-    # Audit-8: Unregister a service worker.
-    unregisterServiceWorker @8 (scope :Text) -> T.VoidResult;
+    # ── WebAuthn ──
+    registerWebAuthn @9 (request :WebAuthnRegisterRequest) -> (result :WebAuthnRegisterResult);
+    authenticateWebAuthn @10 (request :WebAuthnAuthenticateRequest) -> (result :WebAuthnResult);
+    listWebAuthnCredentials @11 (pagination :T.Pagination) -> (credentials :List(WebAuthnCredential), totalCount :UInt64);
+    deleteWebAuthnCredential @12 (credentialId :WebAuthnCredentialId) -> T.VoidResult;
 
-    # Audit-8: Get service worker state.
-    getServiceWorkerState @9 (scope :Text) -> (state :ServiceWorkerState);
+    # ── CDN info ──
+    getCdnInfo @13 (url :Text) -> (result :CdnInfoResult);
 
-    # Audit-8: Configure proxy settings.
-    setProxyConfig @10 (config :ProxyConfig) -> T.VoidResult;
+    # ── Privacy configuration ──
+    getPrivacyConfig @14 () -> (config :PrivacyConfig);
+    setPrivacyConfig @15 (config :PrivacyConfig) -> T.VoidResult;
 
-    # Audit-8: Get current proxy configuration.
-    getProxyConfig @11 () -> (config :ProxyConfig);
+    # ── CORS policy ──
+    getCorsPolicy @16 (url :Text) -> (result :CorsPolicyResult);
+    checkCors @17 (origin :Text, url :Text, method :Text) -> (allowed :Bool);
 
-    # Audit-8: Register a WebAuthn credential.
-    registerWebAuthn @12 (request :WebAuthnRegisterRequest)
-        -> (credential :WebAuthnCredential);
+    # ── Stream readers ──
+    getStreamReader @18 (stream :HttpStream) -> (reader :ReadableStreamReader);
 
-    # Audit-8: Authenticate with WebAuthn.
-    authenticateWebAuthn @13 (request :WebAuthnAuthenticateRequest)
-        -> (result :WebAuthnResult);
+    # ── WebRTC session lifecycle ──
+    createWebRtcOffer @19 (sessionId :Text) -> (result :WebRtcOfferResult);
+    createWebRtcAnswer @20 (sessionId :Text, offer :SdpOffer) -> (result :WebRtcAnswerResult);
+    setLocalDescription @21 (sessionId :Text, sdp :SdpDescription) -> T.VoidResult;
+    setRemoteDescription @22 (sessionId :Text, sdp :SdpDescription) -> T.VoidResult;
+    getLocalDescription @23 (sessionId :Text) -> (result :SdpResult);
+    getWebRtcSession @24 (sessionId :Text) -> (result :WebRtcSessionResult);
 
-    # Audit-8: List WebAuthn credentials.
-    listWebAuthnCredentials @14 (pagination :T.Pagination)
-        -> (credentials :List(WebAuthnCredential), total :UInt64);
+    # ── WebRTC ICE candidates ──
+    addIceCandidate @25 (sessionId :Text, candidate :IceCandidate) -> T.VoidResult;
+    getIceCandidates @26 (sessionId :Text, pagination :T.Pagination) -> (candidates :List(IceCandidate), totalCount :UInt64);
+    removeIceCandidate @27 (sessionId :Text, candidate :IceCandidate) -> T.VoidResult;
 
-    # Audit-8: Delete a WebAuthn credential.
-    deleteWebAuthnCredential @15 (credentialId :T.DataHandle) -> T.VoidResult;
+    # ── WebRTC data channel ──
+    createDataChannel @28 (sessionId :Text, label :Text, config :DataChannelConfig) -> (result :DataChannelResult);
+    sendDataChannelMessage @29 (sessionId :Text, channelId :Text, data :T.DataHandle) -> T.VoidResult;
+    closeDataChannel @30 (sessionId :Text, channelId :Text) -> T.VoidResult;
 
-    # Audit-8: Get CDN info for a URL.
-    getCdnInfo @16 (url :Text) -> (cdn :CDNInfo);
-
-    # Audit-8: Get privacy configuration.
-    getPrivacyConfig @17 () -> (config :PrivacyConfig);
-
-    # Audit-8: Set privacy configuration.
-    setPrivacyConfig @18 (config :PrivacyConfig) -> T.VoidResult;
-
-    # Audit-8: Get CORS policy for a URL.
-    getCorsPolicy @19 (url :Text) -> (policy :CorsPolicy);
-
-    # Audit-8: Check if a URL is allowed by CORS policy.
-    checkCors @20 (origin :Text, url :Text, method :HttpMethod) -> (allowed :Bool);
-
-    # Audit-9: Service worker fetch event interception.
-    handleFetchEvent @21 (event :FetchEvent) -> (response :HttpResponse);
-
-    # Audit-9: Readable stream reader.
-    getStreamReader @22 (stream :ReadableStreamChunk) -> (reader :ReadableStreamReader);
-
-    # Audit-9: WebRTC SDP negotiation.
-    createWebRtcOffer @23 (sessionId :Text) -> (sdp :SdpOffer);
-    createWebRtcAnswer @24 (sessionId :Text, offer :SdpOffer) -> (answer :SdpAnswer);
-    setLocalDescription @25 (sessionId :Text, sdp :Text) -> T.VoidResult;
-    setRemoteDescription @26 (sessionId :Text, sdp :Text) -> T.VoidResult;
-    getLocalDescription @27 (sessionId :Text) -> (sdp :Text);
-
-    # Audit-9: HTTP/2 server push.
-    pushResource @28 (streamId :UInt32, pushPromises :List(PushPromise)) -> T.VoidResult;
-
-    # Audit-10: WebRTC ICE candidate management.
-    addIceCandidate @29 (sessionId :Text, candidate :IceCandidate) -> T.VoidResult;
-    getIceCandidates @30 (sessionId :Text) -> (candidates :List(IceCandidate));
-    removeIceCandidate @31 (sessionId :Text, candidate :IceCandidate) -> T.VoidResult;
-
-    # Audit-10: WebRTC data channel.
-    createDataChannel @32 (sessionId :Text, label :Text, config :DataChannelConfig)
-        -> (channel :DataChannel);
-    sendDataChannelMessage @33 (sessionId :Text, channelId :Text, data :Data) -> T.VoidResult;
-    closeDataChannel @34 (sessionId :Text, channelId :Text) -> T.VoidResult;
-
-    # Audit-10: HTTP/2 push cancellation.
-    cancelPush @35 (streamId :UInt32, pushId :UInt32) -> T.VoidResult;
-
-    # Audit-10: WebAuthn attestation verification.
-    verifyWebAuthnAttestation @36 (attestation :WebAuthnAttestation)
-        -> (result :WebAuthnAttestationResult);
+    # ── WebAuthn attestation ──
+    verifyWebAuthnAttestation @31 (attestation :WebAuthnAttestation) -> (result :WebAuthnAttestationResult);
 }
 
 # ── Streaming ──────────────────────────────────────────────────────────
@@ -125,8 +114,8 @@ interface HttpStream {
 # ── WebSocket ──────────────────────────────────────────────────────────
 
 interface WebSocketConnection {
-    send        @0 (data :Data)         -> T.VoidResult;
-    sendText    @1 (text :Text)         -> T.VoidResult;
+    send        @0 (data :T.DataHandle) -> T.VoidResult;
+    sendText    @1 (text :Text) -> T.VoidResult;
     close       @2 (code :WebSocketCloseCode, reason :Text) -> T.VoidResult;
     subscribeMessages @3 () -> (subscription :MessagesSubscription);
 }
@@ -135,41 +124,51 @@ interface MessagesSubscription {
     pull   @0 () -> (messages :List(WebSocketMessage));
     cancel @1 () -> T.VoidResult;
 
-    # Paginated message retrieval. Returns at most `pagination.limit` messages
-    # starting at `pagination.offset`. Caller should repeat with increasing
-    # offset until all messages are consumed.
+    # Paginated message retrieval. Returns at most `pagination.limit`
+    # messages starting at `pagination.offset`.
     pullPaged @2 (pagination :T.Pagination)
-              -> (messages :List(WebSocketMessage), total :UInt64);
+              -> (messages :List(WebSocketMessage), totalCount :UInt64);
 }
 
 # ── HTTP Request / Response ───────────────────────────────────────────
 
 enum HttpMethod {
-    get     @0;
-    head    @1;
-    post    @2;
-    put     @3;
-    delete  @4;
-    connect @5;
-    options @6;
-    trace   @7;
-    patch   @8;
-    custom  @9;
+    unknown @0;
+    get     @1;
+    head    @2;
+    post    @3;
+    put     @4;
+    delete  @5;
+    connect @6;
+    options @7;
+    trace   @8;
+    patch   @9;
+    custom  @10;
 }
 
 struct HttpRequest {
     method     @0 :HttpMethod;
-    # URL as text. HTTP URLs have specific semantics (scheme validation,
-    # encoding) that a generic T.Uri doesn't capture. Text is appropriate.
+    # URL as text. HTTP URLs have scheme, percent-encoding and query
+    # semantics that a generic T.Uri does not capture; text is the honest
+    # spelling, and the scheme's security meaning is in `security`.
     url        @1 :Text;
     headers    @2 :T.StringMap;
     # Inline for small bodies, buffer-handle for >1KB.
     body       @3 :T.DataHandle;
     timeout    @4 :T.Duration;
-    # Optional cancellation handle (see access.capnp-style patterns).
-    followRedirects @5 :Bool = true;
-    # Maximum number of redirects to follow (0 = none).
-    maxRedirects @6 :UInt32;
+    # Channel security for https:// and wss:// (canonical TLS home).
+    security   @5 :S.TlsConfig;
+    followRedirects @6 :Bool = true;
+    maxRedirects @7 :UInt32;
+    metadata @8 :T.StringMap;
+}
+
+struct HttpFetchResult {
+    union {
+        response @0 :HttpResponse;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
 
 struct HttpResponse {
@@ -181,26 +180,29 @@ struct HttpResponse {
     url        @4 :Text;
     # Round-trip time the engine measured.
     latency    @5 :T.Duration;
+    latencyMeasured @6 :Bool;
 }
 
 # ── WebSocket ─────────────────────────────────────────────────────────
 
 struct WebSocketMessage {
     type @0 :WebSocketMessageType;
-    data @1 :Data;
+    data @1 :T.DataHandle;
     text @2 :Text;
+    metadata @3 :T.StringMap;
 }
 
 enum WebSocketMessageType {
-    text    @0;
-    binary  @1;
-    ping    @2;
-    pong    @3;
-    close   @4;
-    custom  @5;
+    unknown @0;
+    text    @1;
+    binary  @2;
+    ping    @3;
+    pong    @4;
+    close   @5;
+    custom  @6;
 }
 
-# WebSocket close codes. RFC 6455 + vendor-defined escape hatch.
+# WebSocket close codes. RFC 6455 + a vendor-defined escape hatch.
 struct WebSocketCloseCode {
     union {
         normal          @0  :Void;
@@ -229,6 +231,7 @@ struct HtmlLink {
     href @0 :Text;
     text @1 :Text;
     rel  @2 :Text;
+    metadata @3 :T.StringMap;
 }
 
 struct HtmlImage {
@@ -236,396 +239,302 @@ struct HtmlImage {
     alt    @1 :Text;
     width  @2 :UInt32;
     height @3 :UInt32;
+    metadata @4 :T.StringMap;
 }
 
-# ── Audit-8: Service Worker ───────────────────────────────────────────
+# ── WebAuthn ──────────────────────────────────────────────────────────
 
-struct ServiceWorkerRegistration {
-    # Service worker scope.
-    scope @0 :Text;
-    # Current registration state.
-    state @1 :ServiceWorkerState;
-    # Script URL.
-    scriptUrl @2 :Text;
+# An identifier, not a payload: the previous spelling typed it as a
+# T.DataHandle, conflating "reference to bulk data" with "identity".
+struct WebAuthnCredentialId {
+    id @0 :Data;
 }
-
-enum ServiceWorkerState {
-    installing  @0;   # Script is being downloaded and installed
-    installed   @1;   # Script is installed, waiting for activation
-    activating  @2;   # Service worker is being activated
-    activated   @3;   # Service worker is active and handling events
-    redundant   @4;   # Service worker is obsolete
-    custom      @5;   # Backend-specific state
-}
-
-struct ServiceWorkerInfo {
-    # Registration state.
-    state @0 :ServiceWorkerState;
-    # Whether a new update is waiting.
-    updateWaiting @1 :Bool;
-    # Last update timestamp.
-    lastUpdated @2 :T.Timestamp;
-}
-
-# ── Audit-8: Proxy Configuration ──────────────────────────────────────
-
-struct ProxyConfig {
-    # Proxy type.
-    proxyType @0 :ProxyType;
-    # Proxy host.
-    host @1 :Text;
-    # Proxy port.
-    port @2 :UInt16;
-    # Optional username for proxy authentication.
-    username @3 :Text;
-    # Optional password for proxy authentication.
-    password @4 :Text;
-    # Bypass list (URLs that bypass the proxy).
-    bypassList @5 :List(Text);
-    # PAC file URL (for proxyType = pac).
-    pacUrl @6 :Text;
-}
-
-enum ProxyType {
-    http    @0;   # HTTP proxy
-    socks5  @1;   # SOCKS5 proxy
-    pac     @2;   # Proxy auto-configuration
-    direct  @3;   # Direct connection (no proxy)
-    custom  @4;   # Backend-specific proxy type
-}
-
-# ── Audit-8: WebAuthn ─────────────────────────────────────────────────
 
 struct WebAuthnRegisterRequest {
-    # Relying party name.
     rpName @0 :Text;
-    # User identifier.
     userId @1 :Data;
-    # User display name.
     userName @2 :Text;
-    # Preferred authenticator types.
+    # Preferred authenticator types as open tokens.
     authenticatorTypes @3 :List(Text);
-    # Timeout in milliseconds.
-    timeout @4 :UInt32;
+    timeout @4 :T.Duration;
 }
 
 struct WebAuthnAuthenticateRequest {
-    # Relying party ID.
     rpId @0 :Text;
-    # Allowed credential IDs.
-    allowedCredentials @1 :List(T.DataHandle);
-    # Timeout in milliseconds.
-    timeout @2 :UInt32;
+    allowedCredentials @1 :List(WebAuthnCredentialId);
+    timeout @2 :T.Duration;
+    metadata @3 :T.StringMap;
 }
 
 struct WebAuthnCredential {
-    # Credential identifier.
-    id @0 :T.DataHandle;
-    # Credential type (e.g., "public-key").
+    id @0 :WebAuthnCredentialId;
+    # Credential type (e.g., "public-key") as an open token.
     type @1 :Text;
-    # Supported transports.
     transports @2 :List(Text);
-    # Public key.
     publicKey @3 :T.DataHandle;
-    # Sign count (for clone protection).
     signCount @4 :UInt64;
-    # Relying party ID.
     rpId @5 :Text;
+    metadata @6 :T.StringMap;
+}
+
+struct WebAuthnRegisterResult {
+    union {
+        credential @0 :WebAuthnCredential;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
 
 struct WebAuthnResult {
     union {
         success @0 :WebAuthnCredential;
         error   @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
     }
 }
 
-# ── Audit-8: CDN Info ─────────────────────────────────────────────────
-
-struct CDNInfo {
-    # Edge server hostname.
-    edgeServer @0 :Text;
-    # Whether the response was served from cache.
-    cacheHit @1 :Bool;
-    # Age of the cached response.
-    cacheAge @2 :T.Duration;
-    # Geographic region of the edge server.
-    geographicRegion @3 :Text;
-    # Remaining TTL.
-    ttlRemaining @4 :T.Duration;
+struct WebAuthnAttestation {
+    # Attestation object (CBOR-encoded), as content.
+    attestationObject @0 :T.DataHandle;
+    # Client data JSON, as content.
+    clientDataJson @1 :T.DataHandle;
+    # Authenticator data, as content.
+    authenticatorData @2 :T.DataHandle;
+    metadata @3 :T.StringMap;
 }
 
-# ── Audit-8: Privacy Configuration ────────────────────────────────────
+struct WebAuthnAttestationResult {
+    union {
+        verified @0 :WebAuthnVerification;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct WebAuthnVerification {
+    credential @0 :WebAuthnCredential;
+    # Attestation format as an open token ("none", "packed", "tpm", ...).
+    format @1 :Text;
+    # Attestation trust level as an open token ("trusted", "untrusted",
+    # "none", "failed"): reported, not switched on.
+    trustLevel @2 :Text;
+    metadata @3 :T.StringMap;
+}
+
+# ── CDN Info ──────────────────────────────────────────────────────────
+
+struct CdnInfoResult {
+    union {
+        cdn @0 :CDNInfo;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct CDNInfo {
+    edgeServer @0 :Text;
+    cacheHit @1 :Bool;
+    cacheAge @2 :T.Duration;
+    geographicRegion @3 :Text;
+    ttlRemaining @4 :T.Duration;
+    metadata @5 :T.StringMap;
+}
+
+# ── Privacy Configuration ────────────────────────────────────────────
 
 struct PrivacyConfig {
-    # Enable tracking protection.
     trackingProtection @0 :Bool;
-    # Enable storage partitioning (per-origin).
     storagePartitioning @1 :Bool;
-    # Enable first-party isolation.
     firstPartyIsolation @2 :Bool;
-    # Cookie policy.
     cookiePolicy @3 :CookiePolicy;
-    # Enable fingerprint protection.
     fingerprintProtection @4 :Bool;
-    # Blocked tracking domains.
     blockedDomains @5 :List(Text);
+    metadata @6 :T.StringMap;
 }
 
 enum CookiePolicy {
-    acceptAll       @0;   # Accept all cookies
-    rejectThirdParty @1;  # Reject third-party cookies
-    blockAll        @2;   # Block all cookies
-    custom          @3;   # Backend-specific cookie policy
+    unknown @0;
+    acceptAll @1;
+    rejectThirdParty @2;
+    blockAll @3;
+    custom @4;
 }
 
-# ── Audit-8: HTTP/2 Stream ────────────────────────────────────────────
+# ── CORS Policy ───────────────────────────────────────────────────────
 
-struct Http2Stream {
-    # Stream identifier.
-    streamId @0 :UInt32;
-    # Stream priority.
-    priority @1 :UInt8;
-    # Request headers.
-    headers @2 :T.StringMap;
-    # Stream data.
-    data @3 :T.DataHandle;
-    # Whether this is the last frame.
-    endStream @4 :Bool;
+struct CorsPolicyResult {
+    union {
+        policy @0 :CorsPolicy;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
 }
-
-# ── Audit-8: WebRTC ───────────────────────────────────────────────────
-
-struct WebRtcSession {
-    # Session identifier.
-    sessionId @0 :Text;
-    # Session state.
-    state @1 :WebRtcState;
-    # ICE connection state.
-    iceState @2 :Text;
-    # DTLS connection state.
-    dtlsState @3 :Text;
-}
-
-enum WebRtcState {
-    new         @0;   # New session
-    connecting  @1;   # Establishing connection
-    connected   @2;   # Connection established
-    disconnected @3;  # Connection temporarily lost
-    failed      @4;   # Connection failed
-    closed      @5;   # Session closed
-    custom      @6;   # Backend-specific state
-}
-
-# ── Audit-8: CORS Policy ──────────────────────────────────────────────
 
 struct CorsPolicy {
-    # Allowed origins (empty = deny all).
     allowedOrigins @0 :List(Text);
-    # Allowed HTTP methods.
     allowedMethods @1 :List(HttpMethod);
-    # Allowed headers.
     allowedHeaders @2 :List(Text);
-    # Whether credentials are allowed.
     credentials @3 :Bool;
-    # Max age for preflight cache.
     maxAge @4 :T.Duration;
-    # Exposed headers.
     exposedHeaders @5 :List(Text);
+    metadata @6 :T.StringMap;
 }
 
-# ── Audit-8: CSP Report ───────────────────────────────────────────────
-
-struct CspReport {
-    # Document URI where violation occurred.
-    documentUri @0 :Text;
-    # Violated directive.
-    violatedDirective @1 :Text;
-    # Blocked URI.
-    blockedUri @2 :Text;
-    # Source file.
-    sourceFile @3 :Text;
-    # Line number in source.
-    lineNumber @4 :UInt32;
-    # Timestamp of violation.
-    timestamp @5 :T.Timestamp;
-}
-
-# ── Audit-8: Abort Controller ─────────────────────────────────────────
-
-struct AbortSignal {
-    # Whether the signal has been aborted.
-    aborted @0 :Bool;
-    # Reason for abort (if aborted).
-    reason @1 :Text;
-}
-
-# ── Audit-8: Readable Stream ──────────────────────────────────────────
+# ── Readable Stream ───────────────────────────────────────────────────
 
 struct ReadableStreamChunk {
-    # Data chunk.
     data @0 :T.DataHandle;
-    # Whether this is the final chunk.
     done @1 :Bool;
+    metadata @2 :T.StringMap;
 }
-
-# ── Audit-8: Storage Estimate ─────────────────────────────────────────
-
-struct StorageEstimate {
-    # Current usage in bytes.
-    usage @0 :UInt64;
-    # Quota in bytes.
-    quota @1 :UInt64;
-}
-
-# ── Audit-9: Service Worker Fetch Event ────────────────────────────────────
-
-struct FetchEvent {
-    # Request that triggered the fetch.
-    request @0 :HttpRequest;
-    # Client ID (service worker client).
-    clientId @1 :Text;
-    # Is this a navigation request.
-    isNavigation @2 :Bool;
-    # Preload response (if available).
-    preloadResponse @3 :HttpResponse;
-    # Timestamp.
-    timestamp @4 :T.Timestamp;
-}
-
-# ── Audit-9: Readable Stream Reader ────────────────────────────────────────
 
 interface ReadableStreamReader {
-    # Read the next chunk.
-    read @0 () -> (chunk :ReadableStreamChunk);
-    # Cancel the stream.
+    read @0 () -> (result :ReadableStreamResult);
     cancel @1 () -> T.VoidResult;
-    # Release the reader.
     release @2 () -> T.VoidResult;
 }
 
-# ── Audit-9: WebRTC SDP Negotiation ────────────────────────────────────────
+struct ReadableStreamResult {
+    union {
+        chunk @0 :ReadableStreamChunk;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+# ── WebRTC ────────────────────────────────────────────────────────────
+
+struct WebRtcOfferResult {
+    union {
+        offer @0 :SdpOffer;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct WebRtcAnswerResult {
+    union {
+        answer @0 :SdpAnswer;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct SdpResult {
+    union {
+        sdp @0 :SdpDescription;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct WebRtcSessionResult {
+    union {
+        session @0 :WebRtcSession;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+struct DataChannelResult {
+    union {
+        channel @0 :DataChannel;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+# One representation for SDP. The file used to carry typed SdpOffer /
+# SdpAnswer structs beside raw `sdp :Text` parameters on the set/get
+# methods, with no rule for which won.
+struct SdpDescription {
+    sessionId @0 :Text;
+    # The SDP document itself, as content.
+    sdp @1 :T.DataHandle;
+    timestamp @2 :T.Timestamp;
+    metadata @3 :T.StringMap;
+}
 
 struct SdpOffer {
     sessionId @0 :Text;
-    sdp @1 :Text;
-    # Offer timestamp.
+    sdp @1 :T.DataHandle;
     timestamp @2 :T.Timestamp;
+    metadata @3 :T.StringMap;
 }
 
 struct SdpAnswer {
     sessionId @0 :Text;
-    sdp @1 :Text;
-    # Answer timestamp.
+    sdp @1 :T.DataHandle;
     timestamp @2 :T.Timestamp;
+    metadata @3 :T.StringMap;
 }
 
-# ── Audit-9: HTTP/2 Server Push ────────────────────────────────────────────
-
-struct PushPromise {
-    # Path to push.
-    path @0 :Text;
-    # Headers for the pushed response.
-    headers @1 :T.StringMap;
-    # Whether the push is for a GET request.
-    isGet @2 :Bool;
+# Observable session state. The previous revision declared this struct
+# and returned it from nothing, so a consumer could not learn whether a
+# session connected, ICE completed, or failed.
+struct WebRtcSession {
+    sessionId @0 :Text;
+    state @1 :WebRtcState;
+    # ICE and DTLS state as open tokens: the state machines are the
+    # backend's, and a 2046 stack's phases are its own.
+    iceState @2 :Text;
+    dtlsState @3 :Text;
+    metadata @4 :T.StringMap;
 }
 
-# ── Audit-10: WebRTC ICE Candidate ─────────────────────────────────────
+enum WebRtcState {
+    unknown @0;
+    new @1;
+    connecting @2;
+    connected @3;
+    disconnected @4;
+    failed @5;
+    closed @6;
+    custom @7;
+}
 
 struct IceCandidate {
-    # Candidate foundation (unique identifier).
     foundation @0 :Text;
-    # Component ID (1 = RTP, 2 = RTCP).
     component @1 :UInt16;
-    # Transport protocol (UDP, TCP).
+    # Transport protocol as an open token.
     transport @2 :Text;
-    # Priority value.
     priority @3 :UInt32;
-    # Candidate address (IP:port or hostname:port).
+    # Candidate address (host:port or hostname:port).
     address @4 :Text;
-    # Candidate type (host, srflx, relay, prflx).
+    # Candidate type as an open token ("host", "srflx", "relay", "prflx").
     candidateType @5 :Text;
-    # Related address (for server reflexive/relay candidates).
     relatedAddress @6 :Text;
-    # Timestamp when candidate was gathered.
     timestamp @7 :T.Timestamp;
+    metadata @8 :T.StringMap;
 }
 
-# ── Audit-10: WebRTC Data Channel ──────────────────────────────────────
-
 struct DataChannelConfig {
-    # Channel label.
     label @0 :Text;
-    # Whether the channel is ordered.
     ordered @1 :Bool = true;
-    # Max retransmit time in milliseconds (0 = default).
-    maxRetransmitTime @2 :UInt32;
-    # Max retransmit count (0 = default).
+    maxRetransmitTime @2 :T.Duration;
     maxRetransmits @3 :UInt32;
-    # Protocol name.
+    # Protocol name as an open token.
     protocol @4 :Text;
-    # Whether this is a legacy SCTP channel.
     negotiated @5 :Bool = false;
-    # Channel ID (if negotiated).
     channelId @6 :UInt16;
+    metadata @7 :T.StringMap;
 }
 
 struct DataChannel {
-    # Channel identifier.
     channelId @0 :Text;
-    # Channel label.
     label @1 :Text;
-    # Whether the channel is ordered.
     ordered @2 :Bool;
-    # Current channel state.
     state @3 :DataChannelState;
-    # Messages sent.
     messagesSent @4 :UInt64;
-    # Bytes sent.
     bytesSent @5 :UInt64;
+    metadata @6 :T.StringMap;
 }
 
 enum DataChannelState {
-    connecting @0;
-    open @1;
-    closing @2;
-    closed @3;
-    custom @4;
-}
-
-# ── Audit-10: WebAuthn Attestation Verification ────────────────────────
-
-struct WebAuthnAttestation {
-    # Attestation object (CBOR-encoded).
-    attestationObject @0 :Data;
-    # Client data JSON.
-    clientDataJson @1 :Data;
-    # Authenticator data.
-    authenticatorData @2 :Data;
-}
-
-struct WebAuthnAttestationResult {
-    # Whether verification succeeded.
-    success @0 :Bool;
-    # Verified credential (if successful).
-    credential @1 :WebAuthnCredential;
-    # Attestation format (e.g., "none", "fido-u2f", "packed", "tpm").
-    format @2 :Text;
-    # Attestation trust level.
-    trustLevel @3 :AttestationTrustLevel;
-    # Error message (if failed).
-    error @4 :Text;
-}
-
-enum AttestationTrustLevel {
-    # Attestation ca is trusted by the Relying Party.
-    trusted @0;
-    # Attestation is from an untrusted CA.
-    untrusted @1;
-    # Attestation format does not include attestation.
-    none @2;
-    # Attestation verification failed.
-    failed @3;
-    custom @4;
+    unknown @0;
+    connecting @1;
+    open @2;
+    closing @3;
+    closed @4;
+    custom @5;
 }

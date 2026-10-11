@@ -21,7 +21,7 @@
 #   - BluetoothDevice.bondedAt/lastSeenAt timestamps.
 #   - ScanFilter.maxAge for staleness filtering.
 #   - ScanFilter.addressTypes for address type filtering.
-#   - ConnectionEvent.profileConnected/profileDisconnected/bonded/unbonded.
+#   - BluetoothConnectionEvent.profileConnected/profileDisconnected/bonded/unbonded.
 #   - GattEvent.added/removed for dynamic GATT databases.
 #
 # Audit-9 improvements:
@@ -58,9 +58,28 @@ enum BluetoothState {
 
 # ── Device Info ─────────────────────────────────────────────────────────
 
+# ── Device Info ─────────────────────────────────────────────────────────
+#
+# THE ADDRESS. Every method in this file that takes a device takes
+# `T.DeviceAddress` — an opaque, backend-issued reference — while the
+# descriptor used to expose `address :Text`, a MAC string. The two were
+# unrelated types with no method to convert one to the other, so a scan
+# result literally could not be passed to ANY method: a 2046 client that
+# scanned, got `BluetoothDevice.address = "AA:BB:CC:DD:EE:FF"`, and then
+# called `getDevice`, `pair`, `connectProfile`, `readCharacteristic` or
+# anything else had no way to do it. That is a total break of the primary
+# use case, and it is fixed here by making the descriptor expose the
+# same opaque type the methods accept.
+#
+# The human-readable form is kept as a separate, non-authoritative
+# field, because a UI must show something and an address is what users
+# see. It is NOT an identifier: nothing accepts it, and a backend that
+# cannot determine a printable form (a device behind a resolving
+# identity address, a device whose MAC never left the controller) leaves
+# it empty rather than inventing one.
 struct BluetoothDevice {
-    # Device address (MAC or UUID, backend-resolved).
-    address @0 :Text;
+    # Opaque, backend-issued reference. This is what every method takes.
+    address @0 :T.DeviceAddress;
     name @1 :Text;
     alias @2 :Text;
     # Class of device (24-bit CoD). 0 if not available.
@@ -89,6 +108,11 @@ struct BluetoothDevice {
     bondedAt @17 :T.Timestamp;
     # When this device was last seen in a scan.
     lastSeenAt @18 :T.Timestamp;
+    # Printable form of the address (a MAC string where one exists).
+    # Display only: nothing accepts it, and a backend that cannot
+    # determine a printable form leaves it empty rather than inventing
+    # one.
+    addressText @19 :Text;
 }
 
 enum BleTransport {
@@ -454,8 +478,14 @@ struct GattCharacteristic {
     properties @2 :GattProperties;
     # Current value.
     value @3 :Data;
-    # Permissions bitfield (READ=1, WRITE=2).
-    permissions @4 :UInt8;
+    # Attribute permissions, as an open token list rather than a raw
+    # bitmask: the previous `permissions :UInt8` documented two of its
+    # bits ("READ=1, WRITE=2") and left the rest undefined, so no two
+    # backends agreed on what the field meant — and it read as an
+    # authority declaration when it is an ATT-layer hardware fact.
+    # Documented vocabulary: "read", "write", "notify", "indicate",
+    # "encryptRead", "encryptWrite", "authRead", "authWrite".
+    permissions @4 :List(Text);
     # Service this characteristic belongs to.
     serviceHandle @5 :UInt16;
     # Maximum value length.
@@ -466,7 +496,8 @@ struct GattDescriptor {
     handle @0 :UInt16;
     uuid @1 :BluetoothUuid;
     value @2 :Data;
-    permissions @3 :UInt8;
+    # Same open token vocabulary as GattCharacteristic.permissions.
+    permissions @3 :List(Text);
 }
 
 struct GattWriteRequest {
@@ -514,8 +545,8 @@ interface BluetoothService {
                         -> (devices :List(BluetoothDevice), totalCount :UInt32);
 
     # ── Device subscriptions ──
-    subscribeDevice @10 (address :T.DeviceAddress) -> (subscription :DeviceSubscription);
-    subscribeConnection @11 (address :T.DeviceAddress) -> (subscription :ConnectionSubscription);
+    subscribeDevice @10 (address :T.DeviceAddress) -> (subscription :BluetoothDeviceSubscription);
+    subscribeConnection @11 (address :T.DeviceAddress) -> (subscription :BluetoothConnectionSubscription);
 
     # ── Pairing ──
     pair @12 (address :T.DeviceAddress, config :PairingConfig) -> (subscription :BondSubscription);
@@ -532,8 +563,6 @@ interface BluetoothService {
     # ── GATT (LE) ──
     discoverServices @19 (address :T.DeviceAddress, pagination :T.Pagination)
                      -> (services :List(GattService), totalCount :UInt32);
-    discoverServicesFiltered @37 (address :T.DeviceAddress, filter :GattServiceFilter, pagination :T.Pagination)
-                             -> (services :List(GattService), totalCount :UInt32);
     getService @20 (address :T.DeviceAddress, serviceHandle :UInt16) -> (service :GattService);
     getCharacteristics @21 (address :T.DeviceAddress, serviceHandle :UInt16, pagination :T.Pagination)
                        -> (chars :List(GattCharacteristic), totalCount :UInt32);
@@ -552,15 +581,18 @@ interface BluetoothService {
     sendFile @29 (address :T.DeviceAddress, fileHandle :T.FileId) -> T.VoidResult;
 
     # ── State subscription ──
-    subscribeState @30 () -> (subscription :StateSubscription);
+    subscribeState @30 () -> (subscription :BluetoothStateSubscription);
 
     # ── Cancel all subscriptions ──
     cancelScan @31 (subscription :ScanSubscription) -> T.VoidResult;
-    cancelDevice @32 (subscription :DeviceSubscription) -> T.VoidResult;
-    cancelConnection @33 (subscription :ConnectionSubscription) -> T.VoidResult;
+    cancelDevice @32 (subscription :BluetoothDeviceSubscription) -> T.VoidResult;
+    cancelConnection @33 (subscription :BluetoothConnectionSubscription) -> T.VoidResult;
     cancelBond @34 (subscription :BondSubscription) -> T.VoidResult;
     cancelGatt @35 (subscription :GattSubscription) -> T.VoidResult;
-    cancelState @36 (subscription :StateSubscription) -> T.VoidResult;
+    cancelState @36 (subscription :BluetoothStateSubscription) -> T.VoidResult;
+
+    discoverServicesFiltered @37 (address :T.DeviceAddress, filter :GattServiceFilter, pagination :T.Pagination)
+                             -> (services :List(GattService), totalCount :UInt32);
 
     # ── Classic Audio Codec (A2DP) ──
     negotiateAudioCodec @38 (address :T.DeviceAddress, codecs :List(ClassicAudioCodec))
@@ -572,8 +604,12 @@ interface BluetoothService {
     # ── Bluetooth Mesh ──
     provisionMeshNode @40 (deviceAddress :T.DeviceAddress, provisionData :Data)
         -> (node :BluetoothMeshNode);
-    getMeshNode @41 (address :Text) -> (node :BluetoothMeshNode);
-    sendMeshMessage @42 (destination :Text, data :Data, appKeyId :Text) -> T.VoidResult;
+    # T.DeviceAddress, not Text. A mesh node is a device like any other,
+    # so it is addressed like every other device — the previous Text
+    # address here was a second, incompatible addressing scheme beside
+    # the typed one used by provisionMeshNode.
+    getMeshNode @41 (address :T.DeviceAddress) -> (node :BluetoothMeshNode);
+    sendMeshMessage @42 (destination :T.DeviceAddress, data :Data, appKeyId :Text) -> T.VoidResult;
 }
 
 struct ServiceUuidRssiFilter {
@@ -626,18 +662,18 @@ interface BondSubscription {
     cancel @1 () -> T.VoidResult;
 }
 
-interface StateSubscription {
+interface BluetoothStateSubscription {
     pull @0 () -> (state :BluetoothState);
     cancel @1 () -> T.VoidResult;
 }
 
-interface DeviceSubscription {
+interface BluetoothDeviceSubscription {
     pull @0 () -> (device :BluetoothDevice);
     cancel @1 () -> T.VoidResult;
 }
 
-interface ConnectionSubscription {
-    pull @0 () -> (event :ConnectionEvent);
+interface BluetoothConnectionSubscription {
+    pull @0 () -> (event :BluetoothConnectionEvent);
     cancel @1 () -> T.VoidResult;
 }
 
@@ -648,7 +684,7 @@ interface GattSubscription {
 
 # ── Events ──────────────────────────────────────────────────────────────
 
-struct ConnectionEvent {
+struct BluetoothConnectionEvent {
     address @0 :T.DeviceAddress;
     connected @1 :Bool;
     profile @2 :BluetoothProfile;

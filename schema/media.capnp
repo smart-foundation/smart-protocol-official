@@ -143,6 +143,15 @@ struct PlayerEvent {
         metadataChanged @1 :MediaMetadata;
         positionChanged @2 :T.Duration;
         volumeChanged @3 :Float32;
+        # Forward compatibility: a backend reporting a playback event the
+        # contract never named (a DRM licence change, a transport stall
+        # class, a new interpolation mode) must still be dispatchable
+        # rather than arriving as an unrecognisable union member with no
+        # data (TIMELESSNESS.md:98, DESIGN_PRINCIPLES "Forward
+        # compatibility"). Batch B found and deferred this gap; closed
+        # here so the file honours the convention every other event union
+        # in the tree already follows.
+        unknown @4 :T.UnknownEvent;
     }
 }
 

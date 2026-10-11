@@ -1,6 +1,7 @@
 @0xa1b2c3d4e5f60010;
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
 
 # ═══════════════════════════════════════════════════════════════════════
 # Audio - volume, devices, streams, focus, spatial, codecs, routing,
@@ -12,18 +13,25 @@ using T = import "types.capnp";
 #   - T.Pagination on listDevices/listStreams/listCodecs
 #   - cancel() on every subscription interface
 #   - T.Error in failure paths
+#
+# 2026-10-10 integration pass:
+#   - FocusEvent -> AudioFocusEvent, HealthStatus -> AudioHealth: three
+#     files each declared those names for different concepts.
+#     compositor.capnp's surface focus event is SurfaceFocusEvent and the
+#     canonical health struct is diagnostics.capnp's HealthStatus.
+#   - Every subscription's `pull` is bounded by `maxEvents`, and the
+#     convenience `pull*` methods on the root forward the bound. A device
+#     arrival burst used to be able to flood one message.
 #   - codec :Text -> T.CodecId typed
 #   - custom/other variants on all enums
 #   - Recording consent typology (RecordConsentRequest formalized)
 #   - SpatialProfile has typed ChannelMode
-#   - AudioSampleFormat union with custom variant
 #   - DuckPolicy gained duckKind union
 #
 # Audit-7 enhancements (zero-cost, info-density):
 #   - AudioEffect: parametric EQ, reverb, compressor, limiter, etc.
 #   - AudioPreset: user-facing audio profiles (flat, bass boost, etc.)
 #   - GlobalDuckPolicy: system-wide duck for incoming calls
-#   - Additional CodecFamily members (dsdiff, m4a, etc.)
 #   - AudioStream enhancements (bufferSize, underrunCount)
 #   - LoudnessEnhancer for accessibility
 #   - AudioMetering for real-time level monitoring
@@ -46,23 +54,27 @@ interface Audio {
     disableDevice @8 (device :T.AudioDeviceId) -> T.VoidResult;
 
     # -- Subscriptions --
-    subscribeState @9 () -> (subscription :StateSubscription);
-    pullState @10 (subscription :StateSubscription) -> (state :AudioState);
-    cancelState @11 (subscription :StateSubscription) -> T.VoidResult;
+    subscribeState @9 () -> (subscription :AudioStateSubscription);
+    pullState @10 (subscription :AudioStateSubscription, maxEvents :UInt32)
+                 -> (state :AudioState);
+    cancelState @11 (subscription :AudioStateSubscription) -> T.VoidResult;
 
     subscribeDevices @12 () -> (subscription :DevicesSubscription);
-    pullDevices @13 (subscription :DevicesSubscription) -> (devices :List(AudioDevice));
+    pullDevices @13 (subscription :DevicesSubscription, maxEvents :UInt32)
+                   -> (devices :List(AudioDevice));
     cancelDevices @14 (subscription :DevicesSubscription) -> T.VoidResult;
 
     subscribeStreams @15 () -> (subscription :StreamsSubscription);
-    pullStreams @16 (subscription :StreamsSubscription) -> (streams :List(AudioStream));
+    pullStreams @16 (subscription :StreamsSubscription, maxEvents :UInt32)
+                    -> (streams :List(AudioStream));
     cancelStreams @17 (subscription :StreamsSubscription) -> T.VoidResult;
 
     # -- Focus / priority --
     requestFocus @18 (request :FocusRequest) -> (focusId :T.AudioFocusId);
     releaseFocus @19 (focusId :T.AudioFocusId) -> T.VoidResult;
     subscribeFocus @20 () -> (subscription :FocusSubscription);
-    pullFocus @21 (subscription :FocusSubscription) -> (events :List(FocusEvent));
+    pullFocus @21 (subscription :FocusSubscription, maxEvents :UInt32)
+                  -> (events :List(AudioFocusEvent));
     cancelFocus @22 (subscription :FocusSubscription) -> T.VoidResult;
 
     # -- Spatial --
@@ -78,7 +90,8 @@ interface Audio {
     listCodecs @28 (pagination :T.Pagination) -> (codecs :List(AudioCodec), totalCount :UInt32);
     negotiateCodec @29 (streamId :T.AudioStreamId, codec :T.CodecId) -> (result :NegotiationResult);
     subscribeCodecs @30 () -> (subscription :CodecSubscription);
-    pullCodecs @31 (subscription :CodecSubscription) -> (codecs :List(AudioCodec));
+    pullCodecs @31 (subscription :CodecSubscription, maxEvents :UInt32)
+                   -> (codecs :List(AudioCodec));
     cancelCodecs @32 (subscription :CodecSubscription) -> T.VoidResult;
 
     # -- Routing --
@@ -115,7 +128,7 @@ interface Audio {
     setSessionRouting @53 (sessionId :Text, routing :CrossDeviceRouting) -> T.VoidResult;
 
     # -- Audit-9: Typed transport query --
-    getAudioTransport @54 (device :T.AudioDeviceId) -> (transport :AudioTransport);
+    getAudioTransport @54 (device :T.AudioDeviceId) -> (transport :Text);
 
     # -- Audit-9: Typed channel layouts --
     listChannelLayouts @55 (device :T.AudioDeviceId) -> (layouts :List(ChannelLayout));
@@ -149,7 +162,8 @@ interface Audio {
     getStreamAnalysis @67 (streamId :T.AudioStreamId) -> (analysis :AudioAnalysis);
     getDeviceAnalysis @68 (device :T.AudioDeviceId) -> (analysis :AudioAnalysis);
     subscribeAnalysis @69 (streamId :T.AudioStreamId) -> (subscription :AnalysisSubscription);
-    pullAnalysis @70 (subscription :AnalysisSubscription) -> (analysis :AudioAnalysis);
+    pullAnalysis @70 (subscription :AnalysisSubscription, maxEvents :UInt32)
+                     -> (analysis :AudioAnalysis);
     cancelAnalysis @71 (subscription :AnalysisSubscription) -> T.VoidResult;
 
     # -- Privacy Controls (microphone firewall) --
@@ -175,13 +189,14 @@ interface Audio {
 
     # -- Transport Abstraction --
     listTransports @87 () -> (transports :List(AudioTransportInfo));
-    getTransportInfo @88 (transport :AudioTransport) -> (info :AudioTransportInfo);
+    getTransportInfo @88 (transport :Text) -> (info :AudioTransportInfo);
     setTransportPriorities @89 (priorities :List(TransportPriority)) -> T.VoidResult;
 
     # -- Device Health & Hot-Plug --
     getDeviceHealth @90 (device :T.AudioDeviceId) -> (health :DeviceHealth);
     subscribeDeviceHealth @91 () -> (subscription :DeviceHealthSubscription);
-    pullDeviceHealth @92 (subscription :DeviceHealthSubscription) -> (events :List(DeviceHealthEvent));
+    pullDeviceHealth @92 (subscription :DeviceHealthSubscription, maxEvents :UInt32)
+                        -> (events :List(DeviceHealthEvent));
     cancelDeviceHealth @93 (subscription :DeviceHealthSubscription) -> T.VoidResult;
 
     # -- Multi-Zone Audio (spatial zones) --
@@ -190,26 +205,60 @@ interface Audio {
     listAudioZones @96 () -> (zones :List(AudioZone));
     setZoneRoute @97 (zoneId :Text, route :AudioRoute) -> T.VoidResult;
     setZoneVolume @98 (zoneId :Text, volume :Float32) -> T.VoidResult;
+
+    # -- Driver framework entry point --
+    # An audio driver is a capability acquired once. Everything the
+    # provider can do — set the system volume, route a stream, mute the
+    # device, revoke another app's microphone consent, disable hearing
+    # protection — is reachable by anyone merely holding this `Audio`
+    # reference, which is why it was never safe to hand out. Gating the
+    # whole privileged surface behind one accessor follows ai.capnp:578-
+    # 584: ungated discovery above stays open so a caller can learn what
+    # exists before it holds any authority.
+    # Returns the provider directly, exactly as ai.capnp:578-584 does. A
+    # backend that refuses the capability fails the call; there is no
+    # per-method token and no wrapper to hold a second authority for the
+    # same outcome.
+    openDriver @99 (authority :Capability) -> (provider :AudioProvider);
 }
 
-interface StateSubscription {
-    pull @0 () -> (state :AudioState);
+interface AudioStateSubscription {
+    # Bounded by the caller, so a state flip-flop (a volume slider dragged
+    # while a device connects) cannot flood one message. ai.capnp's own
+    # `AISubscription.pull (maxEvents)` discipline.
+    pull @0 (maxEvents :UInt32) -> (state :AudioState);
     cancel @1 () -> T.VoidResult;
 }
 interface DevicesSubscription {
-    pull @0 () -> (devices :List(AudioDevice));
+    # The caller states how many it will take, so a device arrival burst or a
+    # focus flip-flop cannot flood one message (ai.capnp's own
+    # `AISubscription.pull (maxEvents)` discipline). An unstated bound used to
+    # let a producer outrun its consumer.
+    pull @0 (maxEvents :UInt32) -> (devices :List(AudioDevice));
     cancel @1 () -> T.VoidResult;
 }
 interface StreamsSubscription {
-    pull @0 () -> (streams :List(AudioStream));
+    # The caller states how many it will take, so a device arrival burst or a
+    # focus flip-flop cannot flood one message (ai.capnp's own
+    # `AISubscription.pull (maxEvents)` discipline). An unstated bound used to
+    # let a producer outrun its consumer.
+    pull @0 (maxEvents :UInt32) -> (streams :List(AudioStream));
     cancel @1 () -> T.VoidResult;
 }
 interface FocusSubscription {
-    pull @0 () -> (events :List(FocusEvent));
+    # The caller states how many it will take, so a device arrival burst or a
+    # focus flip-flop cannot flood one message (ai.capnp's own
+    # `AISubscription.pull (maxEvents)` discipline). An unstated bound used to
+    # let a producer outrun its consumer.
+    pull @0 (maxEvents :UInt32) -> (events :List(AudioFocusEvent));
     cancel @1 () -> T.VoidResult;
 }
 interface CodecSubscription {
-    pull @0 () -> (codecs :List(AudioCodec));
+    # The caller states how many it will take, so a device arrival burst or a
+    # focus flip-flop cannot flood one message (ai.capnp's own
+    # `AISubscription.pull (maxEvents)` discipline). An unstated bound used to
+    # let a producer outrun its consumer.
+    pull @0 (maxEvents :UInt32) -> (codecs :List(AudioCodec));
     cancel @1 () -> T.VoidResult;
 }
 
@@ -282,7 +331,8 @@ struct AudioStream {
     suppressed @12 :Bool;
     owner @13 :T.AppId;
     startedAt @14 :T.Timestamp;
-    containerFormat @15 :AudioContainerFormat;
+    # Open container media type (e.g. "audio/ogg") — see the codec note above.
+    containerFormat @15 :T.MimeType;
     # Audit-7 additions:
     # Buffer size in bytes.
     bufferSize @16 :UInt32;
@@ -306,6 +356,12 @@ enum AudioStreamType {
     custom @6;
 }
 
+# What the stream is FOR. Not a set of stream *flags*: `duckable`
+# (removed) is the same decision as FocusRequest.duckable, and
+# `emergency` (removed) is a lifecycle flag, not a usage — each was a
+# second authority for a fact the contract already carries somewhere
+# else, and two authorities that can disagree is the failure
+# DESIGN_PRINCIPLES.md:394 exists to prevent.
 enum StreamRole {
     media @0;
     music @1;
@@ -318,40 +374,22 @@ enum StreamRole {
     ringtone @8;
     accessibility @9;
     system @10;
-    duckable @11;
-    emergency @12;
-    custom @13;
+    custom @11;
 }
 
+# ── Sample format ──────────────────────────────────────────────────────
+# T.PcmFormat (types.capnp:1732) is the one PCM vocabulary in the
+# protocol: rate, channels, bits, float/int, endianness, signedness.
+#
+# The local 19-value AudioSampleFormat modelled the same quantity while
+# encoding endianness TWICE — once in the enum (s16LE @1) and once in a
+# sibling Bool (littleEndian @1) with no rule for which wins when they
+# disagree — omitted isUnsigned entirely, and had no analogue for
+# s24Pack. Two models of one fact, disagreeing, in one file.
 struct AudioFormat {
-    sampleFormat @0 :AudioSampleFormat;
-    littleEndian @1 :Bool;
-    channelLayout @2 :Text;
-    bitRate @3 :UInt32;
-    # Backend-decided bit-depth.
-    bitDepth @4 :UInt8;
-}
-
-enum AudioSampleFormat {
-    s16 @0;
-    s16LE @1;
-    s16BE @2;
-    s24 @3;
-    s24LE @4;
-    s24BE @5;
-    s24Pack @6;
-    s32 @7;
-    s32LE @8;
-    s32BE @9;
-    float32 @10;
-    float32LE @11;
-    float32BE @12;
-    float64 @13;
-    float64LE @14;
-    float64BE @15;
-    ulaw @16;
-    alaw @17;
-    custom @18;
+    sampleFormat @0 :T.AudioSampleFormat;
+    channelLayout @1 :ChannelLayout;
+    bitRate @2 :UInt32;
 }
 
 struct FocusRequest {
@@ -366,7 +404,7 @@ struct FocusRequest {
     appId @6 :T.AppId;
 }
 
-struct FocusEvent {
+struct AudioFocusEvent {
     timestamp @0 :T.Timestamp;
     union {
         granted @1 :FocusGrant;
@@ -605,72 +643,35 @@ struct AudioMetering {
 
 # ── Codec ─────────────────────────────────────────────────────────────
 
+# ── Codec and container ────────────────────────────────────────────────
+# CodecFamily was a 32-value enum naming eleven vendor products
+# (aptx = Qualcomm, ldac = Sony, mqa, dsd, wma, atrac ...) and it grew
+# by three in Audit-7 alone — proof it is closed by release schedules,
+# not by mathematics. AudioContainerFormat was 18 values of the same
+# class. Both are now T.MimeType.
+#
+# The 2046 test, stated plainly: a codec invented next year must either
+# add an ordinal to an eternal schema, or be reported as `custom @31` —
+# a bare ordinal that carries no semantics — and every consumer doing
+# `family == CodecFamily.opus` loses the comparison. The information was
+# never in the enum anyway: T.MimeType plus AudioCodec's numeric
+# sample-rate / bit-rate / channel fields is the same data, openly
+# spelled (ai.capnp:24-26 does exactly this substitution).
+#
+# Cost, stated plainly: a consumer can no longer `switch (family)`. It
+# could only switch over this decade's codecs anyway, and MIME subtype
+# comparison is the same operation.
 struct AudioCodec {
     id @0 :T.CodecId;
-    family @1 :CodecFamily;
+    # Open media type — e.g. "audio/opus", "audio/mp4", "audio/x-dsd".
+    family @1 :T.MimeType;
     supportedSampleRates @2 :List(UInt32);
     supportedBitRates @3 :List(UInt32);
     supportedChannels @4 :UInt32;
     hw @5 :Bool;
     lowLatency @6 :Bool;
-    supportedContainers @7 :List(AudioContainerFormat);
-}
-
-enum CodecFamily {
-    pcm @0;
-    opus @1;
-    aac @2;
-    flac @3;
-    vorbis @4;
-    mp3 @5;
-    alac @6;
-    wav @7;
-    dolby @8;
-    dts @9;
-    wma @10;
-    speex @11;
-    amr @12;
-    aptx @13;
-    ldac @14;
-    lc3 @15;
-    sbc @16;
-    ac3 @17;
-    eac3 @18;
-    atrac @19;
-    musepack @20;
-    ape @21;
-    wavpack @22;
-    tta @23;
-    tak @24;
-    mlpa @25;
-    dsd @26;
-    mqa @27;
-    # Audit-7 additions:
-    dsdiff @28;     # DSDIFF (DSD Wide)
-    m4a @29;        # M4A (AAC in MPEG-4)
-    opusHead @30;   # Opus with Ogg headroom
-    custom @31;
-}
-
-enum AudioContainerFormat {
-    m4a @0;
-    mp4 @1;
-    mkv @2;
-    webm @3;
-    ogg @4;
-    flac @5;
-    wav @6;
-    avi @7;
-    mov @8;
-    threegp @9;
-    asf @10;
-    caf @11;
-    dsf @12;
-    dff @13;
-    aiff @14;
-    au @15;
-    raw @16;
-    custom @17;
+    # Open container media types — e.g. "audio/ogg", "video/mp4".
+    supportedContainers @7 :List(T.MimeType);
 }
 
 struct AudioRoute {
@@ -754,28 +755,31 @@ enum LatencyMode {
 }
 
 # ── Audit-9: Audio Transport ────────────────────────────────────────────
-# Typed transport enumeration for AudioDevice.transport. Replaces bare
-# Text to enable structured transport identification and routing.
-enum AudioTransport {
-    usb @0;
-    pcm @1;
-    bluetoothA2dp @2;
-    bluetoothHfp @3;
-    hdmi @4;
-    spdif @5;
-    network @6;
-    virtual @7;
-    pulseAudio @8;
-    alsa @9;
-    jack @10;
-    pipewire @11;
-    other @12;
-    custom @13;
-}
+# OPEN TOKEN, was an enum naming this decade's audio *servers*
+# (pulseAudio, alsa, jack, pipewire) beside the transports.
+#
+# A sound server is an implementation, not a transport: TIMELESSNESS.md:25
+# rejects "Open PulseAudio stream" as implementation detail, and the
+# doctrine's own PipeWire→Rust-server swap test (DESIGN_PRINCIPLES.md:454)
+# cites this file as its example. Naming the backends inside the contract
+# makes that swap fail on the file that is supposed to prove it works, and
+# it leaves a network-audio or embedded backend with no name to report
+# except `custom @13`, which carries no semantics.
+#
+# The transport is therefore a backend-declared open token. Documented
+# vocabulary (not exhaustive, not checked):
+#   "usb", "pcm", "bluetooth-a2dp", "bluetooth-hfp", "hdmi", "spdif",
+#   "network", "virtual", "builtin"
+# An unrecognised token is ignored, never rejected (ai.capnp:43-47).
 
 # ── Audit-9: Channel Layout ─────────────────────────────────────────────
-# Typed channel layout enumeration. Replaces bare Text on
-# AudioFormat.channelLayout and AudioDevice.channelLayouts.
+# Kept as a typed enum. Unlike transport, a channel layout is a
+# property of the audio content that a consumer must interpret
+# numerically (which speaker is sample 4?), so the value set is closed
+# by the geometry of the reproduction — a 7.1.4 or ambisonic layout
+# needs an ordinal, but `other`/`custom` cover a backend-private
+# arrangement, and the alternative (parsing free text) is how the
+# previous revision shipped four untyped spellings of the same fact.
 enum ChannelLayout {
     mono @0;
     stereo @1;
@@ -830,6 +834,12 @@ struct HrtfData {
 # from the audio service and pushes them to its hardware. Replace
 # the backend (Hound, ALSA, PipeWire, symphonia...) without
 # recompiling consumers.
+#
+# REACHABILITY: this interface — and AudioDriverStream below it — were
+# returned by no method anywhere in the protocol, so the entire driver
+# half of this file was uncallable contract. The entry point is
+# `Audio.openDriver` on interface Audio above; nothing else needs to
+# know a driver exists.
 # ═══════════════════════════════════════════════════════════════════════
 
 interface AudioProvider {
@@ -838,12 +848,32 @@ interface AudioProvider {
     # Open an output or input stream. The driver decides how to
     # acknowledge completion (immediate, async, polled).
     openStream @1 (config :StreamConfig, direction :StreamDirection)
-        -> (stream :AudioStream);
-    # Close a stream.
-    closeStream @2 (streamId :UInt64) -> (result :T.VoidResult);
+        -> (stream :AudioDriverStream,
+           negotiatedFormat :T.AudioSampleFormat,
+           negotiatedLayout :ChannelLayout,
+           framesPerBuffer :UInt32);
+    # Close a stream. T.AudioStreamId, not a bare UInt64: the file's
+    # own header records that every stream id was promoted off UInt64,
+    # and this one was missed — so a caller holding an `AudioStream`
+    # had two spellings to choose between and no rule.
+    closeStream @2 (streamId :T.AudioStreamId) -> (result :T.VoidResult);
     # Driver-defined health ping.
     ping @3 () -> (health :T.DriverHealth);
 }
+
+# What openStream agrees to is returned as named results, because the
+# negotiated format is part of the contract and not an implementation
+# detail: the previous revision's comment said "Framing is
+# implementation-defined; consumer uses the negotiated sampleFormat"
+# while openStream returned no negotiation outcome at all — so the frame
+# boundary and the sample format were never agreed, and two
+# independently written drivers could not interoperate without being
+# tested against each other by hand.
+#
+#   negotiatedFormat  the format the driver actually opened at, which is
+#                     the only format the submit path will accept
+#   negotiatedLayout  the channel layout at that format
+#   framesPerBuffer   frames per submit
 
 struct AudioProviderCaps {
     # Sample rates in Hz this provider natively supports.
@@ -871,7 +901,7 @@ enum LatencyClass {
 
 struct StreamConfig {
     sampleFormat @0 :T.AudioSampleFormat;
-    channelLayout @1 :Text;
+    channelLayout @1 :ChannelLayout;
     # Engagement profile — does this stream need ultra-low latency?
     latencyClass @2 :LatencyClass;
     # Suggested buffer duration in ms (driver may ignore).
@@ -887,9 +917,22 @@ enum StreamDirection {
 
 interface AudioDriverStream {
     # Submit a buffer of decoded frames for playback, or read
-    # captured frames. Framing is implementation-defined; consumer
-    # uses the negotiated sampleFormat.
-    submit @0 (frames :Data) -> (result :T.VoidResult);
+    # captured frames.
+    #
+    # T.DataHandle, not inline `Data`. This is the driver boundary and
+    # the hottest path in the file: 48 kHz stereo s16 is 192 KB/s per
+    # stream, so a 10 ms buffer is 1,920 bytes submitted 100 times a
+    # second per stream — and every inline submit copies its payload
+    # into the message arena and then again into the driver's ring. On
+    # N streams that is the dominant CPU cost of audio playback and
+    # therefore the dominant idle-power cost on a battery device.
+    # T.DataHandle's `inline` variant still covers sub-1 KB frames
+    # cheaply, so the small case does not regress (ai.capnp:74-75;
+    # this file's own HrtfData.impulseData already does this).
+    #
+    # Framing is fixed by AudioDriverOpenInfo.framesPerBuffer at the
+    # negotiated format — see the note on openStream.
+    submit @0 (frames :T.DataHandle) -> (result :T.VoidResult);
     drain @1 () -> (result :T.VoidResult);
     # Pause/resume without closing.
     pause @2 () -> (result :T.VoidResult);
@@ -973,7 +1016,11 @@ struct AudioAnalysis {
 }
 
 interface AnalysisSubscription {
-    pull @0 () -> (analysis :AudioAnalysis);
+    # The caller states how many it will take, so a device arrival burst or a
+    # focus flip-flop cannot flood one message (ai.capnp's own
+    # `AISubscription.pull (maxEvents)` discipline). An unstated bound used to
+    # let a producer outrun its consumer.
+    pull @0 (maxEvents :UInt32) -> (analysis :AudioAnalysis);
     cancel @1 () -> T.VoidResult;
 }
 
@@ -1027,6 +1074,21 @@ struct MicAccessEntry {
     access @1 :MicAccess;
 }
 
+# Microphone firewall policy.
+#
+# The previous shape carried `blockedApps`/`trustedApps` — app allow and
+# deny lists. Those are permission strings, which
+# DESIGN_PRINCIPLES.md:399 forbids outright ("The capability system IS
+# the access control mechanism"), and they are also the wrong shape:
+# an allow-list has to name every app that may ever use the microphone,
+# so a 2046 backend must either invent app-id-to-capability mapping
+# rules or ship a list that grants everything by omission.
+#
+# Authority is expressed once, at acquisition: `requestMicAccess`
+# returns a MicAccessEntry that holds the granted capability
+# reference, and `revokeMicAccess` revokes it. There is no list of
+# names to keep in sync, and no second authority path for the same
+# decision.
 struct MicPolicy {
     # Default policy for new apps.
     defaultGrant @0 :MicGrantPolicy;
@@ -1034,10 +1096,8 @@ struct MicPolicy {
     showIndicator @1 :Bool = true;
     # Whether to log all mic access.
     auditLog @2 :Bool = true;
-    # Apps that are always denied.
-    blockedApps @3 :List(T.AppId);
-    # Apps that are always allowed.
-    trustedApps @4 :List(T.AppId);
+    # Open metadata for backends that need to carry extra policy.
+    properties @3 :T.StringMap;
 }
 
 enum MicGrantPolicy {
@@ -1167,7 +1227,8 @@ struct ActiveRoute {
 # Abstract audio transport layer.
 
 struct AudioTransportInfo {
-    transport @0 :AudioTransport;
+    # Open backend-declared transport token — see the transport note above.
+    transport @0 :Text;
     name @1 :Text;
     # Maximum channels supported.
     maxChannels @2 :UInt32;
@@ -1183,7 +1244,8 @@ struct AudioTransportInfo {
 }
 
 struct TransportPriority {
-    transport @0 :AudioTransport;
+    # Open backend-declared transport token — see the transport note above.
+    transport @0 :Text;
     # Priority (higher = preferred).
     priority @1 :Int32;
 }
@@ -1194,7 +1256,7 @@ struct TransportPriority {
 struct DeviceHealth {
     device @0 :T.AudioDeviceId;
     # Overall health status.
-    status @1 :HealthStatus;
+    status @1 :AudioHealth;
     # Temperature (millidegrees Celsius, null if unknown).
     temperature @2 :Int32;
     # Bit error rate (0-100%, null if unknown).
@@ -1209,7 +1271,7 @@ struct DeviceHealth {
     checkedAt @7 :T.Timestamp;
 }
 
-enum HealthStatus {
+enum AudioHealth {
     healthy @0;
     degraded @1;
     failing @2;
@@ -1218,7 +1280,11 @@ enum HealthStatus {
 }
 
 interface DeviceHealthSubscription {
-    pull @0 () -> (events :List(DeviceHealthEvent));
+    # The caller states how many it will take, so a device arrival burst or a
+    # focus flip-flop cannot flood one message (ai.capnp's own
+    # `AISubscription.pull (maxEvents)` discipline). An unstated bound used to
+    # let a producer outrun its consumer.
+    pull @0 (maxEvents :UInt32) -> (events :List(DeviceHealthEvent));
     cancel @1 () -> T.VoidResult;
 }
 

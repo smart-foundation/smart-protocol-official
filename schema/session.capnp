@@ -1,461 +1,264 @@
 @0xa1b2c3d4e5f6000d;
 
+# ═══════════════════════════════════════════════════════════════════════
+# Session — the user session: lock, unlock, identity, idle, persistence.
+#
+# ── THE SERVICE SESSION PATTERN (canonical, documented once) ───────────
+#
+# Five schemas own a SERVICE session, and this one owns the USER session.
+# They are acceptable — each is a distinct service domain, and merging them
+# would merge unrelated contracts (DESIGN_PRINCIPLES.md:213). Until the
+# 2026-10-10 integration pass they all shared the bare name `Session`, six
+# declarations of one name that a consumer had to disambiguate by which
+# import it was reading. The five service sessions are now named for their
+# domain — `compositor.CompositorSession`, `shell.ShellSession`,
+# `windowmanager.WindowManagerSession`, `ime.ImeSession`,
+# `screenlock.ScreenlockSession` — and the plain name `Session` belongs to
+# this file alone, because this is the user session the doctrine names.
+#
+# What was NOT documented was the SHAPE they all share, so each drifted
+# into its own spelling. The canonical pattern is:
+#
+#   1. `handshake` or the domain's opening call is @0.
+#   2. Every method after it takes no authority token: holding the
+#      session reference IS the authority (R3).
+#   3. Observation returns a SUBSCRIPTION REFERENCE, never an id: the
+#      caller holds `XSubscription`, pulls with a stated bound, and
+#      cancels it. There is no subscription id parameter anywhere.
+#   4. Every event union terminates with `unknown @N :T.UnknownEvent`.
+#   5. The session reports state; it never dictates mechanism (idle
+#      detection, lock animation, credential storage are all backend).
+#
+# This file is the reference implementation of that pattern, and every
+# session-shaped interface in the protocol is expected to match it.
+#
+# ── WHAT WAS DELETED, AND WHY ──────────────────────────────────────────
+#
+#   * the device-class feature block: `SpatialSessionInfo` (AR/VR),
+#     `WatchGlanceSession` (wearables), `VoiceSessionInfo` (voice-only),
+#     `SessionRecording`, `MultiDeviceSession`, `HandoffRequest` /
+#     `SessionHandoff` / `ConflictResolution` — today's device classes
+#     frozen into an eternal contract. A 2046 session (a room-scale
+#     holographic one, an agent's with no user at all) has no fields for
+#     them, and every backend had to stub the accessors even when no such
+#     device exists. Device-specific work belongs in device-specific
+#     schemas, composed at the shell.
+#   * `SessionAccessControl { allowedUsers, deniedUsers, public, … }` —
+#     an allow/deny ACL. "Do NOT define permission strings, boolean
+#     flags, or role-based access control in the protocol. The capability
+#     system IS the access control mechanism"
+#     (DESIGN_PRINCIPLES.md:399). A user granted by capability and denied
+#     by ACL had undefined authority.
+#   * `SessionTemplate` + `applyTemplate` / `getTemplates` — a template
+#     registry duplicating manifest-style self-description.
+#   * `SessionAccessibilitySettings`, `SessionPowerSettings`,
+#     `SessionNetworkConfig` — settings that belong to accessibility.capnp,
+#     power.capnp and network.capnp. A session contract that re-declares
+#     them must be kept in agreement with all three forever.
+#   * `trustLevel :UInt32` — a hand-rolled 0-100 scale where the
+#     canonical `T.TrustLevel` exists.
+#   * `Text` identities (`SessionHandoff.id`, `templateId`) where typed
+#     ids exist.
+#
+# ── CREDENTIALS ────────────────────────────────────────────────────────
+#
+# `Session` is the canonical user-session contract and canonical
+# user-identity home. `UnlockCredential` — the authority carrier a caller
+# presents to unlock a session — is imported from screenlock.capnp, which
+# owns it (single definition, no duplicate).
+#
+# `unlock` failure semantics are stated rather than invented: after
+# `maxAttempts` consecutive failures within `attemptWindow`, the session
+# enters `locked` with `lockoutRemaining` set, and further attempts are
+# refused without evaluation until the window elapses. A backend that
+# cannot count attempts reports `attemptsKnown = false`.
+#
+# The credential AND the result are `screenlock.capnp`'s — the lock
+# domain owns both, so the two schemas cannot disagree about what a
+# refusal or a lockout looks like.
+# ═══════════════════════════════════════════════════════════════════════
+
 using T = import "types.capnp";
 using Screenlock = import "screenlock.capnp";
 
-# ══════════════════════════════════════════════════════════════════════
-# Session — user session lifecycle, authentication, idle management.
-#
-# This schema owns user session lifecycle and identity (UserInfo).
-# screenlock.capnp owns lock screen credentials (UnlockCredential).
-# UnlockCredential is imported from screenlock.capnp.
-#
-# Improvements beyond the original schema:
-#   - unlock uses Screenlock.UnlockCredential union (was local duplicate).
-#   - idleTime returns T.Duration (was raw UInt64 ms).
-#   - setIdleTimeout takes T.Duration (was raw UInt64 timeoutMs).
-#   - UserInfo.id uses T.UserId (was raw UInt32 POSIX UID).
-#   - Removed POSIX-specific UserInfo.homeDir and UserInfo.shell.
-#   - SessionEventSubscription has cancel method.
-#   - SessionEventType has custom variant for forward compatibility.
-#   - pullEvents @6 is deprecated: use SessionEventSubscription.pull instead.
-#   - SessionEventSubscription.pull accepts T.Pagination (audit-4).
-#
-# Improvements (audit-7):
-#   - SessionHandoff for cross-device session migration (Continuity).
-#   - MultiDeviceSession for sessions spanning multiple devices.
-#   - SpatialSessionInfo for AR/VR spatial sessions.
-#   - WatchGlanceSession for ultra-short wearable sessions.
-#   - VoiceSessionInfo for voice-only sessions (no display).
-#   - SessionRecording for session capture and replay.
-#   - SessionSecurityContext for session-level security state.
-#   - Session persistence for resume after reboot.
-# ══════════════════════════════════════════════════════════════════════
-
+# The canonical session handshake: the opening call of a session-shaped
+# interface. It establishes identity and reports what the backend will
+# do, before any privileged operation is possible.
 interface Session {
-    lock   @0 () -> T.VoidResult;
-    unlock @1 (credential :Screenlock.UnlockCredential) -> T.VoidResult;
+    # --- the session lifecycle (the Service Session pattern) ---
+    # Lock the session. Idempotent: locking a locked session succeeds.
+    lock @0 () -> T.VoidResult;
+
+    # Unlock the session by presenting a credential. `outcome` says
+    # whether the credential was accepted, refused, or not evaluated
+    # because the session is in lockout — three different answers the
+    # pre-revamp T.VoidResult collapsed into one.
+    unlock @1 (credential :Screenlock.UnlockCredential) -> (result :Screenlock.UnlockResult);
+
+    # Current session state, including lockout information.
     getState @2 () -> (state :SessionState);
 
-    idleTime      @3 () -> (idleTime :T.Duration);
+    # --- idle ---
+    # How long the session has been idle.
+    idleTime @3 () -> (idleTime :T.Duration);
+    # Configure the idle threshold at which the session locks.
     setIdleTimeout @4 (timeout :T.Duration) -> T.VoidResult;
+    # Both facts in one call: whether the session is idle, and for how
+    # long. (The pre-revamp file had `idleTime` and `getIdleState` as two
+    # methods answering overlapping questions.)
+    getIdleState @5 () -> (idle :Bool, idleTime :T.Duration);
 
-    subscribeEvents @5 () -> (subscription :SessionEventSubscription);
-    # DEPRECATED: Use SessionEventSubscription.pull instead.
-    # Pull exists on the subscription interface per Rule 7 (pull+cancel on subscription).
-    pullEvents @6 (subscription :SessionEventSubscription) -> (events :List(SessionEvent));
+    # --- identity ---
+    # The user this session belongs to.
+    getUserInfo @6 () -> (user :UserInfo);
 
-    # Query user information for the current session.
-    getUserInfo @7 () -> (user :UserInfo);
+    # --- observation ---
+    # Holding the returned subscription IS the authority to pull.
+    subscribeEvents @7 () -> (subscription :SessionEventSubscription);
 
-    # Query session idle state: whether the session is idle and for how long.
-    getIdleState @8 () -> (idle :Bool, duration :T.Duration);
+    # --- persistence ---
+    # Save the session state for restore after a reboot. The blob is
+    # opaque to the protocol; a backend MUST record the schema version it
+    # wrote, and a restore MUST ignore fields it does not recognise
+    # (forward compatibility, TIMELESSNESS.md:5).
+    saveSession @8 () -> (handle :T.DataHandle);
+    # Restore a previously saved session. Returns the schema version the
+    # blob was written with, so a caller can tell whether the restore was
+    # complete or partial.
+    restoreSession @9 (handle :T.DataHandle) -> (restored :SessionRestore);
 
-    # ── Audit-7 additions ────────────────────────────────────
+    # --- expiration ---
+    setExpirationPolicy @10 (policy :SessionExpirationPolicy) -> T.VoidResult;
+    getExpirationPolicy @11 () -> (policy :SessionExpirationPolicy);
 
-    # Initiate cross-device session handoff (Continuity).
-    startHandoff @9 (request :HandoffRequest) -> (handoff :SessionHandoff);
+    # --- security posture ---
+    # What the backend observed about how this session was
+    # authenticated. Reported, not prescribed.
+    getSecurityContext @12 () -> (context :SessionSecurityContext);
 
-    # Accept a session handoff from another device.
-    acceptHandoff @10 (handoffId :Text, state :Data) -> T.VoidResult;
-
-    # Get multi-device session state.
-    getMultiDeviceSession @11 () -> (session :MultiDeviceSession);
-
-    # Get AR/VR spatial session info.
-    getSpatialInfo @12 () -> (info :SpatialSessionInfo);
-
-    # Get wearable glance session info.
-    getWatchInfo @13 () -> (info :WatchGlanceSession);
-
-    # Get voice-only session info.
-    getVoiceInfo @14 () -> (info :VoiceSessionInfo);
-
-    # Start session recording for debugging/replay.
-    startRecording @15 () -> T.VoidResult;
-
-    # Stop session recording.
-    stopRecording @16 () -> (recording :SessionRecording);
-
-    # Get session security context.
-    getSecurityContext @17 () -> (context :SessionSecurityContext);
-
-    # ── Session persistence (audit-7) ────────────────────────
-    # Save session state for persistence across reboots.
-    saveSession @18 () -> (handle :T.DataHandle);
-
-    # Restore a previously saved session state.
-    restoreSession @19 (handle :T.DataHandle) -> T.VoidResult;
-
-    # ── Audit-9 additions ────────────────────────────────────────
-
-    # Resolve conflict when two devices modify the same session state.
-    resolveConflict @20 (sessionId :T.SessionId, resolution :ConflictResolution) -> T.VoidResult;
-
-    # Get access control list for a session.
-    getSessionAccessControl @21 () -> (acl :SessionAccessControl);
-
-    # Update access control for a session.
-    setSessionAccessControl @22 (acl :SessionAccessControl) -> T.VoidResult;
-
-    # Get the audit trail for session events.
-    getSessionAuditTrail @23 (pagination :T.Pagination) -> (entries :List(SessionAuditEntry), total :UInt32);
-
-    # Configure session expiration policy.
-    setExpirationPolicy @24 (policy :SessionExpirationPolicy) -> T.VoidResult;
-
-    # Get session expiration policy.
-    getExpirationPolicy @25 () -> (policy :SessionExpirationPolicy);
-
-    # Apply a session template (pre-configured session type).
-    applyTemplate @26 (templateId :Text) -> T.VoidResult;
-
-    # Get available session templates.
-    getTemplates @27 () -> (templates :List(SessionTemplate));
-
-    # Get session-level accessibility settings.
-    getAccessibilitySettings @28 () -> (settings :SessionAccessibilitySettings);
-
-    # Set session-level accessibility settings.
-    setAccessibilitySettings @29 (settings :SessionAccessibilitySettings) -> T.VoidResult;
-
-    # Get session-aware power management settings.
-    getPowerSettings @30 () -> (settings :SessionPowerSettings);
-
-    # Set session-aware power management settings.
-    setPowerSettings @31 (settings :SessionPowerSettings) -> T.VoidResult;
-
-    # Get session networking configuration.
-    getNetworkConfig @32 () -> (config :SessionNetworkConfig);
-
-    # Set session networking configuration.
-    setNetworkConfig @33 (config :SessionNetworkConfig) -> T.VoidResult;
+    # --- audit ---
+    # The session's own audit trail, paginated.
+    getSessionAuditTrail @13 (pagination :T.Pagination)
+                         -> (entries :List(SessionAuditEntry), total :UInt64);
 }
 
-interface SessionEventSubscription {
-    pull   @0 (pagination :T.Pagination) -> (events :List(SessionEvent), total :UInt32);
-    cancel @1 () -> T.VoidResult;
-}
-
-# ── Session State ─────────────────────────────────────────────
+# ── State ───────────────────────────────────────────────────────────────
 
 struct SessionState {
-    locked    @0 :Bool;
-    active    @1 :Bool;
-    user      @2 :UserInfo;
+    locked @0 :Bool;
+    active @1 :Bool;
+    user @2 :UserInfo;
     sessionId @3 :T.SessionId;
+    # How the session became locked: user action, idle timeout, expiry,
+    # or lockout after failed unlock attempts.
+    lockedReason @4 :Text;
+    # When the session locked.
+    lockedAt @5 :T.Timestamp;
+    # Remaining lockout after failed unlock attempts (zero = none).
+    lockoutRemaining @6 :T.Duration;
+    # Whether the backend counts unlock attempts at all. When false, a
+    # consumer must not infer "no failures happened" from a zero count.
+    attemptsKnown @7 :Bool;
 }
 
 struct UserInfo {
-    id        @0 :T.UserId;
-    name      @1 :Text;
-    # Display name that may differ from the system username.
-    # In some systems, this may be empty or identical to name.
-    realName  @2 :Text;
+    # T.UserId, not a POSIX uid: a capability system has no uid, and a
+    # UInt64 is wide enough for any identity namespace.
+    id @0 :T.UserId;
+    name @1 :Text;
+    # Display name that may differ from the system username. May be empty.
+    realName @2 :Text;
 }
 
-# ── Events ───────────────────────────────────────────────────
+# ── Events ──────────────────────────────────────────────────────────────
 
 struct SessionEvent {
-    id        @0 :T.EventId;
+    id @0 :T.EventId;
     timestamp @1 :T.Timestamp;
-    type      @2 :SessionEventType;
+    type @2 :SessionEventType;
+    # Open payload for the event, backend-declared.
+    data @3 :T.StringMap;
 }
 
 enum SessionEventType {
-    unlock     @0;
-    lock       @1;
-    sleep      @2;
-    wake       @3;
-    disconnect @4;
-    reconnect  @5;
-    switchUser @6;
-    idle       @7;
-    active     @8;
-    # Audit-9: conflict detected, expired, access changed, etc.
-    conflictDetected @10;
-    expired @11;
-    accessChanged @12;
-    custom     @9;
+    unknown @0;
+    unlock @1;
+    lock @2;
+    sleep @3;
+    wake @4;
+    disconnect @5;
+    reconnect @6;
+    switchUser @7;
+    idle @8;
+    active @9;
+    expired @10;
+    securityChanged @11;
+    custom @12;
 }
 
-# ── Cross-Device Handoff (audit-7) ───────────────────────────
-
-struct HandoffRequest {
-    # Target device identifier.
-    targetDevice @0 :Text;
-    # Session state to transfer (serialized).
-    state @1 :Data;
-    # Maximum time to wait for acceptance.
-    timeout @2 :T.Duration;
+interface SessionEventSubscription {
+    # Bounded pull: the caller states how many events it will take.
+    pull @0 (maxEvents :UInt32) -> (events :List(SessionEvent), total :UInt32);
+    cancel @1 () -> T.VoidResult;
 }
 
-struct SessionHandoff {
-    # Unique handoff identifier.
-    id @0 :Text;
-    # Source device.
-    sourceDevice @1 :Text;
-    # Target device.
-    targetDevice @2 :Text;
-    # Current handoff state.
-    state @3 :HandoffState;
-    # Transfer progress (0-100).
-    progress @4 :UInt32;
-    # When the handoff was initiated.
-    initiatedAt @5 :T.Timestamp;
-    # When the handoff completed (zero if still in progress).
-    transferredAt @6 :T.Timestamp;
-}
+# ── Persistence ─────────────────────────────────────────────────────────
 
-enum HandoffState {
-    pending @0;
-    transferring @1;
-    completed @2;
-    failed @3;
-    custom @4;
-}
-
-# ── Multi-Device Session (audit-7) ───────────────────────────
-
-struct MultiDeviceSession {
-    # Session identifier.
+struct SessionRestore {
     sessionId @0 :T.SessionId;
-    # Devices participating in this session.
-    devices @1 :List(MultiDeviceEntry);
-    # The device currently in control.
-    primaryDevice @2 :Text;
-    # Whether all devices are synchronized.
-    synchronized @3 :Bool;
+    # Schema version the blob was written with.
+    blobVersion @1 :T.Version;
+    # Fields the backend could not restore, as open names. A non-empty
+    # list means the restore was partial, and the caller can say so
+    # instead of assuming completeness.
+    unrestored @2 :List(Text);
+    error @3 :T.Error;
+    metadata @4 :T.StringMap;
 }
-
-struct MultiDeviceEntry {
-    # Device identifier.
-    device @0 :Text;
-    # Device type (e.g., "phone", "laptop", "tablet", "watch").
-    type @1 :Text;
-    # Whether this device is currently connected.
-    connected @2 :Bool;
-    # When this device last synced.
-    lastSynced @3 :T.Timestamp;
-}
-
-# ── AR/VR Spatial Session (audit-7) ──────────────────────────
-
-struct SpatialSessionInfo {
-    # Number of spatial anchors placed.
-    anchorsCount @0 :UInt32;
-    # Whether occlusion is enabled.
-    occlusionEnabled @1 :Bool;
-    # Whether passthrough (camera feed) is enabled.
-    passthroughEnabled @2 :Bool;
-    # Whether hand gesture input is enabled.
-    gestureEnabled @3 :Bool;
-    # Whether spatial mesh reconstruction is enabled.
-    spatialMeshEnabled @4 :Bool;
-    # Display configuration for the spatial session.
-    displayConfig @5 :T.DisplayConfiguration;
-}
-
-# ── Wearable Glance Session (audit-7) ────────────────────────
-
-struct WatchGlanceSession {
-    # Total glance duration.
-    duration @0 :T.Duration;
-    # Number of glances in this session.
-    glanceCount @1 :UInt32;
-    # When the last glance was dismissed.
-    dismissedAt @2 :T.Timestamp;
-    # Whether the watch is in ambient/always-on mode.
-    ambientMode @3 :Bool;
-}
-
-# ── Voice-Only Session (audit-7) ─────────────────────────────
-
-struct VoiceSessionInfo {
-    # Session language (BCP 47 tag).
-    language @0 :Text;
-    # Whether the wake word was detected.
-    wakeWordDetected @1 :Bool;
-    # Ambient noise level (0.0 = silent, 1.0 = very loud).
-    noiseLevel @2 :Float32;
-    # Whether far-field mode is active (far from microphone).
-    farField @3 :Bool;
-    # Current speech recognition state.
-    recognitionState @4 :SpeechRecognitionState;
-}
-
-enum SpeechRecognitionState {
-    idle @0;
-    listening @1;
-    processing @2;
-    speaking @3;
-    custom @4;
-}
-
-# ── Session Recording (audit-7) ──────────────────────────────
-
-struct SessionRecording {
-    # Session that was recorded.
-    sessionId @0 :T.SessionId;
-    # When the recording started.
-    startedAt @1 :T.Timestamp;
-    # Total recording duration.
-    duration @2 :T.Duration;
-    # Recording size in bytes.
-    sizeBytes @3 :UInt64;
-    # Recording format (e.g., "json", "protobuf", "binary").
-    format @4 :Text;
-}
-
-# ── Session Security Context (audit-7) ───────────────────────
-
-struct SessionSecurityContext {
-    # Whether multi-factor authentication was used.
-    mfaRequired @0 :Bool;
-    # Trust level of the session (0 = untrusted, 100 = fully trusted).
-    trustLevel @1 :UInt32;
-    # Risk score (0.0 = no risk, 1.0 = high risk).
-    riskScore @2 :Float32;
-    # Whether the session has been attested (cryptographic proof of integrity).
-    attested @3 :Bool;
-    # Whether biometric verification was used.
-    biometricVerified @4 :Bool;
-    # Authentication methods used in this session.
-    authMethods @5 :List(Text);
-}
-
-# ══════════════════════════════════════════════════════════════════════
-# AUDIT-9 ADDITIONS — Conflict Resolution, Access Control, Audit, etc.
-# ══════════════════════════════════════════════════════════════════════
-
-# ── Conflict Resolution (audit-9) ───────────────────────────
-
-struct ConflictResolution {
-    # Which device's state to keep (source or target).
-    winningDevice @0 :Text;
-    # Strategy for merging non-conflicting fields.
-    mergeStrategy @1 :ConflictMergeStrategy;
-    # Whether to notify the user of the conflict.
-    notifyUser @2 :Bool;
-    # Human-readable resolution description.
-    description @3 :Text;
-}
-
-enum ConflictMergeStrategy {
-    keepSource @0;      # Keep the source device's state
-    keepTarget @1;      # Keep the target device's state
-    mergeFields @2;     # Merge non-conflicting fields, keep source for conflicts
-    prompt @3;          # Prompt the user to resolve
-    custom @4;
-}
-
-# ── Session Access Control (audit-9) ────────────────────────
-
-struct SessionAccessControl {
-    # Users allowed to join this session.
-    allowedUsers @0 :List(T.UserId);
-    # Users explicitly denied from this session.
-    deniedUsers @1 :List(T.UserId);
-    # Whether the session is publicly joinable.
-    public @2 :Bool;
-    # Maximum number of concurrent participants.
-    maxParticipants @3 :UInt32;
-    # Whether to require approval for new participants.
-    requireApproval @4 :Bool;
-}
-
-# ── Session Audit Trail (audit-9) ───────────────────────────
-
-struct SessionAuditEntry {
-    # Unique audit identifier.
-    auditId @0 :UInt64;
-    # When the event occurred.
-    timestamp @1 :T.Timestamp;
-    # Session identifier.
-    sessionId @2 :T.SessionId;
-    # Type of event (join, leave, modify, conflict, etc.).
-    eventType @3 :Text;
-    # Who performed the action.
-    actor @4 :T.UserId;
-    # Description of the event.
-    description @5 :Text;
-    # Event-specific metadata.
-    metadata @6 :T.StringMap;
-}
-
-# ── Session Expiration Policy (audit-9) ─────────────────────
 
 struct SessionExpirationPolicy {
     # Maximum session lifetime (zero = no limit).
     maxLifetime @0 :T.Duration;
     # Inactivity timeout (zero = no timeout).
     inactivityTimeout @1 :T.Duration;
-    # Whether to warn before expiration.
+    # Whether to warn before expiration, and how long before.
     warnBeforeExpiration @2 :Bool;
-    # Warning lead time.
     warningDuration @3 :T.Duration;
     # Whether to auto-extend on user activity.
     autoExtend @4 :Bool;
 }
 
-# ── Session Template (audit-9) ──────────────────────────────
+# ── Security posture ────────────────────────────────────────────────────
 
-struct SessionTemplate {
-    # Template identifier.
-    templateId @0 :Text;
-    # Human-readable template name.
-    name @1 :Text;
-    # Description of the session type.
-    description @2 :Text;
-    # Default security settings for this template.
-    securityContext @3 :SessionSecurityContext;
-    # Default expiration policy.
-    expirationPolicy @4 :SessionExpirationPolicy;
-    # Default access control.
-    accessControl @5 :SessionAccessControl;
+struct SessionSecurityContext {
+    # Whether multi-factor authentication was used.
+    mfaRequired @0 :Bool;
+    # Canonical trust level, not a hand-rolled 0-100 scale.
+    trustLevel @1 :T.TrustLevel;
+    # Risk score (0.0 = no risk, 1.0 = high risk), as the backend
+    # assesses it. Opaque: the protocol never says how.
+    riskScore @2 :Float32;
+    # Whether biometric verification was used.
+    biometricVerified @3 :Bool;
+    # Authentication methods used in this session, as open tokens.
+    authMethods @4 :List(Text);
+    # Attestation proof, if the backend has one — opaque bytes, backend
+    # format. The pre-revamp `attested :Bool` answered "attested by whom,
+    # to what root?" with a boolean and no proof.
+    attestation @5 :Data;
+    metadata @6 :T.StringMap;
 }
 
-# ── Session Accessibility (audit-9) ─────────────────────────
+# ── Audit ───────────────────────────────────────────────────────────────
 
-struct SessionAccessibilitySettings {
-    # Screen reader verbosity level.
-    screenReaderVerbosity @0 :Text;
-    # Whether to enable high-contrast mode for session UI.
-    highContrast @1 :Bool;
-    # Whether to enable reduced motion animations.
-    reducedMotion @2 :Bool;
-    # Keyboard navigation mode.
-    keyboardNavigation @3 :Text;
-    # Caption language for audio content.
-    captionLanguage @4 :Text;
-    # Whether captions are enabled.
-    captionsEnabled @5 :Bool;
-}
-
-# ── Session Power Management (audit-9) ──────────────────────
-
-struct SessionPowerSettings {
-    # Whether to allow the session to prevent system sleep.
-    preventSleep @0 :Bool;
-    # Maximum CPU usage allowed for this session (percent, 0-100).
-    maxCpuPercent @1 :UInt32;
-    # Whether to enable background processing.
-    backgroundProcessing @2 :Bool;
-    # Power saving mode for this session.
-    powerSavingMode @3 :Text;
-}
-
-# ── Session Networking (audit-9) ────────────────────────────
-
-struct SessionNetworkConfig {
-    # Whether the session requires a network connection.
-    requireNetwork @0 :Bool;
-    # Allowed network interfaces (e.g., "wifi", "cellular", "ethernet").
-    allowedInterfaces @1 :List(Text);
-    # Whether to prefer low-latency connections.
-    preferLowLatency @2 :Bool;
-    # Maximum bandwidth limit (bytes per second, 0 = unlimited).
-    maxBandwidth @3 :UInt64;
-    # Whether to enable offline mode.
-    offlineMode @4 :Bool;
+struct SessionAuditEntry {
+    auditId @0 :UInt64;
+    timestamp @1 :T.Timestamp;
+    sessionId @2 :T.SessionId;
+    # Event type as an open token ("lock", "unlock", "switchUser", …).
+    eventType @3 :Text;
+    # Who performed the action.
+    actor @4 :T.UserId;
+    description @5 :Text;
+    metadata @6 :T.StringMap;
 }

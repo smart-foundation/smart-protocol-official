@@ -23,6 +23,8 @@
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
+using P = import "power.capnp";
 
 struct DeviceNode {
     # Stable opaque id.
@@ -270,6 +272,26 @@ interface DeviceService {
     # Audit-8: Device access control (false positive: device_policy.capnp).
     getDevicePolicy @31 (deviceId :T.DeviceId) -> (policy :DevicePolicy);
     setDevicePolicy @32 (deviceId :T.DeviceId, policy :DevicePolicy) -> T.VoidResult;
+
+    # ─────────────────────────────────────────────────────────────────────
+    # THE DRIVER FRAMEWORK ENTRY POINT
+    #
+    # `DriverRegistry` and `DriverLifecycle` were returned by NOTHING —
+    # no method anywhere in the protocol produced either reference, so
+    # the entire driver framework in this file was unreachable contract:
+    # a driver author following the schema implemented registration,
+    # probing, binding, health and restart, and no client could ever
+    # call any of it (R8). This method is the hole being closed.
+    #
+    # It is capability-gated because registering a driver or restarting
+    # one is an authority-granting act, not a discovery question: the
+    # ungated half above answers "what exists", and this answers "who
+    # gets to attach code to it" (ai.capnp:578-584). Discovery stays
+    # open; the framework is acquired once, and holding the returned
+    # registry IS the authority to call its methods — none of them takes
+    # a capability parameter, because a per-method token would duplicate
+    # the authority the reference already carries.
+    getDriverRegistry @33 (authority :Capability) -> (registry :DriverRegistry);
 }
 
 interface DeviceSubscription {
@@ -353,8 +375,9 @@ struct DevicePowerState {
     batteryLevel @2 :Float32;
     # Whether the device is charging.
     charging @3 :Bool;
-    # Thermal state.
-    thermalState @4 :ThermalState;
+    # Thermal state. (R6: power.capnp owns the canonical `ThermalState`;
+    # this was a verbatim duplicate before.)
+    thermalState @4 :P.ThermalState;
 }
 
 enum PowerMode {
@@ -363,14 +386,6 @@ enum PowerMode {
     sleep     @2;   # Sleep mode
     hibernate @3;   # Hibernate mode
     custom    @4;   # Backend-specific power mode
-}
-
-enum ThermalState {
-    normal   @0;   # Normal temperature
-    warm     @1;   # Warm (throttling may occur)
-    hot      @2;   # Hot (throttling active)
-    critical @3;   # Critical temperature (shutdown imminent)
-    custom   @4;   # Backend-specific thermal state
 }
 
 # ── Audit-8: Power State Subscription ─────────────────────────────────
@@ -491,8 +506,16 @@ struct DriverDescriptor {
 # ── Driver Registration ──────────────────────────────────────
 interface DriverRegistry {
     # Register a driver capability. The registry returns a stable
-    # DriverId that consumers can request.
-    register @0 (driver :DriverDescriptor) -> (handle :T.DriverId);
+    # DriverId that consumers can request, AND the lifecycle interface
+    # the driver itself answers on.
+    #
+    # Returning DriverLifecycle here is what makes it reachable: it was
+    # previously produced by no method, so the probe/bind/start/ping
+    # half of the contract was uncallable. The driver that registers is
+    # exactly the party that should answer those calls, so this is the
+    # natural acquisition point rather than an invented accessor.
+    register @0 (driver :DriverDescriptor)
+              -> (driverId :T.DriverId, lifecycle :DriverLifecycle, handle :UInt64);
     # Unregister. Outstanding subscriptions are auto-cancelled.
     unregister @1 (driver :T.DriverId) -> (result :T.VoidResult);
     # Look up by name (e.g., "xhci-pci").
@@ -505,9 +528,18 @@ interface DriverRegistry {
 }
 
 interface DriverSubscription {
-    pull @0 () -> (events :List(DriverEvent));
+    # Bounded pull, so a slow consumer cannot grow the driver-event
+    # queue without limit and a burst of registrations is not shipped
+    # as one unbounded message.
+    pull @0 (maxEvents :UInt32) -> (events :List(DriverEvent));
     cancel @1 () -> T.VoidResult;
 }
+
+# register's named results are the whole driver-framework entry point:
+# a stable DriverId consumers can request, the DriverLifecycle interface
+# the driver itself answers on (previously produced by no method, so the
+# probe/bind/start/ping half of the contract was uncallable), and a
+# stable handle for the registered capability.
 
 struct DriverEvent {
     at @0 :UInt64;

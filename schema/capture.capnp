@@ -1,6 +1,7 @@
 @0xa1b2c3d4e5f60014;
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
 
 # ═══════════════════════════════════════════════════════════════════════
 # Capture - screen, window, output capture with streaming and archival.
@@ -12,104 +13,171 @@ using T = import "types.capnp";
 #   - Subscription cancel method added.
 #   - T.Duration for capture duration.
 #   - T.DataHandle for captured data (may exceed 1KB).
-#   - Custom variant on CaptureEventType for forward compatibility.
 #
 # Audit-8 enhancements:
-#   - CaptureRegion: typed region for partial screen capture.
+#   - CaptureRegion: typed region for partial capture.
 #   - AudioCaptureConfig: audio capture alongside video.
 #   - WatermarkRequest: programmatic watermarking during capture.
 #   - CaptureScheduleRequest: scheduled/time-lapse capture.
-#   - CaptureStream: continuous streaming handle.
+#   - FrameStream: the canonical bounded frame-delivery contract
+#     (pull(maxFrames)/cancel, monotonic sequence, honest end-of-stream),
+#     the single home shared with camera.capnp.
 #   - CaptureThumbnail: low-resolution preview.
-#   - CaptureDeduplication: duplicate detection strategy.
 #   - RetentionPolicy: auto-deletion and archival rules.
+#
+# Revamp (pre-release — nothing external consumes this contract):
+#   - FRAME DELIVERY closes the hole: `startStream`/`openCapture` return a
+#     readable `FrameStream`, and `stopRecording` NO LONGER materialises a
+#     whole recording (~22 GB at 4K60/30min) as one result. Live pulls
+#     carry a monotonic `sequence`, never an offset into the stream.
+#   - AUTHORITY (R3): every operation that acquires, persists or shares
+#     another application's pixels moved behind the single gated
+#     `CaptureController` (obtained once via `openController`); discovery
+#     stays ungated. The old `CapturePermission` boolean/allow-list model
+#     and `setCapturePermission` are deleted.
 # ═══════════════════════════════════════════════════════════════════════
 
 interface CaptureService {
-    captureOutput @0 (outputId :T.OutputId, format :CaptureFormat) -> (captureId :T.CaptureId, data :T.DataHandle);
-    captureWindow @1 (windowId :T.WindowId, format :CaptureFormat) -> (captureId :T.CaptureId, data :T.DataHandle);
-    captureScreen @2 (format :CaptureFormat) -> (captureId :T.CaptureId, data :T.DataHandle);
+    # ── Ungated discovery (ai.capnp:57-60) ──
+    # What exists and what a source can do stays readable without any
+    # authority, so a caller can learn before it holds a grant. None of
+    # these acquires or persists another application's pixels.
+    getSources @0 (pagination :T.Pagination) -> (sources :List(CaptureSourceRef), totalCount :UInt32);
+    listCaptures @1 (pagination :T.Pagination) -> (captures :List(CaptureInfo), totalCount :UInt32);
+    getCapture @2 (captureId :T.CaptureId) -> (info :CaptureInfo);
+    negotiateFormat @3 (source :CaptureSourceRef, desired :CaptureFormat) -> (result :FormatNegotiationResult);
+    subscribeEvents @4 () -> (subscription :CaptureEventSubscription);
 
-    startRecording @3 (source :CaptureSourceRef, format :CaptureFormat) -> (captureId :T.CaptureId);
-    stopRecording @4 (captureId :T.CaptureId) -> (data :T.DataHandle);
-    pauseRecording @5 (captureId :T.CaptureId) -> T.VoidResult;
-    resumeRecording @6 (captureId :T.CaptureId) -> T.VoidResult;
+    # ── Read back a stored artifact in bounded pulls ──
+    # One read path for live and stored, so a ~22 GB recording is never
+    # materialised as one result; the caller sizes its own memory. The
+    # authority is the captureId the caller already holds.
+    openCapture @5 (captureId :T.CaptureId) -> (stream :FrameStream, format :CaptureFormat, startedAt :T.Timestamp);
 
-    listCaptures @7 (pagination :T.Pagination) -> (captures :List(CaptureInfo), totalCount :UInt32);
-    getCapture @8 (captureId :T.CaptureId) -> (info :CaptureInfo);
-
-    getSources @9 (pagination :T.Pagination) -> (sources :List(CaptureSourceRef), totalCount :UInt32);
-
-    subscribeEvents @10 () -> (subscription :CaptureEventSubscription);
-
-    # -- Audit-8: Region capture --
-    captureRegion @11 (outputId :T.OutputId, region :CaptureRegion, format :CaptureFormat)
-                  -> (captureId :T.CaptureId, data :T.DataHandle);
-
-    # -- Audit-8: Continuous streaming --
-    startStream @12 (source :CaptureSourceRef, format :CaptureFormat)
-                -> (streamId :T.CaptureId);
-    stopStream @13 (streamId :T.CaptureId) -> T.VoidResult;
-
-    # -- Audit-8: Scheduled capture --
-    scheduleCapture @14 (request :CaptureScheduleRequest) -> (scheduleId :UInt64);
-    cancelSchedule @15 (scheduleId :UInt64) -> T.VoidResult;
-
-    # -- Audit-8: Archive capture --
-    archiveCapture @16 (captureId :T.CaptureId, policy :RetentionPolicy) -> T.VoidResult;
-
-    # -- Audit-9: Capture pipeline --
-    createPipeline @17 (pipeline :CapturePipeline) -> (pipelineId :UInt64);
-    applyPipeline @18 (captureId :T.CaptureId, pipelineId :UInt64) -> (processed :T.CaptureId);
-    listPipelines @19 (pagination :T.Pagination) -> (pipelines :List(CapturePipeline), total :UInt32);
-
-    # -- Audit-9: Capture session management --
-    createSession @20 (name :Text, sources :List(CaptureSourceRef), format :CaptureFormat)
-                  -> (session :CaptureSession);
-    stopSession @21 (sessionId :UInt64) -> T.VoidResult;
-    pauseSession @22 (sessionId :UInt64) -> T.VoidResult;
-    resumeSession @23 (sessionId :UInt64) -> T.VoidResult;
-    listSessions @24 (pagination :T.Pagination) -> (sessions :List(CaptureSession), total :UInt32);
-
-    # -- Audit-9: Capture content analysis --
-    analyzeCapture @25 (captureId :T.CaptureId) -> (analysis :CaptureAnalysis);
-
-    # -- Audit-9: Capture permission model --
-    setCapturePermission @26 (permission :CapturePermission) -> T.VoidResult;
-    getCapturePermission @27 (appId :T.AppId) -> (permission :CapturePermission);
-
-    # -- Audit-9: Capture sharing --
-    shareCapture @28 (request :CaptureShareRequest) -> (shareLink :T.Uri);
-
-    # -- Audit-9: Capture annotation --
-    addAnnotation @29 (annotation :CaptureAnnotation) -> (annotationId :UInt64);
-    listAnnotations @30 (captureId :T.CaptureId) -> (annotations :List(CaptureAnnotation));
-    removeAnnotation @31 (annotationId :UInt64) -> T.VoidResult;
-
-    # -- Audit-9: Capture comparison --
-    compareCaptures @32 (captureIdA :T.CaptureId, captureIdB :T.CaptureId)
-                    -> (comparison :CaptureComparison);
-
-    # -- Audit-9: Batch capture --
-    batchCapture @33 (sources :List(CaptureSourceRef), format :CaptureFormat)
-                 -> (captureIds :List(T.CaptureId));
-
-    # -- Audit-9: Format negotiation --
-    negotiateFormat @34 (source :CaptureSourceRef, desired :CaptureFormat)
-                    -> (result :FormatNegotiationResult);
+    # ── The ONE gated accessor (R3) ──
+    # Capturing another application's window, persisting pixels, or
+    # handing them to someone is the sensitive half. It is reached ONLY
+    # through this capability-gated accessor — never from a reference a
+    # caller holds by default. The old shape leaked both ways: capture
+    # methods hung ungated on this root, AND a parallel permission model
+    # (CapturePermission) let any client set another app's rights.
+    openController @6 (authority :Capability) -> (controller :CaptureController);
 }
 
+# ═══════════════════════════════════════════════════════════════════════
+# CaptureController — the capability-gated capture half.
+#
+# Obtained once, from `CaptureService.openController (authority)`.
+# Holding this reference IS the authority to capture; none of its
+# methods takes a capability token, because a per-method parameter
+# would duplicate the authority the reference already carries and leave
+# two paths that must agree forever (DESIGN_PRINCIPLES.md:394).
+#
+# What moved here is exactly what used to be ungated: the methods that
+# acquire pixels belonging to another application, that persist them,
+# or that hand them to someone else. Discovery (`getSources`,
+# `listCaptures`, `negotiateFormat`) and reading a capture the caller
+# already holds a right to stay ungated on CaptureService, so a caller
+# can learn what exists before it holds any authority (ai.capnp:57-60).
+# ═══════════════════════════════════════════════════════════════════════
+interface CaptureController {
+    # Holding this reference IS the authority to capture; none of these
+    # methods takes a capability token, because a per-method parameter
+    # would duplicate the authority the reference already carries and leave
+    # two paths that must agree forever (DESIGN_PRINCIPLES.md:394). EVERY
+    # operation that acquires, persists, or hands off another application's
+    # pixels lives here — the previous revision left them ungated on
+    # CaptureService AND kept a parallel permission model beside them.
+
+    # ── One-shot captures ──
+    captureOutput @0 (outputId :T.OutputId, format :CaptureFormat) -> (result :CaptureResult);
+    captureWindow @1 (windowId :T.WindowId, format :CaptureFormat) -> (result :CaptureResult);
+    captureScreen @2 (format :CaptureFormat) -> (result :CaptureResult);
+    captureRegion @3 (outputId :T.OutputId, region :CaptureRegion, format :CaptureFormat) -> (result :CaptureResult);
+    batchCapture @4 (sources :List(CaptureSourceRef), format :CaptureFormat) -> (result :BatchCaptureResult);
+
+    # ── Recording ──
+    # A recording is NOT returned by stopRecording. A 4K60 30-minute clip
+    # is ~22 GB, and returning it as one result is a message no client can
+    # accept; it is read back through `CaptureService.openCapture` in
+    # bounded pulls instead.
+    startRecording @5 (source :CaptureSourceRef, format :CaptureFormat) -> (captureId :T.CaptureId);
+    stopRecording @6 (captureId :T.CaptureId) -> T.VoidResult;
+    pauseRecording @7 (captureId :T.CaptureId) -> T.VoidResult;
+    resumeRecording @8 (captureId :T.CaptureId) -> T.VoidResult;
+
+    # ── Continuous streaming ──
+    # Returns a readable stream, not an id. See FRAME DELIVERY above.
+    startStream @9 (source :CaptureSourceRef, format :CaptureFormat)
+                -> (stream :FrameStream, format :CaptureFormat, startedAt :T.Timestamp);
+    stopStream @10 (streamId :T.CaptureId) -> T.VoidResult;
+
+    # ── Scheduled / archival ──
+    scheduleCapture @11 (request :CaptureScheduleRequest) -> (scheduleId :UInt64);
+    cancelSchedule @12 (scheduleId :UInt64) -> T.VoidResult;
+    archiveCapture @13 (captureId :T.CaptureId, policy :RetentionPolicy) -> T.VoidResult;
+
+    # ── Pipeline ──
+    createPipeline @14 (pipeline :CapturePipeline) -> (pipelineId :UInt64);
+    applyPipeline @15 (captureId :T.CaptureId, pipelineId :UInt64) -> (processed :T.CaptureId);
+    listPipelines @16 (pagination :T.Pagination) -> (pipelines :List(CapturePipeline), total :UInt32);
+
+    # ── Session ──
+    createSession @17 (name :Text, sources :List(CaptureSourceRef), format :CaptureFormat) -> (session :CaptureSession);
+    stopSession @18 (sessionId :UInt64) -> T.VoidResult;
+    pauseSession @19 (sessionId :UInt64) -> T.VoidResult;
+    resumeSession @20 (sessionId :UInt64) -> T.VoidResult;
+    listSessions @21 (pagination :T.Pagination) -> (sessions :List(CaptureSession), total :UInt32);
+
+    # ── Analysis / annotation / comparison ──
+    analyzeCapture @22 (captureId :T.CaptureId) -> (analysis :CaptureAnalysis);
+    addAnnotation @23 (annotation :CaptureAnnotation) -> (annotationId :UInt64);
+    listAnnotations @24 (captureId :T.CaptureId) -> (annotations :List(CaptureAnnotation));
+    removeAnnotation @25 (annotationId :UInt64) -> T.VoidResult;
+    compareCaptures @26 (captureIdA :T.CaptureId, captureIdB :T.CaptureId) -> (comparison :CaptureComparison);
+
+    # ── Sharing ──
+    shareCapture @27 (request :CaptureShareRequest) -> (result :CaptureShareResult);
+}
+
+struct CaptureResult {
+    union {
+        ok @0 :CaptureData;
+        error @1 :T.Error;
+    }
+}
+
+# The one-shot captures. A failed capture (a window that vanished, an
+# occluded output, out of storage) previously returned an empty
+# DataHandle indistinguishable from a zero-length image.
+struct CaptureData {
+    captureId @0 :T.CaptureId;
+    data @1 :T.DataHandle;
+    metadata @2 :T.StringMap;
+}
+
+struct BatchCaptureResult {
+    union {
+        ok @0 :List(T.CaptureId);
+        error @1 :T.Error;
+    }
+}
+
+struct CaptureShareResult {
+    union {
+        ok @0 :T.Uri;
+        error @1 :T.Error;
+    }
+}
+
+# One pull path, bounded by the caller's request, with an honest
+# end-of-stream. The previous `pullPaginated @2 (pagination)` offset
+# into a live event queue, where an offset means nothing; and the
+# unbounded `pull @0` beside it let a server's queue grow without
+# limit while a slow consumer's next pull shipped everything at once.
 interface CaptureEventSubscription {
-    # Deprecated: use pullPaginated for bounded results.
-    pull @0 () -> (events :List(CaptureEvent));
+    pull @0 (maxEvents :UInt32) -> (events :List(CaptureEvent));
     cancel @1 () -> T.VoidResult;
-    # Paginated pull — returns at most `limit` events starting from `offset`.
-    pullPaginated @2 (pagination :T.Pagination) -> (result :CaptureEventPullResult);
-}
-
-struct CaptureEventPullResult {
-    events    @0 :List(CaptureEvent);
-    totalCount @1 :UInt32;
 }
 
 struct CaptureFormat {
@@ -157,20 +225,37 @@ struct CaptureInfo {
     thumbnail @9 :CaptureThumbnail;  # Low-resolution preview
 }
 
+# An event, as a union. The previous shape was a struct with a
+# `type :CaptureEventType` enum, which had two defects:
+#
+#   1. `error @4` carried no payload, so a failed capture produced an
+#      event that said "something failed" and nothing about what.
+#   2. The enum was the only forward-compat route, so a backend adding
+#      a frameCaptured or recordingSurvivedCleanup event had to overload
+#      `stopped` — and a consumer that did not know the new meaning
+#      could not tell what it skipped.
+#
+# The ai.capnp:533-550 shape fixes both: known events are arms, the
+# error arm carries T.Error, and anything not yet invented rides in
+# `unknown` and is ignored rather than rejected (ai.capnp:43-47).
 struct CaptureEvent {
     id @0 :T.EventId;
     timestamp @1 :T.Timestamp;
     captureId @2 :T.CaptureId;
-    type @3 :CaptureEventType;
+    union {
+        started @3 :Void;
+        stopped @4 :Void;
+        paused @5 :Void;
+        resumed @6 :Void;
+        error @7 :T.Error;
+        unknown @8 :UnknownCaptureEvent;
+    }
 }
 
-enum CaptureEventType {
-    started @0;
-    stopped @1;
-    paused @2;
-    resumed @3;
-    error @4;
-    custom @5;
+# Unknown values are ignored, never rejected (ai.capnp:43-47).
+struct UnknownCaptureEvent {
+    typeId @0 :UInt64;
+    payload @1 :Data;
 }
 
 # ════════════════════════════════════════════════════════════════════════
@@ -228,15 +313,95 @@ struct CaptureScheduleRequest {
     endTime @5 :T.Timestamp;
 }
 
-# ── Capture Stream ─────────────────────────────────────────────────────
-# Continuous streaming handle for real-time capture delivery.
-# Returned by startStream; consumers read from the stream handle.
-struct CaptureStream {
-    streamId @0 :T.CaptureId;
-    source @1 :CaptureSourceRef;
-    format @2 :CaptureFormat;
-    startedAt @3 :T.Timestamp;
+# ═══════════════════════════════════════════════════════════════════════
+# FRAME DELIVERY — the canonical contract for continuous capture.
+#
+# WHY THIS EXISTS: the previous revision's `startStream` returned a
+# T.CaptureId and NO METHOD ANYWHERE READ IT. A continuous capture could
+# be started and stopped but never read, so a headless consumer (an AR
+# overlay, an OCR pass, a getUserMedia client) had no way to obtain a
+# frame and every backend filled the hole with its own side channel —
+# V4L2 and AVFoundation already disagree on buffer semantics, and the
+# protocol forced implementers to keep both. `stopRecording` had the
+# mirror-image defect: it materialised an entire recording as one
+# result, which at 4K60 for 30 minutes is ~22 GB that no client can
+# accept as a unit, with no partial read, no segment and no resume.
+#
+# THE CONTRACT — five properties, all of them load-bearing:
+#
+#   1. HANDLES, NEVER INLINE BYTES. `pixels` is a T.DataHandle. A 4K
+#      frame is ~25 MB; as an inline field every frame is copied into
+#      the message arena and out again, which is exactly what Cap'n
+#      Proto's zero-copy exists to prevent (ai.capnp:74-75).
+#
+#   2. BOUNDED BY EXPLICIT REQUEST. `pull (maxFrames)` — the caller
+#      states how much it will accept. A slow consumer therefore cannot
+#      grow the producer's queue without limit, and a fast producer
+#      cannot materialise an unbounded message. ai.capnp:277's
+#      `pull (maxBytes)` is the same decision.
+#
+#   3. SEQUENCE, NEVER OFFSET. Every frame carries a monotonically
+#      increasing `sequence` starting at 1. There is deliberately no
+#      offset parameter: `T.Pagination.offset` is an index into a
+#      STABLE list, and a live stream has no stable ordering, so
+#      `pull (offset=5)` either drops the first 5 readings or re-delivers
+#      five already consumed ones — silently, with no way for the caller
+#      to tell. The sequence number replaces it exactly: a gap between
+#      the last sequence the caller saw and the first sequence in this
+#      pull measures precisely how many frames were lost, so loss is
+#      visible instead of silent. (This is the fix for the offset-into-
+#      live-stream defect found at nine sites across the protocol.)
+#
+#   4. HONEST END OF STREAM. `pull` distinguishes "nothing has arrived
+#      yet" (`empty`), "the producer closed this stream and no more
+#      frames will ever arrive" (`ended`), and "the producer failed"
+#      (`error`, carrying T.Error). A dead camera and a quiet camera
+#      are different facts, and the previous bare-list return made them
+#      the same fact.
+#
+#   5. CANCEL. `cancel` stops delivery, releases the producer's buffers
+#      and makes the stream's termination observable to the producer.
+#
+# One contract serves both a LIVE stream (frames flow as captured) and a
+# STORED artifact (a recording, a batch result, a pipeline output) read
+# back through `openCapture` — because an artifact is a stored frame
+# sequence, and having one read path instead of two removes the second
+# authority for the same bytes.
+# ═══════════════════════════════════════════════════════════════════════
+
+struct Frame {
+    pixels @0 :T.DataHandle;
+    # Monotonic, per-stream, starts at 1. A consumer records the last
+    # sequence it processed; a gap in the next pull is measured loss,
+    # not a silent skip.
+    sequence @1 :UInt64;
+    # When the frame was captured by the hardware, NOT when it was
+    # delivered. A consumer computing latency needs the difference, and
+    # a wall-clock timestamp here would survive a clock adjustment.
+    capturedAt @2 :T.MonotonicTimestamp;
+    metadata @3 :T.StringMap;
 }
+
+struct FramePullResult {
+    union {
+        frames @0 :List(Frame);
+        empty @1 :Void;
+        ended @2 :Void;
+        error @3 :T.Error;
+    }
+}
+
+interface FrameStream {
+    pull @0 (maxFrames :UInt32) -> (result :FramePullResult);
+    cancel @1 () -> T.VoidResult;
+}
+
+# startStream returns the stream and the agreed format as named results,
+# because the negotiated format is part of the contract: the previous
+# revision left a stream's format as a request with no outcome, so two
+# independently written backends could not interoperate without being
+# tested against each other by hand. A format the source cannot produce
+# is a failed call, not a silent downgrade.
 
 # ── Capture Thumbnail ──────────────────────────────────────────────────
 # Low-resolution preview of a capture. Used for rapid visual browsing
@@ -245,15 +410,6 @@ struct CaptureThumbnail {
     width @0 :UInt32;
     height @1 :UInt32;
     data @2 :T.DataHandle;
-}
-
-# ── Capture Deduplication ──────────────────────────────────────────────
-# Strategy for detecting duplicate captures to save storage.
-enum CaptureDeduplication {
-    none @0;
-    hash @1;
-    perceptual @2;
-    custom @3;
 }
 
 # ── Retention Policy ───────────────────────────────────────────────────
@@ -346,23 +502,20 @@ struct CapturedFace {
     confidence @5 :Float32;
 }
 
-# ── Capture Permission Model ───────────────────────────────────────────
-# Structured permission for controlling who can capture what.
-# Defines capture access at source, output, and time granularity.
-struct CapturePermission {
-    # App requesting capture permission.
-    appId @0 :T.AppId;
-    # Sources this app is allowed to capture from.
-    allowedSources @1 :List(CaptureSourceRef);
-    # Maximum capture duration allowed.
-    maxDuration @2 :T.Duration;
-    # Whether audio capture is permitted.
-    audioAllowed @3 :Bool;
-    # Whether screen capture is permitted.
-    screenAllowed @4 :Bool;
-    # Whether window capture is permitted.
-    windowAllowed @5 :Bool;
-}
+# ── Capture Authority Model ────────────────────────────────────────────
+# DELETED (R3, O1-deletion-half). The previous `CapturePermission
+# { appId, allowedSources, maxDuration, audioAllowed, screenAllowed,
+# windowAllowed }` — boolean permission flags plus an app allow-list, and
+# a `setCapturePermission` that let any client set ANOTHER app's rights —
+# is exactly the parallel permission model DESIGN_PRINCIPLES.md:399
+# forbids ("Do NOT define permission strings, boolean flags, or role-based
+# access control; the capability system IS the access control mechanism").
+# Authority is now the `CaptureController` reference, granted once through
+# `CaptureService.openController (authority)`. A grant names what it
+# permits through capability.capnp's own `operations` and `constraints`
+# (a duration cap is a constraint on the grant, not a re-specified field),
+# and attenuation/revocation are capability.capnp's job — not duplicated
+# per service here.
 
 # ── Capture Sharing ────────────────────────────────────────────────────
 # Share captured content with other apps or devices. Provides
@@ -424,48 +577,6 @@ struct CaptureComparison {
     identical @3 :Bool;
     # Regions that differ (for partial diffs).
     diffRegions @4 :List(CaptureRegion);
-}
-
-# ── Compression Options ────────────────────────────────────────────────
-# Fine-grained compression control for captured content. Separates
-# compression level, quality, and algorithm from the format field.
-struct CompressionOptions {
-    algorithm @0 :CompressionAlgorithm;
-    # Quality level (0–100, higher = better quality, larger file).
-    quality @1 :UInt8;
-    # Whether to use lossless compression.
-    lossless @2 :Bool;
-    # Target file size in bytes (0 = no target, use quality).
-    targetSizeBytes @3 :UInt64;
-}
-
-enum CompressionAlgorithm {
-    auto @0;
-    zlib @1;
-    lz4 @2;
-    zstd @3;
-    brotli @4;
-    jpeg @5;
-    png @6;
-    webp @7;
-    custom @8;
-}
-
-# ── Capture Device Metadata ────────────────────────────────────────────
-# Tag captures with device information, location, and user context.
-# Enables organizing and filtering captures by provenance.
-struct CaptureDeviceMetadata {
-    # Device name/identifier.
-    deviceName @0 :Text;
-    # User who initiated the capture.
-    userId @1 :T.UserId;
-    # Application that performed the capture.
-    appId @2 :T.AppId;
-    # GPS location at capture time.
-    latitude @3 :Float64;
-    longitude @4 :Float64;
-    # Capture timestamp.
-    capturedAt @5 :T.Timestamp;
 }
 
 # ── Format Negotiation Result ──────────────────────────────────────────

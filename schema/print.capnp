@@ -210,6 +210,11 @@ struct PrintRange {
         all @0 :Void;
         pages @1 :List(UInt32);
         range @2 :PageRange;
+        # A selection form the contract has not named (a named selection, a
+        # bookmark, a whole document set). The alternative is a backend
+        # truncating a request into `all` or `range` and printing the wrong
+        # thing, which is the failure mode an extension point exists to stop.
+        unknown @3 :T.UnknownEvent;
     }
 }
 

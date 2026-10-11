@@ -3,70 +3,147 @@
 # ═══════════════════════════════════════════════════════════════════════
 # Intent - component activation and dispatch.
 #
-# Improvements beyond the original schema (audit):
-#   - LaunchFlags typed struct (not raw UInt32 bitmap).
-#   - IntentCategory enum replaces Text categories.
-#   - IntentExtras typed struct (no flat StringMap collision).
-#   - DispatchType enum for explicit vs implicit dispatch.
-#   - ComponentInfo.priority for ranking multiple handlers.
-#   - UriPattern supports wildcards properly.
-#   - IntentFilter for multi-criteria resolution.
-#   - cancelActivity returns reason.
+# WHAT THIS IS
+#   The universal activation contract: describe what you want done, let the
+#   dispatcher find who can do it, and get a result. `resolve`, dispatch
+#   (activity, service, broadcast), handler registration, replay and history.
 #
-# Improvements (audit-3):
-#   - resolve, resolveWithFilter, listHandlers paginated with T.Pagination (Rule 9).
-#   - cancelActivity.reason changed from Text to T.Error (Rule 5).
-#   - ComponentInfo.icon changed from Text to T.DataHandle (Rule 6).
+# ANDROID IS GONE FROM THE REQUIRED POSITION
+#   `LaunchFlags` was a transcription of Android's `FLAG_ACTIVITY_*`
+#   constants — `newTask`, `singleTop`, `clearTop`, `clearTask`,
+#   `clearWhenTaskReset`, `excludeFromRecents`, `multipleTask`,
+#   `grantReadUriPermission`, `grantPersistableUriPermission`. `IntentCategory`
+#   was Android's intent-filter categories, `browserCategory` included. And
+#   `ActivityResultCode.firstUser` was `RESULT_FIRST_USER`, an API constant
+#   from one platform that nothing else can produce.
 #
-# Improvements (audit-5):
-#   - ComponentInfo.name changed from bare Text to T.ComponentName (Rule 2).
-#   - Intent.component changed from bare Text to T.ComponentName (Rule 2).
-#   - IntentService.unregisterHandler componentName changed to T.ComponentName (Rule 2).
+#   The Swap Test fails on all three: swapping Android for a spatial shell, an
+#   embedded HMI, or a robot UI forces the contract to be re-explained, because
+#   "tasks" and "recents" do not exist there. Every non-Android backend maps
+#   ten flags it does not have, and a client that branches on
+#   `grantPersistableUriPermission` bakes 2010s URI-grant semantics into an
+#   eternal contract.
 #
-# Improvements (audit-6):
-#   - cancelActivity return type changed from (ok, reason) to T.VoidResult (Rule 5).
+#   In their place:
+#   - `DeliveryHints` declares the real questions — how many instances may
+#     result, whether it is visible in a task list, whether it is exclusive to
+#     the caller, whether a result is expected — and carries authority as
+#     CAPABILITY REFERENCES. A grant IS a capability, not a boolean flag per
+#     permission kind.
+#   - Categories are OPEN TOKENS, published below as conformance constants. A
+#     registration vocabulary is unbounded and per-platform; freezing it at
+#     2010 values made a 2046 category unregisterable.
+#   - `firstUser` is deleted.
 #
-# Improvements (audit-7):
-#   - Intent chaining / workflow (IntentChain, IntentStep, ChainState).
-#   - Intent recording for automation (IntentRecording, RecordingTrigger).
-#   - Intent replay for testing/debugging (IntentReplayRequest/Result).
-#   - Intent history for analytics (IntentHistoryEntry, IntentHistoryFilter).
-#   - Intent debug tracing (IntentTrace, IntentResolution, TraceStep).
-#   - Intent attestation for security (IntentAttestation, AttestationResult).
-#   - Intent metrics for monitoring (IntentMetrics, IntentActionMetrics).
+# RESULTS ARE NOT POLLED
+#   `waitForResult @4` blocked or spun per handle. It is replaced by
+#   `subscribeActivity`, which delivers results on a subscription with the
+#   same pull/cancel shape every other stream in the protocol uses. Every
+#   caller's wait loop disappears.
+#
+# ONE AUTHORITY PATH
+#   `IntentAccessService` — `checkAccess`, `setPolicy`, `getPolicy`,
+#   `listPolicies` over `IntentAccessPolicy { caller, allowedActions,
+#   deniedActions, maxPerMinute }` — was permission string lists plus a rate
+#   limit, i.e. a second access-control policy engine that had to agree with
+#   capability.capnp forever. Deleted: the caller's capability reference
+#   determines which intents it may dispatch, and rate limits are
+#   capability.capnp's `RateBox`.
+#
+# ONE RECORDING MODEL
+#   There were two parallel record/replay families — intent recordings and
+#   cross-app activity recordings — with different step types, so a consumer
+#   building automation support implemented both. There is now ONE: a
+#   recording is an ordered list of steps, each an intent plus the app that
+#   handled it.
+#
+# ADDRESSED BY TYPED IDS
+#   Chains, recordings, traces and history entries were free `Text`, so a
+#   lifecycle object could not be validated or enumerated. They are now
+#   server-issued opaque IDs.
+#
+# CONTRACTS THAT WERE PROSE, NOW STATED
+#   HANDLER DEATH: when a handler unregisters, intents already dispatched to it
+#   complete with `T.ErrorCode.unavailable`; intents queued but not yet
+#   delivered are re-resolved against the remaining handlers. A backend may
+#   not silently drop either.
+#   CHOOSER: `DispatchMode.chooser` dispatches to the component registered for
+#   the `chooser` action, passing the ranked `resolve` result; the user's pick
+#   comes back as the activity result. There is no separate chooser contract
+#   because there is no separate chooser behaviour.
+#   BROADCAST ORDERING: `sendBroadcast` is best-effort, at-most-once, with NO
+#   ordering guarantee between receivers. A receiver that needs ordering
+#   sequences its own deliveries; the dispatcher does not.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
 
-# ── Intent ──────────────────────────────────────────────────────────────
+# ── Identity defined here ─────────────────────────────────────
+# Server-issued and opaque. `T.RecordingId` was promoted to types.capnp in
+# the foundation batch; the chain, trace and history ids were promoted in
+# the 2026-10-10 integration pass, because a consumer holding a chain id
+# returned by `executeChain` must be able to name its type without
+# importing this schema. ALL of intent's identity is now in the foundation.
+
+# ── Intent ────────────────────────────────────────────────────
 
 struct Intent {
+    # Open token. What should happen. Conformance constants are published at
+    # the end of this file; an unrecognised action is ignored by a consumer
+    # that does not know it, and unroutable for one that does.
     action @0 :Text;
-    dataUri @1 :Text;
-    mimeType @2 :Text;
+    dataUri @1 :T.Uri;
+    mimeType @2 :T.MimeType;
     component @3 :T.ComponentName;
     extras @4 :IntentExtras;
-    flags @5 :LaunchFlags;
-    categories @6 :List(IntentCategory);
+    # Replaces LaunchFlags. Declarations, not an activity-stack emulation.
+    delivery @5 :DeliveryHints;
+    # Open tokens — see the conformance constants at the end of this file.
+    categories @6 :List(Text);
     dispatchType @7 :DispatchType = unspecified;
     # Audit-9: intent priority (higher = more urgent).
     priority @8 :IntentPriority;
-    # Audit-9: intent timeout (null = use system default).
+    # Audit-9: intent timeout (zero = use system default).
     timeout @9 :T.Duration;
     # Audit-9: retry policy for failed intents.
     retry @10 :IntentRetryPolicy;
-    # Audit-9: deduplication key (null = deduplicate all matching intents).
+    # Audit-9: deduplication key (empty = deduplicate all matching intents).
     dedupKey @11 :Text;
+}
+
+# Declarations about how this intent should be delivered. Each replaces one or
+# more Android activity flags with the question the flag was approximating.
+struct DeliveryHints {
+    # Maximum instances of the target component that may result
+    # (0 = backend default). This is the real question behind
+    # "singleTask"/"singleTop".
+    maxInstances @0 :UInt32;
+    # Whether this intent may appear in a task/recents list. A declaration
+    # about visibility, not an instruction about activity stacks.
+    visibleInRecents @1 :Bool;
+    # Whether this intent is exclusive to its caller.
+    exclusive @2 :Bool;
+    # Whether the caller expects a result and will subscribe for it.
+    expectsResult @3 :Bool;
+    # Authority the target is being granted, as capability references. A
+    # grant IS a capability — not a boolean per permission kind, because a
+    # boolean cannot be attenuated or revoked.
+    grants @4 :List(Capability);
+    metadata @5 :T.StringMap;
 }
 
 # Audit-9: intent priority level.
 enum IntentPriority {
-    lowest @0;
-    low @1;
-    normal @2;
-    high @3;
-    highest @4;
-    custom @5;
+    # Absent means the backend decides; it must never mean a
+    # specific paradigm value.
+    unspecified @0;
+    lowest @1;
+    low @2;
+    normal @3;
+    high @4;
+    highest @5;
+    custom @6;
 }
 
 # Audit-9: retry policy for failed intents.
@@ -74,49 +151,10 @@ struct IntentRetryPolicy {
     enabled @0 :Bool;
     maxAttempts @1 :UInt8;
     backoffMultiplier @2 :Float32;
-    initialDelayMs @3 :UInt32;
+    initialDelay @3 :T.Duration;
 }
 
-# ── Launch flags (typed, not raw bitmap) ────────────────────────────────
-
-struct LaunchFlags {
-    newTask @0 :Bool;
-    singleTop @1 :Bool;
-    newDocument @2 :Bool;
-    clearTop @3 :Bool;
-    clearTask @4 :Bool;
-    clearWhenTaskReset @5 :Bool;
-    excludeFromRecents @6 :Bool;
-    fromHistory @7 :Bool;
-    foreground @8 :Bool;
-    multipleTask @9 :Bool;
-    grantReadUriPermission @10 :Bool;
-    grantWriteUriPermission @11 :Bool;
-    grantPersistableUriPermission @12 :Bool;
-    # Force the intent to be treated as exclusive to this caller.
-    exclusive @13 :Bool;
-}
-
-# ── Categories ───────────────────────────────────────────────────────────
-
-enum IntentCategory {
-    default @0;
-    browsable @1;
-    view @2;
-    edit @3;
-    pick @4;
-    send @5;
-    receive @6;
-    main @7;
-    launcher @8;
-    home @9;
-    preference @10;
-    browserCategory @11;
-    alternative @12;
-    custom @13;
-}
-
-# ── Dispatch type ───────────────────────────────────────────────────────
+# ── Dispatch type ─────────────────────────────────────────────
 
 enum DispatchType {
     # Dispatcher decides based on intent contents.
@@ -128,7 +166,7 @@ enum DispatchType {
     custom @3;
 }
 
-# ── Extras ──────────────────────────────────────────────────────────────
+# ── Extras ────────────────────────────────────────────────────
 
 struct IntentExtras {
     # Typed key-value pairs. Backend validates types.
@@ -142,24 +180,31 @@ struct IntentExtra {
         int @2 :Int64;
         float @3 :Float64;
         bool @4 :Bool;
-        # Base64-encoded binary data.
-        data @5 :Data;
-        # Serialized Cap'n Proto message.
-        capnp @6 :Data;
+        # Binary data, as a buffer reference.
+        data @5 :T.DataHandle;
+        # Serialized Cap'n Proto message, as a buffer reference.
+        # `capnpSchemaId` names the schema, so a consumer can decode it
+        # instead of guessing.
+        capnp @6 :T.DataHandle;
+        capnpSchemaId @7 :T.SchemaId;
+        custom @8 :T.StringMap;
+        unknown @9 :Void;
     }
 }
 
-# ── Component ────────────────────────────────────────────────────────────
+# ── Component ─────────────────────────────────────────────────
 
 struct ComponentInfo {
     name @0 :T.ComponentName;
     label @1 :Text;
     # Icon as inline small data or buffer reference for large icons.
     icon @2 :T.DataHandle;
+    # Open action tokens.
     actions @3 :List(Text);
-    mimeTypes @4 :List(Text);
+    mimeTypes @4 :List(T.MimeType);
     uriPatterns @5 :List(UriPattern);
-    categories @6 :List(IntentCategory);
+    # Open category tokens.
+    categories @6 :List(Text);
     # Priority for ranking when multiple handlers match (higher = preferred).
     priority @7 :Int32;
     # Whether this component is the system-default for this intent.
@@ -176,35 +221,35 @@ struct UriPattern {
     # Exact path (mutually exclusive with pathPrefix).
     pathExact @3 :Text;
     # MIME type this pattern handles.
-    mimeType @4 :Text;
+    mimeType @4 :T.MimeType;
 }
 
-# ── Intent Filter (for resolution) ──────────────────────────────────────
+# ── Intent Filter (for resolution) ───────────────────────────
 
 struct IntentFilter {
     actions @0 :List(Text);
-    categories @1 :List(IntentCategory);
-    mimeTypes @2 :List(Text);
-    schemes @3 :List(Text);
+    categories @1 :List(Text);
+    mimeTypes @2 :List(T.MimeType);
+    schemes @3 :List(T.MimeType);
     paths @4 :List(Text);
 }
 
-# ── Activity Result ─────────────────────────────────────────────────────
+# ── Activity Result ──────────────────────────────────────────
 
 struct ActivityResult {
+    # `firstUser` (Android's RESULT_FIRST_USER range marker) is deleted: an
+    # API constant from one platform that nothing else can produce.
     resultCode @0 :ActivityResultCode;
     data @1 :Intent;
 }
 
-# Typed result code — replaces raw Int32 for forward compatibility.
 enum ActivityResultCode {
     canceled @0;
     ok @1;
-    firstUser @2;
-    custom @3;
+    custom @2;
 }
 
-# ── Dispatch Mode ──────────────────────────────────────────────────────
+# ── Dispatch Mode ────────────────────────────────────────────
 
 enum DispatchMode {
     bestMatch @0;
@@ -213,36 +258,47 @@ enum DispatchMode {
     custom @3;
 }
 
-# ── Service ─────────────────────────────────────────────────────────────
+# ── Service ───────────────────────────────────────────────────
 
 interface IntentService {
-    resolve @0 (intent :Intent, page :T.Pagination) -> (components :List(ResolvedComponent));
-    resolveWithFilter @9 (filter :IntentFilter, page :T.Pagination) -> (components :List(ResolvedComponent));
+    resolve @0 (intent :Intent, page :T.Pagination)
+              -> (components :List(ResolvedComponent), total :UInt64);
 
-    startActivity @1 (intent :Intent, mode :DispatchMode) -> (handle :ActivityHandle);
-    startService @2 (intent :Intent) -> (handle :ServiceHandle);
+    startActivity @1 (intent :Intent, mode :DispatchMode)
+                   -> (result :DispatchResult);
+    startService @2 (intent :Intent) -> (result :DispatchResult);
     sendBroadcast @3 (intent :Intent) -> T.VoidResult;
 
-    waitForResult @4 (handle :ActivityHandle) -> (result :ActivityResult);
+    # Observe an activity's results. Replaces `waitForResult`, which every
+    # caller polled or blocked on.
+    subscribeActivity @4 (handle :ActivityHandle)
+                       -> (subscription :ActivityResultSubscription);
     cancelActivity @5 (handle :ActivityHandle) -> T.VoidResult;
 
     registerHandler @6 (component :ComponentInfo) -> T.VoidResult;
     unregisterHandler @7 (componentName :T.ComponentName) -> T.VoidResult;
-    listHandlers @8 (action :Text, mimeType :Text, page :T.Pagination) -> (components :List(ComponentInfo));
+    listHandlers @8 (action :Text, mimeType :T.MimeType, page :T.Pagination)
+                 -> (components :List(ComponentInfo), total :UInt64);
 
-    # ── Audit-7 additions ────────────────────────────────────
+    resolveWithFilter @9 (filter :IntentFilter, page :T.Pagination)
+                       -> (components :List(ResolvedComponent), total :UInt64);
 
-    # Record an intent workflow for later replay.
-    recordIntent @10 (recording :IntentRecording) -> (recordingId :Text);
+    # ── Recording and replay ─────────────────────────────────
 
-    # Replay a recorded intent workflow.
-    replayIntent @11 (request :IntentReplayRequest) -> (result :IntentReplayResult);
+    # Record a workflow for later replay.
+    record @10 (recording :Recording) -> (recordingId :T.RecordingId);
+
+    # Replay a recorded workflow.
+    replay @11 (request :ReplayRequest) -> (result :ReplayResult);
+
+    # ── History and tracing ──────────────────────────────────
 
     # Query intent history with filtering.
-    getHistory @12 (filter :IntentHistoryFilter, pagination :T.Pagination) -> (entries :List(IntentHistoryEntry));
+    getHistory @12 (filter :IntentHistoryFilter, pagination :T.Pagination)
+                 -> (entries :List(IntentHistoryEntry), total :UInt64);
 
     # Debug trace an intent dispatch (resolve, dispatch, result).
-    traceIntent @13 (intent :Intent) -> (trace :IntentTrace);
+    traceIntent @13 (intent :Intent) -> (result :TraceResult);
 
     # Verify intent authenticity and integrity.
     attestIntent @14 (attestation :IntentAttestation) -> (result :AttestationResult);
@@ -250,30 +306,71 @@ interface IntentService {
     # Get dispatch metrics for monitoring.
     getMetrics @15 () -> (metrics :IntentMetrics);
 
+    # ── Chains ───────────────────────────────────────────────
+
     # Execute a chained workflow of intents.
-    executeChain @16 (chain :IntentChain) -> (chainId :Text);
+    executeChain @16 (chain :IntentChain) -> (chainId :T.IntentChainId);
 
     # Get the status of a running chain.
-    getChainStatus @17 (chainId :Text) -> (chain :IntentChain);
+    getChainStatus @17 (chainId :T.IntentChainId) -> (result :ChainStatusResult);
 
     # Cancel a running chain.
-    cancelChain @18 (chainId :Text) -> T.VoidResult;
+    cancelChain @18 (chainId :T.IntentChainId) -> T.VoidResult;
 
-    # Audit-9: dispatch a batch of intents.
+    # ── Batching and recording management ────────────────────
+
+    # Dispatch a batch of intents.
     dispatchBatch @19 (batch :IntentBatch) -> (result :IntentBatchResult);
 
-    # Audit-10: record a cross-app activity workflow for replay.
-    recordActivity @20 (recording :ActivityRecording) -> (recordingId :Text);
+    # List recorded workflows.
+    listRecordings @20 (pagination :T.Pagination)
+                   -> (recordings :List(Recording), total :UInt64);
 
-    # Audit-10: replay a recorded cross-app activity workflow.
-    replayActivity @21 (request :ActivityReplayRequest) -> (result :ActivityReplayResult);
+    # Delete a recorded workflow.
+    deleteRecording @21 (recordingId :T.RecordingId) -> T.VoidResult;
+}
 
-    # Audit-10: list recorded cross-app activity workflows.
-    listActivityRecordings @22 (pagination :T.Pagination)
-                           -> (recordings :List(ActivityRecording), totalCount :UInt32);
+# ── Results ───────────────────────────────────────────────────
 
-    # Audit-10: delete a recorded activity workflow.
-    deleteActivityRecording @23 (recordingId :Text) -> T.VoidResult;
+struct DispatchResult {
+    union {
+        activity @0 :ActivityHandle;
+        service  @1 :ServiceHandle;
+        # No component could handle the intent. An answer, not a fault the
+        # caller has to infer from a zero handle.
+        unhandled @2 :Void;
+        error   @3 :T.Error;
+        unknown @4 :Void;
+    }
+}
+
+struct ChainStatusResult {
+    union {
+        chain   @0 :IntentChain;
+        error   @1 :T.Error;
+        unknown @2 :Void;
+    }
+}
+
+struct TraceResult {
+    union {
+        trace   @0 :IntentTrace;
+        error   @1 :T.Error;
+        unknown @2 :Void;
+    }
+}
+
+struct ReplayResult {
+    union {
+        completed @0 :ReplaySummary;
+        error     @1 :T.Error;
+        unknown   @2 :Void;
+    }
+}
+
+interface ActivityResultSubscription {
+    pull @0 (maxEvents :UInt32) -> (results :List(ActivityResult));
+    cancel @1 () -> T.VoidResult;
 }
 
 struct ResolvedComponent {
@@ -292,11 +389,11 @@ struct ServiceHandle {
     id @0 :T.ServiceHandleId;
 }
 
-# ── Intent Chaining / Workflow (audit-7) ─────────────────────
+# ── Chains ────────────────────────────────────────────────────
 
 struct IntentChain {
-    # Unique chain identifier.
-    id @0 :Text;
+    # Unique chain identifier, server-issued.
+    id @0 :T.IntentChainId;
     # Human-readable chain name.
     name @1 :Text;
     # Ordered list of steps in the chain.
@@ -339,91 +436,102 @@ struct IntentPostcondition {
     timeout @1 :T.Duration;
 }
 
+# A condition names an intent field with an OPEN TOKEN and compares a TYPED
+# value. The previous spelling compared two Text values, so a boolean became
+# "true" by convention and a future intent field could not be branched on
+# without a string convention shared across backends.
 struct IntentCondition {
-    # Intent field name to check.
     field @0 :Text;
     operator @1 :ConditionOp;
-    # Value to compare against.
-    value @2 :Text;
+    value @2 :T.MetaValue;
 }
 
 enum ConditionOp {
-    equals @0;
-    notEquals @1;
-    contains @2;
-    exists @3;
-    notExists @4;
-    custom @5;
+    # Absent means the backend decides; it must never mean a
+    # specific paradigm value.
+    unspecified @0;
+    equals @1;
+    notEquals @2;
+    contains @3;
+    exists @4;
+    notExists @5;
+    custom @6;
 }
 
-# ── Intent Recording (audit-7) ───────────────────────────────
+# ── Recording and replay (ONE model) ─────────────────────────
 
-struct IntentRecording {
-    # Unique recording identifier.
-    id @0 :Text;
-    # Human-readable recording name.
+# A recording is an ordered list of steps. `app` records which app handled a
+# step; absent when the step is being authored rather than replayed. That is
+# what collapsed the two parallel families: an intent recording and a
+# cross-app activity recording are the same thing.
+struct Recording {
+    id @0 :T.RecordingId;
     name @1 :Text;
-    # Description of what this recording does.
     description @2 :Text;
-    # Ordered steps in the recording.
-    steps @3 :List(IntentStep);
-    # When this recording was created.
+    steps @3 :List(RecordingStep);
     createdAt @4 :T.Timestamp;
-    # Total duration of the recording.
     duration @5 :T.Duration;
-    # How this recording was triggered.
-    trigger @6 :RecordingTrigger;
+    # Apps involved in this recording.
+    apps @6 :List(T.AppId);
+    # How this recording was triggered — an open token.
+    trigger @7 :Text;
+    metadata @8 :T.StringMap;
 }
 
-enum RecordingTrigger {
-    manual @0;
-    shortcut @1;
-    voice @2;
-    gesture @3;
-    schedule @4;
-    custom @5;
+struct RecordingStep {
+    # The intent to dispatch for this step.
+    intent @0 :Intent;
+    # The app that handled this step, when recorded.
+    app @1 :T.AppId;
+    # Expected conditions before this step.
+    preconditions @2 :List(IntentCondition);
+    # Expected conditions after this step.
+    postconditions @3 :List(IntentCondition);
+    # Maximum time to wait for this step.
+    timeout @4 :T.Duration;
+    # Whether to skip this step if the previous step failed.
+    skipOnError @5 :Bool;
+    metadata @6 :T.StringMap;
 }
 
-# ── Intent Replay (audit-7) ──────────────────────────────────
-
-struct IntentReplayRequest {
+struct ReplayRequest {
     # Recording to replay.
-    recordingId @0 :Text;
+    recordingId @0 :T.RecordingId;
     # Override parameters for the replay.
     parameters @1 :T.StringMap;
     # Replay speed (1.0 = normal, 2.0 = double speed).
     speed @2 :Float32;
     # Validate without executing.
     dryRun @3 :Bool;
+    # Start from a specific step index (0-based).
+    startStep @4 :UInt32;
 }
 
-struct IntentReplayResult {
-    # Whether the replay completed successfully.
-    success @0 :Bool;
+struct ReplaySummary {
     # Number of steps executed.
-    stepsExecuted @1 :UInt32;
+    stepsExecuted @0 :UInt32;
     # Total steps in the recording.
-    stepsTotal @2 :UInt32;
+    stepsTotal @1 :UInt32;
     # Total replay duration.
-    duration @3 :T.Duration;
+    duration @2 :T.Duration;
     # Errors encountered during replay.
-    errors @4 :List(IntentReplayError);
+    errors @3 :List(ReplayError);
+    metadata @4 :T.StringMap;
 }
 
-struct IntentReplayError {
+struct ReplayError {
     # Step index where the error occurred.
     step @0 :UInt32;
-    # Error description.
-    reason @1 :T.Error;
-    # The intent that failed.
-    intent @2 :Intent;
+    # Routable error, not prose.
+    error @1 :T.Error;
+    metadata @2 :T.StringMap;
 }
 
-# ── Intent History (audit-7) ─────────────────────────────────
+# ── History ───────────────────────────────────────────────────
 
 struct IntentHistoryEntry {
-    # Unique history entry identifier.
-    id @0 :Text;
+    # Unique history entry identifier, server-issued.
+    id @0 :T.IntentHistoryId;
     # The intent that was dispatched.
     intent @1 :Intent;
     # The result of the dispatch.
@@ -453,11 +561,10 @@ struct IntentHistoryFilter {
     success @5 :T.BoolFilter;
 }
 
-# ── Intent Debug Trace (audit-7) ─────────────────────────────
+# ── Debug Trace ───────────────────────────────────────────────
 
 struct IntentTrace {
-    # Unique trace identifier.
-    id @0 :Text;
+    id @0 :T.IntentTraceId;
     # The intent that was traced.
     intent @1 :Intent;
     # Resolution details (which candidates, why this one was selected).
@@ -499,17 +606,19 @@ struct TraceStep {
     timestamp @1 :T.Timestamp;
     # How long this step took.
     duration @2 :T.Duration;
-    # Input data for this step.
-    input @3 :Data;
+    # Input data for this step. A buffer reference: a trace of a
+    # document-sized intent must not copy the document per step.
+    input @3 :T.DataHandle;
     # Output data from this step.
-    output @4 :Data;
+    output @4 :T.DataHandle;
     # Whether this step succeeded.
     success @5 :Bool;
     # Error if this step failed.
     error @6 :T.Error;
+    metadata @7 :T.StringMap;
 }
 
-# ── Intent Attestation (audit-7) ─────────────────────────────
+# ── Attestation ───────────────────────────────────────────────
 
 struct IntentAttestation {
     # The calling component.
@@ -522,20 +631,24 @@ struct IntentAttestation {
     nonce @3 :Data;
     # Cryptographic signature.
     signature @4 :Data;
-    # Signature algorithm (e.g., "ed25519", "rsa-pss-sha256").
+    # Signature algorithm (e.g. "ed25519", "rsa-pss-sha256") — an open token.
     algorithm @5 :Text;
 }
 
 struct AttestationResult {
-    # Whether the attestation is valid.
-    valid @0 :Bool;
-    # Reason if invalid.
-    reason @1 :Text;
-    # When the verification was performed.
-    verifiedAt @2 :T.Timestamp;
+    union {
+        valid @0 :AttestationOk;
+        invalid @1 :T.Error;
+        unknown @2 :Void;
+    }
 }
 
-# ── Intent Metrics (audit-7) ─────────────────────────────────
+struct AttestationOk {
+    # When the verification was performed.
+    verifiedAt @0 :T.Timestamp;
+}
+
+# ── Metrics ───────────────────────────────────────────────────
 
 struct IntentMetrics {
     # Total intents dispatched.
@@ -559,24 +672,25 @@ struct IntentActionMetrics {
     errorRate @3 :Float32;
 }
 
-# ── Audit-9: Intent Batching ─────────────────────────────────
+# ── Batching ──────────────────────────────────────────────────
 
-# Audit-9: a batch of intents for bulk dispatch.
 struct IntentBatch {
-    id @0 :Text;
-    intents @1 :List(Intent);
+    intents @0 :List(Intent);
     # How to handle partial failure.
-    failureMode @2 :BatchFailureMode;
+    failureMode @1 :BatchFailureMode;
 }
 
 enum BatchFailureMode {
+    # Absent means the backend decides; it must never mean a
+    # specific paradigm value.
+    unspecified @0;
     # All intents must succeed.
-    allOrNothing @0;
+    allOrNothing @1;
     # Continue on failure; collect errors.
-    continueOnFailure @1;
+    continueOnFailure @2;
     # Stop at first failure.
-    stopOnFirst @2;
-    custom @3;
+    stopOnFirst @3;
+    custom @4;
 }
 
 struct IntentBatchResult {
@@ -591,81 +705,26 @@ struct IntentBatchError {
     error @2 :T.Error;
 }
 
-# ── Audit-9: Intent Access Control ──────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Published so today's tools have a discoverable spelling for actions and
+# categories. An unrecognised value MUST be ignored, never rejected. They are
+# Text and deliberately NOT enums: a registration vocabulary is unbounded and
+# per-platform, and freezing it would make a 2046 category unregisterable.
+# ══════════════════════════════════════════════════════════════════════
 
-struct IntentAccessPolicy {
-    caller @0 :T.ComponentName;
-    allowedActions @1 :List(Text);
-    deniedActions @2 :List(Text);
-    maxPerMinute @3 :UInt32;
-}
+const actionView    :Text = "view";
+const actionEdit    :Text = "edit";
+const actionPick    :Text = "pick";
+const actionSend    :Text = "send";
+const actionReceive :Text = "receive";
+const actionMain    :Text = "main";
+const actionChooser :Text = "chooser";
 
-interface IntentAccessService {
-    checkAccess @0 (caller :T.ComponentName, intent :Intent) -> (allowed :Bool, reason :Text);
-    setPolicy @1 (policy :IntentAccessPolicy) -> T.VoidResult;
-    getPolicy @2 (caller :T.ComponentName) -> (policy :IntentAccessPolicy);
-    listPolicies @3 (pagination :T.Pagination) -> (policies :List(IntentAccessPolicy));
-}
-
-# ── Audit-10: Cross-App Activity Replay ──────────────────────
-
-# Audit-10: recorded cross-app activity workflow (multi-app sequence).
-struct ActivityRecording {
-    id @0 :Text;
-    name @1 :Text;
-    description @2 :Text;
-    # Ordered steps across multiple apps.
-    steps @3 :List(ActivityStep);
-    # When this recording was created.
-    createdAt @4 :T.Timestamp;
-    # Total duration of the recording.
-    duration @5 :T.Duration;
-    # Apps involved in this recording.
-    apps @6 :List(T.AppId);
-}
-
-# Audit-10: a single step in a cross-app activity.
-struct ActivityStep {
-    # The intent to dispatch.
-    intent @0 :Intent;
-    # The app that handled this step.
-    app @1 :T.AppId;
-    # Expected conditions before this step.
-    preconditions @2 :List(IntentCondition);
-    # Expected conditions after this step.
-    postconditions @3 :List(IntentCondition);
-    # Maximum time to wait for this step.
-    timeout @4 :T.Duration;
-    # Whether to skip this step if the previous step failed.
-    skipOnError @5 :Bool;
-}
-
-# Audit-10: request to replay a recorded activity.
-struct ActivityReplayRequest {
-    recordingId @0 :Text;
-    # Override parameters for the replay (key-value).
-    parameters @1 :T.StringMap;
-    # Replay speed (1.0 = normal, 2.0 = double speed).
-    speed @2 :Float32;
-    # Validate without executing.
-    dryRun @3 :Bool;
-    # Start from a specific step index (0-based).
-    startStep @4 :UInt32;
-}
-
-# Audit-10: result of replaying a recorded activity.
-struct ActivityReplayResult {
-    success @0 :Bool;
-    stepsExecuted @1 :UInt32;
-    stepsTotal @2 :UInt32;
-    duration @3 :T.Duration;
-    errors @4 :List(ActivityReplayError);
-}
-
-# Audit-10: error encountered during activity replay.
-struct ActivityReplayError {
-    step @0 :UInt32;
-    intent @1 :Intent;
-    app @2 :T.AppId;
-    error @3 :T.Error;
-}
+const categoryDefault     :Text = "default";
+const categoryBrowsable   :Text = "browsable";
+const categoryLauncher    :Text = "launcher";
+const categoryHome        :Text = "home";
+const categoryPreference  :Text = "preference";
+const categoryAlternative :Text = "alternative";

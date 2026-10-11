@@ -15,7 +15,7 @@
 #   - All raw UInt64 → typed IDs (T.FramebufferId)
 #   - All enums have custom variant for forward compatibility
 #   - AtomicRejection.target is now typed enum (was bare Text)
-#   - DisplayMode flags is now typed DisplayFlag enum (was raw UInt32)
+#   - FramebufferDisplayMode flags is now typed DisplayFlag enum (was raw UInt32)
 #   - alpha prop is now typed Alpha capability bits struct
 #   - T.Pagination for list operations
 #   - T.Error for failure paths
@@ -158,7 +158,7 @@ struct Crtc {
     transform @2 :T.SurfaceTransform;
 
     # Mode currently active.
-    mode @3 :DisplayMode;
+    mode @3 :FramebufferDisplayMode;
 
     # Plane stack for this CRTC.
     planeIds @4 :List(T.PlaneId);
@@ -170,7 +170,7 @@ struct Crtc {
     enabled @6 :Bool;
 }
 
-struct DisplayMode {
+struct FramebufferDisplayMode {
     # Pixel clock in Hz × 1000 (so 60000 = 60 MHz).
     pixelClockMilliHz @0 :UInt64;
     # Horizontal: visible + front porch + sync + back porch.
@@ -245,14 +245,42 @@ struct AtomicTestResult {
     rejections @1 :List(AtomicRejection);
 }
 
+# Why one entry was rejected. The previous shape carried THREE references
+# to the same resource (a kind enum, a bare UInt64, and a typed union)
+# with a comment telling consumers to prefer one of them — three
+# spellings of one reference where one would do, and an implementer trap
+# for the other two.
 struct AtomicRejection {
-    target @0 :AtomicTargetKind;
-    # Legacy target ID — Interpret according to `target` kind.
-    # Prefer typedId for new consumers.
-    targetId @1 :UInt64;
-    reason @2 :T.Error;
-    # Typed target ID — unambiguous reference to the rejected resource.
-    typedId @3 :AtomicTargetId;
+    typedId @0 :AtomicTargetId;
+    reason @1 :T.Error;
+}
+
+# What to stage. This is the input the atomic methods never had: the
+# complete set of property changes to validate together, addressed by the
+# AtomicTargetId union that already existed but was only ever used in a
+# rejection — i.e. the typed-target machinery was forward-compat
+# scaffolding for an operation that could not be performed.
+#
+# Each entry is one proposed change to one resource. `properties` carries
+# the change itself as an open key/value map so that a 2046 property
+# needs no ordinal.
+struct AtomicEntry {
+    target @0 :AtomicTargetId;
+    # The proposed property values. A backend that does not recognise a
+    # key ignores it rather than rejecting the whole configuration
+    # (ai.capnp:43-47).
+    properties @1 :T.StringMap;
+}
+
+struct AtomicRequest {
+    entries @0 :List(AtomicEntry);
+    # Whether the commit may tear (present before the new configuration
+    # is fully active). False is the safe default and is what a
+    # compositor needs.
+    allowTearing @1 :Bool = false;
+    # Test-only: validate the configuration without applying anything.
+    test @2 :Bool = false;
+    metadata @3 :T.StringMap;
 }
 
 # Typed target reference — replaces bare UInt64 for forward compatibility.
@@ -289,19 +317,28 @@ interface FramebufferService {
     capabilities @3 () -> (caps :FramebufferCaps);
 
     # Test an atomic configuration without committing it.
-    testAtomic @4 () -> (result :AtomicTestResult);
+    #
+    # THE PREVIOUS SHAPE TOOK NO PARAMETERS AT ALL — both atomic methods
+    # were `() -> (...)`, while the only configuration channel in the
+    # entire interface was a set of per-framebuffer setters. So a backend
+    # could not stage a mode set, validate it and commit it: it had to
+    # call six setters and hope. The whole point of an atomic test is to
+    # say "would THIS work" before doing it, and "this" could not be
+    # expressed. (Both methods were `()`, so adding a parameter is
+    # ordinal-neutral.)
+    testAtomic @4 (request :AtomicRequest) -> (result :AtomicTestResult);
 
     # Commit an atomic configuration. Always interleaved with `testAtomic`.
-    commitAtomic @5 () -> (result :T.VoidResult);
+    commitAtomic @5 (request :AtomicRequest) -> (result :T.VoidResult);
+
+    # Subscribe to hotplug events.
+    subscribe @6 () -> (subscription :FramebufferSubscription);
 
     # Get plane by ID.
     getPlane @7 (planeId :T.PlaneId) -> (plane :Plane);
 
     # List all planes.
     listPlanes @8 (pagination :T.Pagination) -> (planes :List(Plane), total :UInt64);
-
-    # Subscribe to hotplug events.
-    subscribe @6 () -> (subscription :FramebufferSubscription);
 
     # ── Audit-7 additions ──
     # Get HDR capabilities for a framebuffer.
@@ -337,7 +374,10 @@ interface FramebufferService {
     disconnectDisplay @20 (outputId :T.OutputId) -> T.VoidResult;
 
     # ── Display power management (audit-9 What's Still Missing) ──
-    setDpmsState @21 (framebufferId :T.FramebufferId, state :DpmsState) -> T.VoidResult;
+    # T.PowerSleepState, not a local DpmsState: display power state is
+    # one concept with one vocabulary (types.capnp:2140), and the local
+    # copy was a verbatim duplicate of display.capnp's.
+    setDpmsState @21 (framebufferId :T.FramebufferId, state :T.PowerSleepState) -> T.VoidResult;
 
     # ── Display rotation (audit-9 What's Still Missing) ──
     setRotation @22 (framebufferId :T.FramebufferId, rotation :DisplayRotation) -> T.VoidResult;
@@ -354,6 +394,15 @@ interface FramebufferSubscription {
     cancel @1 () -> T.VoidResult;
 }
 
+# Unknown values are ignored, never rejected (ai.capnp:43-47). Without
+# this arm a backend adding a modeset, HDR-metadata or frame-timing
+# event has to overload `changed` — and the file's own header claimed
+# every enum had a forward-compat variant while this union had none.
+struct UnknownFramebufferEvent {
+    typeId @0 :UInt64;
+    payload @1 :Data;
+}
+
 struct FramebufferEvent {
     timestamp @0 :T.Timestamp;
     union {
@@ -363,6 +412,7 @@ struct FramebufferEvent {
         crtcChanged @4 :Crtc;
         planeChanged @5 :Plane;
         atomicRejected @6 :AtomicRejection;
+        unknown @7 :UnknownFramebufferEvent;
     }
 }
 
@@ -448,7 +498,12 @@ struct GpuPassthroughInfo {
     vendor @0 :Text;
     deviceId @1 :UInt32;
     passthroughMode @2 :PassthroughMode;
-    vfioGroup @3 :UInt32;
+    # Opaque, backend-decided passthrough locator. VFIO is a Linux
+    # kernel API: a microkernel GPU service, macOS, or an embedded RTOS
+    # has no "group" to report, and must previously invent a number for
+    # a required field. The locator is now whatever the backend needs it
+    # to be, with no platform named in the contract.
+    passthroughLocator @3 :Data;
     memorySize @4 :UInt64;
 }
 

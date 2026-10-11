@@ -73,10 +73,10 @@ BufferId                                          AudioFormat
 | Rejected | Reason | Replacement |
 |----------|--------|-------------|
 | `inode`, `device` (files) | Filesystem internals | Opaque `FileHandle` + `FileInfo` query |
-| `zombie`, `defunct` (process) | POSIX-specific | Universal: `active`, `blocked`, `suspended`, `terminated` |
+| `zombie`, `defunct` (process) | POSIX-specific | Universal: `active`, `blocked`, `suspended`, `terminated` (`T.ExecutionState`) |
 | `stdout`, `stderr`, `journal` (logging) | Backend-specific | Opaque `Data` target |
 | `cr3`, `HHDM` (kernel) | x86-specific | `pageTableRoot`, `bootstrapPointer` |
-| `systemd`, `syslinux` (boot) | Product names | `BootloaderKind { limine, grub, uefiDirect, custom }` |
+| `systemd`, `syslinux` (boot) | Product names | **No enum at all.** An earlier draft of this document prescribed `BootloaderKind { limine, grub, uefiDirect, custom }` — which is the same violation it was rejecting. The replacement is an OPEN TEXT TOKEN the backend declares; a consumer that does not recognise the token ignores it. `boot.capnp` now follows this. |
 
 ### Implementation Details
 | Rejected | Reason |
@@ -91,11 +91,40 @@ BufferId                                          AudioFormat
 
 ## Schema Evolution Rules (Guarantees Timelessness)
 
-1. **Ordinal stability** — Once published, an ordinal is permanent. Never reuse or reorder.
+> **PRE-RELEASE CARVE-OUT — read this first.**
+>
+> Rules 1–4 below bound a PUBLISHED protocol. They apply after the first
+> external release, because from that moment a schema id is a promise to
+> someone who is not in this room.
+>
+> Before that release — the state of this repository today — nothing
+> external consumes these schemas, and no ordinal, type or interface is
+> yet a promise. Every fix is therefore still free, and a defect kept
+> "for wire compatibility" with a protocol nobody speaks is a defect
+> kept forever. So, pre-release:
+>
+>   * ordinals MAY be renumbered, reordered and reclaimed (they are
+>     repurposed freely — the revamp did so in boot, kernel, logging,
+>     klog, diagnostics, process, session, hal, init, service,
+>     discovery, queue, task_scheduler, signal, system, abi, types and
+>     capability);
+>   * types and interfaces MAY be deleted outright — no deprecation
+>     comment is required for something no consumer ever held;
+>   * DELETE is preferable to deprecate-and-keep, because a deprecated
+>     variant that survives this wave becomes the next schema's example;
+>   * the tree's own `scripts/validate.py` is the gate: it must stay
+>     green, and the revamp extended it (E9–E14) to check the rules that
+>     were previously only prose.
+>
+> A BREAKING change to an already-published schema still requires a new
+> schema ID (rule 3) — the carve-out expires at first release, not at
+> convenience.
+
+1. **Ordinal stability** — Once published, an ordinal is permanent. Never reuse or reorder. (See the carve-out above: pre-release, revise freely.)
 2. **Additive only** — New methods, types, enum variants, fields → minor version.
 3. **Breaking = new schema ID** — Removing methods, changing signatures, changing field types → major version (new `@0x...`).
-4. **Deprecate, don't delete** — `# Deprecated: use newMethod instead. Ordinal preserved for wire compatibility.`
-5. **Forward compatibility** — Every union MUST have `unknown @N :UnknownEvent { typeId: UInt64, payload: Data }`
+4. **Deprecate, don't delete** — `# Deprecated: use newMethod instead. Ordinal preserved for wire compatibility.` (Pre-release: delete instead — see the carve-out.)
+5. **Forward compatibility** — Every union MUST have `unknown @N :UnknownEvent { typeId: UInt64, payload: Data }`, promoted to `types.capnp` so the pattern is checkable against one canonical type. The rule binds EVENT and SPECIFICATION unions, where a producer must forward a kind it did not foresee. The three terminal unions are exempt by construction: `T.VoidResult` and `T.BoolResult` carry `T.Error` (their non-success arm IS the extension point), and `T.DataHandle` is closed (inline bytes or a buffer reference — there is no third possibility).
 6. **ABI negotiation** — Use `abi.capnp` to declare supported versions at startup.
 
 ---
@@ -159,13 +188,24 @@ interface MyService {
 **Why:** a per-method parameter duplicates authority the reference already
 carries, producing two authority paths that must agree forever — every future
 method can get one wrong. Attenuation and revocation belong to
-`capability.capnp` (`attenuate @2`, `revoke @4`, `revokeControlled @9`).
+`capability.capnp` (`attenuate @2`, `revoke @4`, `revokeControlled @8`).
+
+**The one exception, stated so it is not mistaken for a violation:** the five
+methods in `capability.capnp` that take a `Capability` parameter
+(`attenuate`, `transfer`, `revoke`, `revokeControlled`,
+`evaluateCondition`) act ON the capability named by that parameter — the
+parameter is the object under manipulation, not an authority token. That is
+the only file in the protocol where this is true, and `scripts/validate.py`
+rule E11 encodes exactly this shape: a `Capability` parameter is legal on a
+root accessor that returns a service (the ai.capnp precedent) and inside
+`capability.capnp` itself, nowhere else.
 
 **Reference implementation:** `schema/ai.capnp` — `Capability` appears only on
 `interface AI` accessors, never inside a service method. Enforced by validator
-rule E3. See plan task 16 for the migration of the older per-method pattern,
-which was implemented in only 5 methods repo-wide, all inside `capability.capnp`
-itself.
+rule E3. The older per-method pattern survives only in the exception above;
+every other per-method authority token in the tree (free-text `authority`
+headers, `requiredCaps :List(Text)`, RBAC role strings, ACLs, per-command
+capability parameters) was deleted in the revamp.
 
 ---
 

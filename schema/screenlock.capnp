@@ -1,6 +1,15 @@
 @0xa1b2c3d4e5f60033;
 
 using T = import "types.capnp";
+# The one service-session handshake. compositor.capnp hosts the shared types
+# (`SessionRequest`, `SessionResponse`, `HandshakeResult`, `CapabilityRequest`,
+# `ServiceInfo`) and ime, shell, windowmanager and this file import them
+# instead of re-declaring a fifth dialect. This file carried its own private
+# `HandshakeRequest`/`HandshakeResponse`/`HandshakeResult` trio until the
+# 2026-10-10 integration pass, which is the drift the shared handshake
+# exists to stop: a lock screen that could not negotiate a protocol version
+# or request a capability at handshake could only be opened or refused.
+using C = import "compositor.capnp";
 
 # ══════════════════════════════════════════════════════════════════════
 # Screen Lock — device lock screen, idle management, lock/unlock lifecycle.
@@ -13,15 +22,21 @@ using T = import "types.capnp";
 #   - applicationId uses T.AppId (was raw Text).
 #   - UnlockCredential is the canonical credential union.
 #   - IdleChangedEvent uses T.Duration (was raw UInt64 ms).
-#   - HandshakeResult has custom variant for forward compatibility.
 #   - UnlockResult has custom variant for forward compatibility.
 #   - UnlockResult.failedError uses T.Error (audit-3, replaces raw UInt32).
 #   - UnlockResult.lockedOutDuration uses T.Duration (audit-3, replaces raw UInt32).
 #   - All enums have forward-compatibility escape hatches.
 #
+# Integration pass (2026-10-10): the private handshake trio is gone. The
+# handshake is `C.SessionRequest` -> `C.SessionResponse`, exactly as
+# compositor, ime, shell and windowmanager already did, so a lock screen
+# negotiates the same protocol version, receives the same `HandshakeResult`
+# and the same granted/denied capability reporting, and publishes itself
+# with the same `C.ServiceInfo`.
+#
 # Audit-7 improvements:
 #   - UnlockCredential extended: pattern, face, voice, presence, nfc, duress.
-#   - Session methods: addLockScreenWidget, removeLockScreenWidget, listLockScreenWidgets,
+#   - ScreenlockSession methods: addLockScreenWidget, removeLockScreenWidget, listLockScreenWidgets,
 #     setSecurityPolicy, getSecurityPolicy, reportHostileEnvironment,
 #     setBiometricStepUp, getBiometricStepUp, reportWearablePresence,
 #     addLockScreenNotification, removeLockScreenNotification.
@@ -34,29 +49,32 @@ using T = import "types.capnp";
 #   - WearablePresence for proximity-based unlock.
 # ══════════════════════════════════════════════════════════════════════
 
-interface Session {
+interface ScreenlockSession {
 
-    struct HandshakeRequest {
-        applicationId @0 :T.AppId;
-        version       @1 :T.Version;
-        metadata      @2 :List(T.Meta);
-    }
-
+    # The shared handshake, not a private one: the caller states which
+    # application it is, which version of THIS protocol it speaks, and which
+    # capabilities it wants; the backend answers with the agreed version,
+    # what it granted, what it denied and why, and what it is. `service`
+    # is the shared `C.ServiceInfo` — name, version, open capability tokens,
+    # metadata — so every session-based service in the tree publishes the
+    # same self-description.
     struct HandshakeResponse {
-        sessionId @0 :T.SessionId;
-        result    @1 :HandshakeResult;
+        sessionId     @0 :T.SessionId;
+        agreedVersion @1 :T.Version;
+        granted       @2 :List(C.GrantedCapability);
+        denied        @3 :List(C.DeniedCapability);
+        # Ungated discovery of what this lock screen is, published before
+        # any capability is held, so a caller can learn before it acts.
+        service       @4 :C.ServiceInfo;
+        result        @5 :C.HandshakeResult;
+        metadata      @6 :T.StringMap;
     }
 
-    enum HandshakeResult {
-        accepted @0;
-        rejected @1;
-        custom   @2;
-    }
-
-    handshake @0 (request :HandshakeRequest)
+    handshake @0 (request :C.SessionRequest)
                -> (response :HandshakeResponse);
 
     # -- System Side --
+
 
     lock            @1 () -> (result :T.VoidResult);
     unlock          @2 (credential :UnlockCredential) -> (result :UnlockResult);

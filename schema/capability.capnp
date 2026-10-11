@@ -3,11 +3,12 @@
 # ═══════════════════════════════════════════════════════════════════════
 # Capability — the universal currency of authority
 #
-# A capability is opaque content-addressed proof that the holder may invoke
-# a specific operation on a specific target, optionally constrained. It is
-# backend-agnostic: any service that issues a capability has freedom in how
-# it backs that capability (kernel object, signed token, distributed ledger).
-# Applications see only the type, never the backing.
+# A capability is opaque, content-addressed proof that the holder may
+# invoke a specific operation on a specific target, optionally
+# constrained. It is backend-agnostic: a service that issues a capability
+# has freedom in how it backs that capability (kernel object, signed
+# token, distributed ledger). Applications see only the type, never the
+# backing.
 #
 # Targets are textual paths into any namespace. Examples:
 #   "audio/device/speaker"
@@ -15,6 +16,39 @@
 #   "input/keyboard/0"
 #   "service/audio"
 # Backends decide how to interpret each target; the protocol is timeless.
+#
+# ── AUTHORITY IS THE REFERENCE ─────────────────────────────────────────
+#
+# In Cap'n Proto RPC a capability IS a reference: holding it conveys the
+# authority to call it. So authority is expressed by WHICH REFERENCE A
+# CALLER HOLDS, granted once at acquisition, and every method below takes
+# no authority token. `schema/ai.capnp` is the reference implementation
+# (validator rule E3); this file is the second half — it owns attenuation
+# and revocation so that no service ever re-specifies them.
+#
+# The exception, stated so it is not mistaken for a violation: the five
+# methods that take a `Capability` parameter (attenuate, transfer, revoke,
+# revokeControlled, evaluateCondition) act ON the capability named by that
+# parameter. The parameter is the object under manipulation, not an
+# authority token. There is exactly one file in the protocol where that is
+# true, and this is it.
+#
+# Delegation lives here too. Delegating a capability to another holder is
+# `attenuate` (weaken: fewer operations, tighter constraints) followed by
+# `transfer` (hand the reference over). `DelegationChain` records the
+# parentage so a revoked root takes its derivatives with it. There is no
+# delegation method in boot.capnp, kernel.capnp or anywhere else — that
+# was the pre-revamp state and it was a second, unenforced authority
+# grammar.
+#
+# ── WHAT WAS DELETED, AND WHY ──────────────────────────────────────────
+#
+# negotiate / compose / proposeExchange / acceptExchange / rejectExchange /
+# requestTransferApproval / approveTransfer / denyTransfer: a capability
+# market with human approval flows. None of it is needed to prove an
+# operation on a target, all of it had to be implemented and kept
+# consistent, and a 2046 system gains nothing from it. Attenuation and
+# transfer, both typed and both error-honest, cover the real cases.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
@@ -42,17 +76,21 @@ struct Capability {
     # When this capability expires (zero means never). Optional.
     expiry @5 :T.Timestamp;
 
-    # Audit-7: delegation chain tracking (parent→child→grandchild).
+    # Delegation chain tracking (parent→child→grandchild).
     chain @6 :DelegationChain;
 
-    # Audit-7: conditional validity (network, time, location, device).
+    # Conditional validity. `type` is an OPEN token — network, time,
+    # location and device are today's examples, not a closed list: a
+    # condition invented in 2046 ("inside a trusted enclave") needs no
+    # schema edit. Unrecognised condition types are ignored by consumers
+    # and enforced by the backend that issued them.
     conditions @7 :List(CapabilityCondition);
 
-    # Audit-7: usage analytics metadata.
+    # Usage tracking metadata.
     usage @8 :CapabilityUsage;
 }
 
-# Audit-7: tracks the delegation chain from root to this capability.
+# The delegation chain from root to this capability.
 struct DelegationChain {
     # Root capability ID (the original issued capability).
     rootId @0 :Data;
@@ -64,25 +102,17 @@ struct DelegationChain {
     ancestors @3 :List(Data);
 }
 
-# Audit-7: condition that must be true for the capability to be valid.
+# A condition that must be true for the capability to be valid.
 struct CapabilityCondition {
     # Condition identifier.
     conditionId @0 :UInt64;
-    # Type of condition.
-    type @1 :CapabilityConditionType;
+    # Open condition token (e.g. "network", "time", "location", "device").
+    type @1 :Text;
     # Condition-specific parameters (backend-defined).
     params @2 :T.StringMap;
 }
 
-enum CapabilityConditionType {
-    network @0;        # Must be on specific network
-    time @1;           # Must be within time window
-    location @2;       # Must be at specific location
-    device @3;         # Must be on specific device
-    custom @4;
-}
-
-# Audit-7: usage tracking metadata.
+# Usage tracking metadata.
 struct CapabilityUsage {
     # Total number of times this capability has been used.
     useCount @0 :UInt64;
@@ -96,6 +126,12 @@ struct CapabilityUsage {
     maxDelegationDepth @4 :UInt32;
 }
 
+# The authority algebra. Closed because it is a grammar, not a fashion:
+# a holder reads, writes, executes, subscribes, publishes, creates,
+# destroys, attenuates, transfers and revokes — and `custom` carries a
+# verb a backend needs that is not in this list. New values do not need
+# to be added here to be usable: the field is an open list of tokens on
+# the wire.
 enum Operation {
     read @0;
     write @1;
@@ -149,7 +185,16 @@ struct Audit {
     proof @3 :Data;
 }
 
-# Capability service — issues, attenuates, verifies, revokes.
+# ── The authority service ───────────────────────────────────────────────
+# This is the root of the authority domain: like `AI` in ai.capnp it is
+# handed to the caller by the host, so it is deliberately not returned by
+# any method. Every interface below it is.
+#
+# `verify` returns T.BoolResult, which distinguishes "denied" from
+# "un-enforceable" only through the Error code — a backend that cannot
+# honour a constraint MUST say so with a non-permissionDenied code rather
+# than answering `false` for two different reasons.
+
 interface CapabilityService {
     # Issue a fresh capability from scratch (caller must hold authority by
     # some out-of-band mechanism; this is the genesis point).
@@ -159,7 +204,9 @@ interface CapabilityService {
     verify @1 (request :VerifyRequest) -> (result :T.BoolResult);
 
     # Derive a weaker capability from a stronger one.
-    # Requires the parent has `attenuate` in its operations.
+    # Requires the parent has `attenuate` in its operations — the
+    # precondition is stated here and enforced by the backend, exactly
+    # like every other precondition in this file.
     attenuate @2 (parent :Capability, drops :List(Operation), tighter :Constraints) -> (result :T.BoolResult);
 
     # Transfer to another holder (capability unchanged, registry updated).
@@ -172,74 +219,38 @@ interface CapabilityService {
     list @5 (filter :CapabilityFilter, pagination :T.Pagination) -> (caps :List(Capability), totalCount :UInt32);
 
     # Subscribe to capability changes (issued, attenuated, revoked).
+    # Holding the returned subscription IS the authority to pull.
     subscribe @6 () -> (subscription :CapabilitySubscription);
 
-    # Pull events via service (alternative to holding subscription reference).
-    pull @7 (subscription :CapabilitySubscription) -> (events :List(CapabilityEvent));
+    # Refresh an expiring capability.
+    refresh @7 (request :RefreshRequest) -> (capability :Capability);
 
-    # Audit-7: refresh an expiring capability.
-    refresh @8 (request :RefreshRequest) -> (capability :Capability);
+    # Revoke with cascade control.
+    revokeControlled @8 (cap :Capability, cascade :RevocationCascade) -> (result :T.BoolResult);
 
-    # Audit-7: revoke with cascade control.
-    revokeControlled @9 (cap :Capability, cascade :RevocationCascade) -> (result :T.BoolResult);
+    # Create a named capability group.
+    createGroup @9 (group :CapabilityGroup) -> T.VoidResult;
 
-    # Audit-7: create a named capability group.
-    createGroup @10 (group :CapabilityGroup) -> T.VoidResult;
+    # List capability groups.
+    listGroups @10 (pagination :T.Pagination) -> (groups :List(CapabilityGroup), totalCount :UInt32);
 
-    # Audit-7: list capability groups.
-    listGroups @11 (pagination :T.Pagination) -> (groups :List(CapabilityGroup), totalCount :UInt32);
+    # Evaluate a capability condition.
+    evaluateCondition @11 (cap :Capability, condition :CapabilityCondition) -> (valid :Bool);
 
-    # Audit-7: evaluate a capability condition.
-    evaluateCondition @12 (cap :Capability, condition :CapabilityCondition) -> (valid :Bool);
-
-    # Audit-7: take a point-in-time snapshot of all capabilities.
-    snapshot @13 () -> (capabilities :List(Capability));
-
-    # ── Audit-9: Capability Negotiation ──
-
-    # Negotiate capabilities between two entities (returns intersection of acceptable caps).
-    negotiate @17 (request :NegotiationRequest) -> (result :NegotiationResult);
-
-    # ── Audit-9: Capability Composition ──
-
-    # Combine multiple capabilities into a single composite capability.
-    compose @18 (capabilities :List(Capability)) -> (composite :Capability);
-
-    # ── Audit-9: Capability Exchange ──
-
-    # Propose an exchange of capabilities with another entity.
-    proposeExchange @19 (request :ExchangeRequest) -> (proposalId :Text);
-
-    # Accept a proposed capability exchange.
-    acceptExchange @20 (proposalId :Text) -> (result :T.BoolResult);
-
-    # Reject a proposed capability exchange.
-    rejectExchange @21 (proposalId :Text, reason :Text) -> T.VoidResult;
-
-    # ── Audit-9: Transfer Approval ──
-
-    # Request approval for a capability transfer (requires explicit approval).
-    requestTransferApproval @22 (cap :Capability, recipient :Text, reason :Text) -> (approvalId :Text);
-
-    # Approve a pending transfer request.
-    approveTransfer @23 (approvalId :Text) -> (result :T.BoolResult);
-
-    # Deny a pending transfer request.
-    denyTransfer @24 (approvalId :Text, reason :Text) -> T.VoidResult;
-
-    # ── Audit Trail (false positive: capability_audit.capnp) ──
+    # Take a point-in-time snapshot of all capabilities.
+    snapshot @12 () -> (capabilities :List(Capability));
 
     # Query the audit trail with filters.
-    queryAudit @14 (filter :AuditFilter) -> (entries :List(AuditEntry), total :UInt32);
+    queryAudit @13 (filter :AuditFilter) -> (entries :List(AuditEntry), total :UInt32);
 
     # Export audit trail for compliance.
-    exportAudit @15 (request :AuditExportRequest) -> (data :T.DataHandle);
+    exportAudit @14 (request :AuditExportRequest) -> (data :T.DataHandle);
 
     # Generate a compliance report for a time window.
-    generateComplianceReport @16 (windowStart :T.Timestamp, windowEnd :T.Timestamp) -> (report :ComplianceReport);
+    generateComplianceReport @15 (windowStart :T.Timestamp, windowEnd :T.Timestamp) -> (report :ComplianceReport);
 }
 
-# Audit-7: cascade control for revocation.
+# Cascade control for revocation.
 enum RevocationCascade {
     subtree @0;       # Revoke this capability and all descendants
     children @1;      # Revoke only direct children
@@ -248,7 +259,7 @@ enum RevocationCascade {
     custom @4;
 }
 
-# Audit-7: refresh an expiring capability.
+# Refresh an expiring capability.
 struct RefreshRequest {
     # The capability to refresh.
     capability @0 :Capability;
@@ -258,7 +269,7 @@ struct RefreshRequest {
     tighterConstraints @2 :Constraints;
 }
 
-# Audit-7: named bundle of capabilities.
+# Named bundle of capabilities.
 struct CapabilityGroup {
     # Human-readable group name (e.g. "standard-app", "admin").
     name @0 :Text;
@@ -290,25 +301,24 @@ struct CapabilityFilter {
     targetPrefix @0 :Text;
     operations @1 :List(Operation);
     onlyActive @2 :Bool = true;
-    # Audit-7: filter by issuer.
+    # Filter by issuer.
     issuer @3 :Text;
-    # Audit-7: filter by delegation depth (max depth to return).
+    # Filter by delegation depth (max depth to return).
     maxDepth @4 :UInt32;
 }
 
+# `unknown @0 :T.UnknownEvent` is the R7 terminator (TIMELESSNESS.md:98):
+# a backend forwards an event kind this schema does not name, with its
+# discriminant and payload intact, instead of squeezing it into a string.
 struct CapabilityEvent {
     union {
         issued @0 :Capability;
         revoked @1 :Capability;
         attenuated @2 :AttenuationEvent;
         transferred @3 :TransferEvent;
-        # Audit-9: notification when a capability is revoked (for the holder).
-        revocationNotice @5 :RevocationNoticeEvent;
-        # Audit-9: transfer approval requested.
-        transferApprovalRequested @6 :TransferApprovalEvent;
-        # Audit-9: exchange proposed.
-        exchangeProposed @7 :ExchangeProposedEvent;
-        custom @4 :Text;
+        # Notification when a capability is revoked (for the holder).
+        revocationNotice @4 :RevocationNoticeEvent;
+        unknown @5 :T.UnknownEvent;
     }
 }
 
@@ -324,62 +334,6 @@ struct TransferEvent {
     to @2 :Text;
 }
 
-# ── Audit-9: Negotiation ────────────────────────────────────────────────
-
-struct NegotiationRequest {
-    # Entity we are negotiating with.
-    peer @0 :Text;
-    # Capabilities we offer.
-    offered @1 :List(Capability);
-    # Capabilities we require from the peer.
-    required @2 :List(Text);
-    # Constraints on the negotiation.
-    constraints @3 :Constraints;
-}
-
-struct NegotiationResult {
-    # Capabilities the peer accepted.
-    accepted @0 :List(Capability);
-    # Capabilities the peer rejected.
-    rejected @1 :List(Capability);
-    # Whether the negotiation succeeded (all required caps were met).
-    success @2 :Bool;
-}
-
-# ── Audit-9: Exchange ───────────────────────────────────────────────────
-
-struct ExchangeRequest {
-    # Entity we want to exchange with.
-    peer @0 :Text;
-    # Capabilities we are offering.
-    offered @1 :List(Capability);
-    # Capability targets we want in return.
-    requestedTargets @2 :List(Text);
-    # Maximum duration for the exchange to be valid.
-    ttl @3 :T.Duration;
-}
-
-struct ExchangeProposedEvent {
-    proposalId @0 :Text;
-    from @1 :Text;
-    offered @2 :List(Capability);
-    requestedTargets @3 :List(Text);
-    expiresAt @4 :T.Timestamp;
-}
-
-# ── Audit-9: Transfer Approval ──────────────────────────────────────────
-
-struct TransferApprovalEvent {
-    approvalId @0 :Text;
-    cap @1 :Capability;
-    from @2 :Text;
-    to @3 :Text;
-    reason @4 :Text;
-    requestedAt @5 :T.Timestamp;
-}
-
-# ── Audit-9: Revocation Notice ──────────────────────────────────────────
-
 struct RevocationNoticeEvent {
     # The capability that was revoked.
     cap @0 :Capability;
@@ -393,6 +347,10 @@ struct RevocationNoticeEvent {
     cascadeApplied @4 :Bool;
 }
 
+# One pull path only: hold the subscription reference and pull from it.
+# The pre-revamp `CapabilityService.pull (subscription)` was a second
+# identity path for the same subscription — the two-authority-paths
+# anti-pattern (DESIGN_PRINCIPLES.md:394-396).
 interface CapabilitySubscription {
     # Deprecated: use pullPaginated for bounded results.
     pull @0 () -> (events :List(CapabilityEvent));
@@ -406,10 +364,10 @@ struct CapabilityPullResult {
     totalCount @1 :UInt32;
 }
 
-# ── Capability Audit (false positive: capability_audit.capnp) ──────────
-# Capability audit trail, compliance reporting, and history export.
-# The existing Audit struct captures issuance metadata; these additions
-# capture the full lifecycle for compliance and forensic review.
+# ── Capability Audit ────────────────────────────────────────────────────
+# The full lifecycle for compliance and forensic review. `Audit` above
+# captures issuance metadata; this captures everything that happened to a
+# capability afterwards.
 
 struct AuditEntry {
     # Unique audit identifier.
@@ -464,7 +422,7 @@ struct AuditFilter {
 }
 
 struct AuditExportRequest {
-    # Export format (e.g., "json", "csv", "siem").
+    # Export format (e.g., "json", "csv", "siem") — open token.
     format @0 :Text;
     # Filter for the export window.
     filter @1 :AuditFilter;
@@ -519,9 +477,3 @@ enum ComplianceSeverity {
     critical @2;
     custom @3;
 }
-
-# ── CapabilityService audit methods ────────────────────────────────────
-# These are documented here but would be added to CapabilityService.
-# Since CapabilityService is already defined above, they are added as
-# separate interface methods below via documentation.
-# Actual integration requires updating CapabilityService ordinal range.

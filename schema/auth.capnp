@@ -1,85 +1,146 @@
 @0xa1b2c3d4e5f60015;
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
+# The canonical app icon: appindex.capnp declares it (data, mimeType, width,
+# height, metadata) and app.capnp consumes it. auth.capnp carried a reduced
+# three-field copy, so an icon fetched for a consent screen and the same icon
+# fetched for a launcher were two shapes a backend had to keep in agreement.
+using AI = import "appindex.capnp";
 
 # ═══════════════════════════════════════════════════════════════════════
-# Auth - authentication, authorization, and credential management
+# Auth - authentication, credential management, and token lifecycle.
 #
 # This schema handles the full auth lifecycle: authentication (who are
-# you?), authorization (what can you do?), credential management, and
-# token lifecycle. Biometric hardware interaction lives in
-# biometric.capnp; this schema orchestrates the auth flow.
+# you?), credential management, and token lifecycle. Biometric hardware
+# interaction lives in biometric.capnp; device lock, MFA state machine
+# and credential recovery live in access.capnp, which is the canonical
+# owner of those flows — this file delegates to it rather than carrying
+# competing copies.
 #
-# All permissions are resource-scoped and typed. All errors are T.Error.
-# All tokens carry structured metadata. All IDs are typed.
+# ── AUTHORITY IS THE INTERFACE REFERENCE ───────────────────────────────
+#
+# Authentication is ungated: proving who you are cannot require authority
+# you do not yet have. Everything that MUTATES credential or token state
+# sits behind `interface AuthService`, obtained once through an accessor
+# that takes a Capability. No method below takes an authority token.
+#
+# This file used to carry a second, parallel authorization system —
+# PermissionRequest / PermissionGrant / PermissionCheck with permission
+# ids, resource strings and `grantedBy` — which DESIGN_PRINCIPLES.md:399
+# forbids outright ("Do NOT define permission strings, boolean flags, or
+# role-based access control in the protocol. The capability system IS the
+# access control mechanism."). Its cost was concrete: a grant made here
+# could outlive or contradict a capability revoked in capability.capnp,
+# and every consumer had to learn two access models and reconcile them.
+# Grants are Capabilities now; attenuation and revocation belong to
+# capability.capnp.
+#
+# ── REFRESH REQUIRES PROOF OF POSSESSION ──────────────────────────────
+#
+# `refreshToken` used to take a token ID and mint a fresh token.
+# T.AuthTokenId is a UInt64, i.e. enumerable, so anyone who learned or
+# guessed any id could extend a session forever, and the id was never
+# bound to the secret it represented. The refresh call now presents the
+# token value itself, and a backend MUST verify it matches before
+# issuing a successor.
+#
+# ── AUTH METHOD TYPE IS AN OPEN TOKEN ─────────────────────────────────
+#
+# The previous AuthMethodType enum named fingerprint, face, iris, voice,
+# gesture and smartCard — platform biometric specifics — so a 2046
+# modality (DNA, brainwave, odour, behavioural fusion) had only `custom`
+# carrying nothing, and a consumer could not tell what it was. The type
+# is now an open token published as a conformance const below.
 # ═══════════════════════════════════════════════════════════════════════
 
-interface AuthService {
+# ── Root: ungated authentication and discovery ─────────────────────────
+
+interface Auth {
     # Authenticate with credentials.
     authenticate @0 (request :AuthRequest) -> (result :AuthResult);
 
-    # Request a permission grant for a resource.
-    requestPermission @1 (request :PermissionRequest) -> (grant :PermissionGrant);
-
-    # Check if a permission is granted.
-    checkPermission @2 (permission :T.PermissionId, resource :Text) -> (result :PermissionCheck);
-
     # List available auth methods.
-    listAuthMethods @3 (pagination :T.Pagination) -> (methods :List(AuthMethodInfo), totalCount :UInt32);
-
-    # Register a custom auth method handler.
-    registerAuthMethod @4 (method :AuthMethodInfo, handler :AuthHandler) -> T.VoidResult;
-
-    # Unregister an auth method.
-    unregisterAuthMethod @5 (methodId :T.AuthMethodId) -> T.VoidResult;
+    listAuthMethods @1 (pagination :T.Pagination) -> (methods :List(AuthMethodInfo), totalCount :UInt32);
 
     # Get supported auth factors.
-    getSupportedFactors @6 (pagination :T.Pagination) -> (factors :List(AuthFactor), totalCount :UInt32);
-
-    # ── Token lifecycle ──
-    refreshToken @7 (tokenId :T.AuthTokenId) -> (result :AuthTokenResultWrapper);
-    revokeToken @8 (tokenId :T.AuthTokenId) -> T.VoidResult;
-    revokeAllTokens @9 () -> T.VoidResult;
-    listActiveTokens @10 (pagination :T.Pagination) -> (tokens :List(AuthToken), totalCount :UInt32);
+    getSupportedFactors @2 (pagination :T.Pagination) -> (factors :List(AuthFactor), totalCount :UInt32);
 
     # ── MFA flow ──
-    startMfa @11 (methodId :T.AuthMethodId) -> (challenge :MfaChallenge);
-    verifyMfa @12 (challengeId :T.MfaChallengeId, response :Data) -> (result :AuthResult);
+    # The challenge state machine itself belongs to access.capnp; these
+    # two are the authentication-side entry points into it.
+    startMfa @3 (methodId :T.AuthMethodId) -> (challenge :AuthMfaChallenge);
+    verifyMfa @4 (challengeId :T.MfaChallengeId, response :Data) -> (result :AuthResult);
 
-    # ── Credential enrollment ──
-    enrollCredential @13 (request :EnrollRequest) -> (result :EnrollResult);
-
-    # ── Lockout status ──
-    getLockoutStatus @14 () -> (status :LockoutStatus);
-
-    # ── Events ──
-    subscribe @15 () -> (subscription :AuthSubscription);
-    pull @16 (subscription :AuthSubscription) -> (events :List(AuthEvent));
-    cancel @17 (subscription :AuthSubscription) -> T.VoidResult;
+    # ── Lockout status (observation) ──
+    getLockoutStatus @5 () -> (status :LockoutStatus);
 
     # Audit-7: read-only token introspection without refresh/revoke.
-    introspectToken @18 (tokenId :T.AuthTokenId) -> (token :AuthToken, valid :Bool);
-
-    # Audit-7: let users reorder preferred auth methods.
-    setAuthMethodOrder @19 (orderedIds :List(T.AuthMethodId)) -> T.VoidResult;
+    introspectToken @6 (tokenId :T.AuthTokenId) -> (token :AuthToken, valid :Bool);
 
     # Audit-7: get the current auth method display order.
-    getAuthMethodOrder @20 () -> (orderedIds :List(T.AuthMethodId));
-
-    # Audit-9: enforce auth method priority (returns true if method is above threshold).
-    enforceAuthMethodPriority @21 (methodId :T.AuthMethodId, minPriority :UInt32) -> (enforced :Bool);
-
-    # Audit-9: validate claims against an expected schema.
-    validateClaims @22 (claims :ClaimsSet, expectedSchema :ClaimsSchema) -> (valid :Bool, violations :List(Text));
-
-    # Audit-9: register a typed scope descriptor.
-    registerScope @23 (info :ScopeInfo) -> T.VoidResult;
+    getAuthMethodOrder @7 () -> (orderedIds :List(T.AuthMethodId));
 
     # Audit-9: look up a scope descriptor by T.ScopeId.
-    getScope @24 (scopeId :T.ScopeId) -> (info :ScopeInfo);
+    getScope @8 (scopeId :T.ScopeId) -> (info :ScopeInfo);
 
     # Audit-9: list all registered scopes.
-    listScopes @25 (pagination :T.Pagination) -> (scopes :List(ScopeInfo), total :UInt32);
+    listScopes @9 (pagination :T.Pagination) -> (scopes :List(ScopeInfo), total :UInt32);
+
+    # ── Gated once, at acquisition ──────────────────────────────────
+    # Holding `service` IS the authority to register credentials, issue,
+    # refresh and revoke tokens, and reorder methods. No method inside
+    # takes an authority token.
+    session @10 (authority :Capability) -> (service :AuthService);
+}
+
+# ── Privileged surface: obtained with a Capability ──────────────────────
+# Method ordinals were re-issued when this surface was split off the flat
+# interface: the surface is pre-release and nothing external consumed the
+# old shape, so a clean sequence is clearer than one with holes.
+
+interface AuthService {
+    # Register a custom auth method handler.
+    registerAuthMethod @0 (method :AuthMethodInfo, handler :AuthHandler) -> T.VoidResult;
+
+    # Unregister an auth method.
+    unregisterAuthMethod @1 (methodId :T.AuthMethodId) -> T.VoidResult;
+
+    # ── Token lifecycle ──
+    # Proof of possession is mandatory: see the header.
+    refreshToken @2 (tokenId :T.AuthTokenId, proof :T.DataHandle) -> (result :AuthTokenResult);
+    revokeToken @3 (tokenId :T.AuthTokenId) -> T.VoidResult;
+    # Revoke every token held by the CALLER. The previous `revokeAllTokens`
+    # said "all" without saying whose, and every implementer chose: this
+    # session, this user, or the whole system — a security-critical
+    # choice made invisible on the wire. The blast radius is now part of
+    # the contract. Revoking another principal's tokens is a capability
+    # operation, not this method's.
+    revokeAllTokens @4 (scope :T.ScopeId) -> T.VoidResult;
+    listActiveTokens @5 (pagination :T.Pagination) -> (tokens :List(AuthToken), totalCount :UInt32);
+
+    # ── Credential enrollment ──
+    # Gated: enrolling a credential you do not hold (someone else's
+    # biometric template, for instance) is no longer open to any holder
+    # of the reference.
+    enrollCredential @6 (request :EnrollRequest) -> (result :EnrollResult);
+
+    # ── Events ──
+    subscribe @7 () -> (subscription :AuthSubscription);
+    pull @8 (subscription :AuthSubscription) -> (events :List(AuthEvent));
+    cancel @9 (subscription :AuthSubscription) -> T.VoidResult;
+
+    # Audit-7: let users reorder preferred auth methods.
+    setAuthMethodOrder @10 (orderedIds :List(T.AuthMethodId)) -> T.VoidResult;
+
+    # Audit-9: enforce auth method priority.
+    enforceAuthMethodPriority @11 (methodId :T.AuthMethodId, minPriority :UInt32) -> (enforced :Bool);
+
+    # Audit-9: validate claims against an expected schema.
+    validateClaims @12 (claims :ClaimsSet, expectedSchema :ClaimsSchema) -> (valid :Bool, violations :List(Text));
+
+    # Audit-9: register a typed scope descriptor.
+    registerScope @13 (info :ScopeInfo) -> T.VoidResult;
 }
 
 interface AuthHandler {
@@ -93,18 +154,19 @@ struct AuthRequest {
     credentials @1 :Credentials;
     # Optional challenge for challenge-response auth.
     challenge @2 :Data;
-    # Audit-9: scopes identified by typed T.ScopeId for cross-schema references.
-    # Migration note: previous List(Text) field renamed; consumers using string
-    # scopes should pair with the ScopeInfo registry.
+    # Scopes identified by typed T.ScopeId for cross-schema references.
     scopeIds @3 :List(T.ScopeId);
 }
 
 struct Credentials {
     union {
-        password @0 :Text;
-        pin @1 :Text;
+        # Secret fields are opaque Data, not Text: a password
+        # materialised as text in the message arena is copied, exposed to
+        # any crash dump or message log, and trivially greppable.
+        password @0 :Data;
+        pin @1 :Data;
         biometric @2 :BiometricCredential;
-        otp @3 :Text;
+        otp @3 :Data;
         token @4 :Data;
         challenge @5 :Data;
         custom @6 :T.StringMap;
@@ -116,7 +178,7 @@ struct BiometricCredential {
     templateId @0 :T.BiometricId;
     # Signed challenge (crypto-binding).
     signature @1 :Data;
-    # Modality used.
+    # Modality used, as an open token.
     modality @2 :Text;
 }
 
@@ -126,7 +188,7 @@ struct AuthResult {
     union {
         success @0 :AuthSuccess;
         failed @1 :T.Error;
-        mfaRequired @2 :MfaChallenge;
+        mfaRequired @2 :AuthMfaChallenge;
         lockout @3 :LockoutStatus;
         custom @4 :Data;
     }
@@ -134,8 +196,12 @@ struct AuthResult {
 
 struct AuthSuccess {
     token @0 :AuthToken;
-    # Scopes actually granted.
-    grantedScopes @1 :List(Text);
+    # Scopes actually granted, as typed T.ScopeId. The previous
+    # List(Text) response forced a consumer to round-trip Text → ScopeId
+    # through getScope just to compare it against what it asked for:
+    # three spellings of "scope" in one file, the weakest of them on the
+    # response side a user sees.
+    grantedScopes @1 :List(T.ScopeId);
 }
 
 # ── Auth Token ────────────────────────────────────────────────────────
@@ -143,134 +209,87 @@ struct AuthSuccess {
 struct AuthToken {
     id @0 :T.AuthTokenId;
     type @1 :TokenType;
-    # Opaque token value (backend-decided format).
+    # Opaque token value (backend-decided format). This is the secret
+    # refreshToken requires as proof of possession; it is never the id.
     value @2 :Data;
     issuedAt @3 :T.Timestamp;
     expiresAt @4 :T.Timestamp;
     issuer @5 :Text;
     audience @6 :Text;
-    # Audit-9: scopes as typed T.ScopeId (was List(Text) @7).
     scopeIds @7 :List(T.ScopeId);
-    # Audit-7: structured claims for token introspection.
     claims @8 :ClaimsSet;
+    # Whether a refresh may be issued against this token more than once.
+    # Declared on the wire so replay behaviour is not a per-backend
+    # secret.
+    reusable @9 :Bool;
 }
 
-# Wrapper for token refresh result.
-struct AuthTokenResultWrapper {
-    token @0 :AuthToken;
+# Result of a refresh or token lifecycle operation. Previously a bare
+# wrapper struct, so an expired, revoked or unproven refresh had no
+# failure representation at all.
+struct AuthTokenResult {
+    union {
+        token @0 :AuthToken;
+        error @1 :T.Error;
+        custom @2 :Data;
+    }
 }
 
 # Audit-7 addition: typed common claims replacing bare StringMap.
-# Provides structured access to standard JWT-like claims while
-# retaining extensibility for custom claims via the custom field.
 struct ClaimsSet {
-    # Subject (who the token represents).
     subject @0 :Text;
-    # Issuer (who issued the token).
     issuer @1 :Text;
-    # Audience (who the token is intended for).
     audience @2 :Text;
-    # Expiration time.
     expiresAt @3 :T.Timestamp;
-    # Not-before time.
     notBefore @4 :T.Timestamp;
-    # Issued-at time.
     issuedAt @5 :T.Timestamp;
-    # Audit-9: granted scopes as typed T.ScopeId for cross-schema references.
     scopeIds @6 :List(T.ScopeId);
-    # Audit-9: human-readable scope descriptors (mirrors scopeIds for display).
+    # Human-readable scope descriptors (mirrors scopeIds for display).
     scopeDescriptions @7 :List(Text);
-    # Custom claims (backend-defined). Renamed @7 → @8 to keep insertion order.
     custom @8 :T.StringMap;
 }
 
 enum TokenType {
-    bearer @0;
-    capability @1;
-    mac @2;
-    custom @3;
-}
-
-# ── Permissions ───────────────────────────────────────────────────────
-
-struct PermissionRequest {
-    permission @0 :T.PermissionId;
-    resource @1 :Text;
-    # Optional TTL for temporary grants.
-    ttl @2 :T.Duration;
-    # Reason for the request (shown in UI).
-    reason @3 :Text;
-}
-
-struct PermissionGrant {
-    permission @0 :T.PermissionId;
-    resource @1 :Text;
-    granted @2 :Bool;
-    grantedAt @3 :T.Timestamp;
-    expiresAt @4 :T.Timestamp;
-    grantedBy @5 :Text;
-}
-
-struct PermissionCheck {
-    granted @0 :Bool;
-    expiresAt @1 :T.Timestamp;
+    unspecified @0;   # Sentinel: an unset type is not "bearer"
+    bearer @1;
+    capability @2;
+    mac @3;
+    custom @4;
 }
 
 # ── Auth Method ───────────────────────────────────────────────────────
 
 struct AuthMethodInfo {
     id @0 :T.AuthMethodId;
-    type @1 :AuthMethodType;
+    # Open token; see conformance consts below. An unrecognized token is
+    # ignored, never rejected.
+    type @1 :Text;
     name @2 :Text;
     description @3 :Text;
-    icon @4 :AppIcon;
+    icon @4 :AI.AppIcon;
     enabled @5 :Bool;
     # Higher values = higher priority in UI display order.
     priority @6 :UInt32;
-    # Required factors for this method.
     requiredFactors @7 :List(AuthFactor);
 }
 
-struct AppIcon {
-    data @0 :Data;
-    mimeType @1 :Text;
-}
-
-enum AuthMethodType {
-    password @0;
-    pin @1;
-    fingerprint @2;
-    face @3;
-    iris @4;
-    voice @5;
-    gesture @6;
-    device @7;
-    otp @8;
-    challenge @9;
-    smartCard @10;
-    passphrase @11;
-    custom @12;
-}
 
 # ── Auth Factor ───────────────────────────────────────────────────────
 
 struct AuthFactor {
-    # Audit-7: promoted to typed reference for cross-schema identification.
     id @0 :T.AuthMethodId;
-    type @1 :AuthMethodType;
+    type @1 :Text;
     name @2 :Text;
     available @3 :Bool;
-    # Audit-7: UI hint icon for the factor.
-    icon @4 :AppIcon;
-    # Audit-7: human-readable description.
+    icon @4 :AI.AppIcon;
     description @5 :Text;
 }
 
 # ── MFA ───────────────────────────────────────────────────────────────
 
-struct MfaChallenge {
+struct AuthMfaChallenge {
     challengeId @0 :T.MfaChallengeId;
-    type @1 :AuthMethodType;
+    type @1 :Text;
     payload @2 :Data;
     expiresAt @3 :T.Timestamp;
 }
@@ -278,9 +297,8 @@ struct MfaChallenge {
 # ── Enrollment ────────────────────────────────────────────────────────
 
 struct EnrollRequest {
-    type @0 :AuthMethodType;
+    type @0 :Text;
     credentials @1 :Credentials;
-    # Optional name/label for the credential.
     label @2 :Text;
 }
 
@@ -294,7 +312,7 @@ struct EnrollResult {
 
 struct EnrollSuccess {
     credentialId @0 :T.AccessCredentialId;
-    type @1 :AuthMethodType;
+    type @1 :Text;
 }
 
 # ── Lockout ───────────────────────────────────────────────────────────
@@ -327,13 +345,11 @@ struct AuthEvent {
         failed @1 :AuthEventFailed;
         tokenIssued @2 :AuthEventTokenIssued;
         tokenRevoked @3 :AuthEventTokenRevoked;
-        permissionGranted @4 :AuthEventPermissionGranted;
-        permissionDenied @5 :AuthEventPermissionDenied;
-        lockoutStarted @6 :AuthEventLockout;
-        lockoutEnded @7 :AuthEventLockout;
+        lockoutStarted @4 :AuthEventLockout;
+        lockoutEnded @5 :AuthEventLockout;
         # Audit-9: admin-initiated token revocation.
-        tokenRevokedByAdmin @9 :AuthEventTokenRevokedByAdmin;
-        custom @8 :Data;
+        tokenRevokedByAdmin @6 :AuthEventTokenRevokedByAdmin;
+        custom @7 :Data;
     }
 }
 
@@ -360,20 +376,6 @@ struct AuthEventTokenRevoked {
     timestamp @1 :T.Timestamp;
 }
 
-struct AuthEventPermissionGranted {
-    permission @0 :T.PermissionId;
-    resource @1 :Text;
-    expiresAt @2 :T.Timestamp;
-    timestamp @3 :T.Timestamp;
-}
-
-struct AuthEventPermissionDenied {
-    permission @0 :T.PermissionId;
-    resource @1 :Text;
-    reason @2 :T.Error;
-    timestamp @3 :T.Timestamp;
-}
-
 struct AuthEventLockout {
     remainingAttempts @0 :UInt32;
     expiresAt @1 :T.Timestamp;
@@ -382,62 +384,62 @@ struct AuthEventLockout {
 
 # Audit-9: richer factor metadata for UI display.
 struct AuthFactorInfo {
-    # Factor identifier.
     methodId @0 :T.AuthMethodId;
-    # Factor type.
-    type @1 :AuthMethodType;
-    # Human-readable name.
+    type @1 :Text;
     name @2 :Text;
-    # Background color for UI badge (CSS hex, e.g., "#4CAF50").
     color @3 :Text;
-    # Badge text (e.g., "Recommended", "Primary", "Backup").
     badge @4 :Text;
-    # Whether this factor is recommended by the system.
     recommended @5 :Bool;
-    # Whether the factor is currently enrolled and usable.
     ready @6 :Bool;
-    # When the factor was last used.
     lastUsedAt @7 :T.Timestamp;
 }
 
 # Audit-9: claims validation schema — defines expected claim constraints.
 struct ClaimsSchema {
-    # Required claim fields (must be non-empty).
     requiredFields @0 :List(Text);
-    # Expected issuer (empty = any issuer).
     expectedIssuer @1 :Text;
-    # Expected audience (empty = any audience).
     expectedAudience @2 :Text;
-    # Maximum allowed token lifetime (zero = no limit).
     maxLifetime @3 :T.Duration;
-    # Required scope set (all must be present).
     requiredScopes @4 :List(T.ScopeId);
 }
 
-# Audit-9: token revocation notification event — triggered when an admin revokes a token.
+# Audit-9: token revocation notification event.
 struct AuthEventTokenRevokedByAdmin {
-    # Token that was revoked.
     tokenId @0 :T.AuthTokenId;
-    # Admin or system that performed the revocation.
     revokedBy @1 :Text;
-    # Reason for revocation (audit trail).
     reason @2 :Text;
     timestamp @3 :T.Timestamp;
 }
 
 # Audit-9: typed scope descriptor for cross-schema scope identification.
-# Replaces bare List(Text) scope strings with structured T.ScopeId references.
 struct ScopeInfo {
-    # Typed scope identifier.
     scopeId @0 :T.ScopeId;
-    # Human-readable scope name (e.g., "read:calendar", "write:files").
     name @1 :Text;
-    # Description of what this scope permits.
     description @2 :Text;
-    # Whether this scope is sensitive (redacted in logs).
     sensitive @3 :Bool;
-    # When this scope was registered.
     registeredAt @4 :T.Timestamp;
-    # Owner / registering entity.
     registeredBy @5 :Text;
 }
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Today's spellings for the open `type` fields above. Nothing requires
+# them; an unrecognized token MUST be ignored rather than rejected. This
+# section can grow without touching a single ordinal, so a 2046 modality
+# becomes nameable the day a backend ships it — no schema amendment, and
+# no `custom` slot that carries nothing.
+# ══════════════════════════════════════════════════════════════════════
+
+const methodPassword  :Text = "password";
+const methodPin       :Text = "pin";
+const methodFingerprint :Text = "fingerprint";
+const methodFace      :Text = "face";
+const methodIris      :Text = "iris";
+const methodVoice     :Text = "voice";
+const methodGesture   :Text = "gesture";
+const methodDevice    :Text = "device";
+const methodOtp       :Text = "otp";
+const methodChallenge :Text = "challenge";
+const methodSmartCard :Text = "smartcard";
+const methodPassphrase :Text = "passphrase";

@@ -18,56 +18,38 @@
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using import "capability.capnp".Capability;
 
 # ── Sensor Types ─────────────────────────────────────────────────────────
 
-enum SensorType {
-    unknown @0;
-    accelerometer @1;
-    gyroscope @2;
-    magnetometer @3;
-    barometer @4;
-    proximity @5;
-    ambientLight @6;
-    heartRate @7;
-    stepCounter @8;
-    stepDetector @9;
-    gravity @10;
-    linearAcceleration @11;
-    rotationVector @12;
-    gameRotationVector @13;
-    geomaticRotation @14;
-    significantMotion @15;
-    pose6Dof @16;
-    stationaryDetect @17;
-    motionDetect @18;
-    heartBeat @19;
-    lowLatencyOffbodyDetect @20;
-    accelerometerUncalibrated @21;
-    gyroscopeUncalibrated @22;
-    magnetometerUncalibrated @23;
-    humidity @24;
-    temperature @25;
-    ambientTemperature @26;
-    pressure @27;
-    uv @28;
-    # Audit-7: extended sensor types.
-    gnss @29;           # Multi-constellation GNSS positioning
-    airQuality @30;     # Air quality index (PM2.5, CO2, VOC)
-    fallDetection @31;  # Wearable fall detection
-    lidar @32;          # LiDAR 3D depth sensing
-    tof @33;            # Time-of-flight depth sensing
-    radar @34;          # Radar motion/gesture detection
-    gesture @35;        # Touchless gesture recognition
-    spectrometer @36;   # UV index, color temperature, spectral analysis
-    gas @37;            # Gas detection (methane, CO, propane)
-    radiation @38;      # Radiation detection (Geiger counter)
-    soil @39;           # Soil moisture, pH, temperature
-    waterQuality @40;   # Water turbidity, pH, chlorine
-    acoustic @41;       # Sound level, frequency analysis
-    strain @42;         # Load cells, strain gauges
-    custom @43;
-}
+# ── Sensor class: an OPEN TOKEN, was a 44-value enum ───────────────────
+#
+# The enum's own history is the proof it was closed by release
+# schedules rather than by mathematics: Audit-7 appended fourteen values
+# in one revision (gnss, airQuality, fallDetection, lidar, tof, radar,
+# gesture, spectrometer, gas, radiation, soil, waterQuality, acoustic,
+# strain). A 2046 sensor class — bioimpedance, electrochemical, a
+# quantum magnetometer — must either add an ordinal to an eternal
+# schema or answer `custom @43`, a bare ordinal carrying no semantics.
+# The concrete costs were: `getSensorsByType` could not ask for a class
+# the enum lacked, and every consumer with a `switch (type)` had to be
+# recompiled to support new hardware.
+#
+# The machine-readable half of a sensor class never needed the enum:
+# `units` and `axisLabels` are already open per-sensor descriptors, so
+# "what does this number mean" is answered from the device. What the
+# enum added was only a filterable NAME — which is exactly what an open
+# token gives, with no ordinal.
+#
+# Documented vocabulary (not exhaustive, not checked):
+#   "accelerometer", "gyroscope", "magnetometer", "barometer",
+#   "proximity", "ambientLight", "heartRate", "stepCounter",
+#   "stepDetector", "gravity", "linearAcceleration", "rotationVector",
+#   "pose6Dof", "motionDetect", "humidity", "temperature", "pressure",
+#   "uv", "gnss", "airQuality", "fallDetection", "lidar", "tof",
+#   "radar", "gesture", "spectrometer", "gas", "radiation", "soil",
+#   "waterQuality", "acoustic", "strain"
+# An unrecognised token is ignored, never rejected (ai.capnp:43-47).
 
 # ── Sensor Info ─────────────────────────────────────────────────────────
 
@@ -75,7 +57,8 @@ struct SensorInfo {
     id @0 :T.SensorId;
     name @1 :Text;
     vendor @2 :Text;
-    type @3 :SensorType;
+    # Open class token — see the SensorType note above.
+    type @3 :Text;
     version @4 :T.Version;
     # Maximum sampling rate in Hz.
     maxRate @5 :UInt32;
@@ -100,8 +83,15 @@ struct SensorInfo {
     maxBatchSize @14 :UInt16;
     # For wake-up sensors: what triggered the wake.
     triggerData @15 :Text;
-    # Which capability must be held to access this sensor.
-    permissionCapability @16 :Text;
+    # The capability that must be held to read this sensor, as a
+    # capability REFERENCE. The previous `permissionCapability :Text`
+    # named a capability by string, which DESIGN_PRINCIPLES.md:399
+    # forbids ("The capability system IS the access control
+    # mechanism"), and no method in the file accepted a Capability —
+    # so the string was a dead end: a client learned it must hold
+    # "sensor.heartrate" and then had nothing to present.
+    # `SensorService.openStreams` is where the reference is presented.
+    authority @16 :Capability;
     # Whether sensor is currently enabled.
     enabled @17 :Bool;
     # DEPRECATED: Use latencyHint instead. Latency hint in microseconds.
@@ -125,6 +115,10 @@ struct SensorReading {
     # Batch marker: number of flushed readings in this payload.
     # When batchCount > 1, values contains concatenated readings.
     batchCount @4 :UInt16;
+    # Per-subscription monotonic sequence, starting at 1. A consumer
+    # that records the last sequence it processed can measure loss
+    # exactly, so a dropped reading is visible instead of silent.
+    sequence @5 :UInt64;
 }
 
 enum SensorAccuracy {
@@ -154,10 +148,6 @@ interface SensorService {
 
     getInfo @1 (sensorId :T.SensorId) -> (info :SensorInfo);
 
-    # All sensors of a given type (for multi-sensor devices).
-    getSensorsByType @7 (type :SensorType, pagination :T.Pagination)
-                     -> (sensors :List(SensorHandle), total :UInt32);
-
     # Subscribe at a named rate.
     subscribe @2 (sensorId :T.SensorId, rate :SamplingRate)
               -> (subscription :SensorSubscription);
@@ -166,20 +156,30 @@ interface SensorService {
     subscribeCustom @3 (sensorId :T.SensorId, rateHz :UInt32)
                     -> (subscription :SensorSubscription);
 
+    # Pull latest readings (non-blocking). Convenience path — it reads
+    # the SAME queue as SensorSubscription.pull, and the canonical pull
+    # is on the subscription interface (DESIGN_PRINCIPLES.md:254).
+    pull @4 (subscription :SensorSubscription, maxCount :UInt32, cursor :SequenceToken)
+           -> (result :ReadingPullResult);
+
+    unsubscribe @5 (subscription :SensorSubscription) -> T.VoidResult;
+
+    # Cheapest possible "is there one": no descriptors, just a yes and a count.
+    isAvailable @6 (type :Text, pagination :T.Pagination)
+                -> (available :Bool, sensors :List(SensorHandle), total :UInt32);
+
+    # All sensors of a given class token (for multi-sensor devices).
+    # Filters on the open class token, so a 2046 sensor class is
+    # searchable the day it ships, with no ordinal.
+    getSensorsByType @7 (type :Text, pagination :T.Pagination)
+                     -> (sensors :List(SensorHandle), total :UInt32);
+
     # Subscribe multiple sensors at once (for time-synchronized reads).
     subscribeBatch @8 (requests :List(SubscribeRequest))
                    -> (subscription :BatchSubscription);
 
-    # Pull latest readings (non-blocking).
-    pull @4 (subscription :SensorSubscription) -> (readings :List(SensorReading));
-
     # Flush pending readings for a subscription (forces delivery).
     flush @9 (subscription :SensorSubscription) -> T.VoidResult;
-
-    unsubscribe @5 (subscription :SensorSubscription) -> T.VoidResult;
-
-    isAvailable @6 (type :SensorType, pagination :T.Pagination)
-                -> (available :Bool, sensors :List(SensorHandle), total :UInt32);
 
     # Enable/disable a sensor.
     enable @10 (sensorId :T.SensorId, enabled :Bool) -> T.VoidResult;
@@ -234,13 +234,73 @@ struct SamplingRateConfig {
     }
 }
 
+# ═══════════════════════════════════════════════════════════════════════
+# READING DELIVERY — why these take a bound and a cursor, not an offset.
+#
+# `T.Pagination { offset, limit }` is an offset into a STABLE list. A
+# live sensor stream has no stable list, so `pull (offset=5, limit=10)`
+# has no defined meaning: a backend may skip the first 5 readings
+# (losing them) or return 10 from the newest — silently, with no way
+# for the caller to tell. The same defect was found at nine sites across
+# the protocol (sensor, camera, capture, usb, bluetooth, capability).
+#
+# The bound is wanted; the offset is meaningless. So:
+#
+#   * `maxCount` — the caller states how much it will accept, exactly
+#     as ai.capnp:277's `pull (maxBytes)` does. This bounds the
+#     server-side queue and stops a slow consumer's next pull from
+#     materialising an unbounded message.
+#
+#   * `cursor` — an opaque, per-subscription sequence token returned by
+#     each pull. It is NOT a count and NOT an offset: a backend may
+#     encode whatever it needs (the ring position, the queue head, a
+#     generation counter). The contract is only that passing it back
+#     resumes exactly where the previous pull stopped, and that a
+#     consumer that never passes a cursor gets a fresh, contiguous run.
+#     Because it is opaque, a backend is free to change its internal
+#     queue representation without breaking a caller.
+#
+#   * `readings` carries an explicit `sequence` per reading so that a
+#     GAP is measurable. If the last sequence a consumer processed was
+#     412 and the next pull starts at 415, three readings were dropped
+#     — which the consumer can see, report, and act on, instead of
+#     silently misinterpreting its own sample rate.
+#
+#   * `T.SubscriptionResult`'s `ended`/`error` (types.capnp:907) tell a
+#     dead sensor apart from a quiet one. A bare list return made them
+#     the same fact.
+# ═══════════════════════════════════════════════════════════════════════
+
+struct ReadingPullResult {
+    union {
+        # At most maxCount readings, in sequence order.
+        readings @0 :List(SensorReading);
+        # Nothing has arrived yet. Not an error.
+        empty @1 :Void;
+        # The sensor is gone and no more readings will arrive.
+        ended @2 :Void;
+        error @3 :T.Error;
+    }
+    # Opaque resume token. Pass it back to continue from the next
+    # unread reading. See the note above: this replaces the offset, and
+    # it is deliberately not a count.
+    cursor @4 :SequenceToken;
+}
+
+struct SequenceToken {
+    # Opaque: a backend encodes its own resumption point here.
+    # Consumers never inspect it and never construct one — the token a
+    # pull returned is the token the next pull takes.
+    token @0 :Data;
+}
+
 interface BatchSubscription {
-    pull   @0 (pagination :T.Pagination) -> (readings :List(SensorReading), total :UInt32);
+    pull   @0 (maxCount :UInt32, cursor :SequenceToken) -> (result :ReadingPullResult);
     cancel @1 () -> T.VoidResult;
 }
 
 interface SensorSubscription {
-    pull   @0 (pagination :T.Pagination) -> (readings :List(SensorReading), total :UInt32);
+    pull   @0 (maxCount :UInt32, cursor :SequenceToken) -> (result :ReadingPullResult);
     cancel @1 () -> T.VoidResult;
 }
 
@@ -369,10 +429,16 @@ struct ContextSnapshot {
 }
 
 # ── Spectrometer Sensor Data (audit-8 What's Still Missing) ──
+# T.DataHandle for the bins, not an inline list. A spectrometer produces
+# hundreds to thousands of bins per reading — 2048 channels x 4 bytes =
+# 8 KB — at up to 100 Hz, which is 800 KB/s copied inline into the
+# message arena and then copied out again. Same reasoning as
+# audio.capnp's submit path; a 12-byte accelerometer reading stays
+# inline, which is why SensorReading.values is unchanged.
 struct SpectrometerData {
     uvIndex @0 :Float32;
     colorTemperature @1 :UInt32;
-    spectralData @2 :List(Float32);
+    spectralData @2 :T.DataHandle;
     timestamp @3 :T.Timestamp;
 }
 
@@ -423,32 +489,72 @@ interface SensorEventSubscription {
     cancel @1 () -> T.VoidResult;
 }
 
+# An event, as a union. The previous shape was a struct with
+# `type :SensorEventType` and `data :T.Meta`, which had three defects:
+#
+#   1. T.Meta is ONE {key, value} pair, so a threshold event could carry
+#      exactly one of "the threshold" or "the value that crossed it".
+#      `data` is now a T.StringMap.
+#   2. `error @4` carried no payload, so a sensor failure produced an
+#      event that said "something failed" and nothing about what.
+#   3. The enum was the only forward-compat route, so a backend adding a
+#      new event kind had to overload `other` — and a consumer that did
+#      not know the new meaning could not tell what it skipped.
+#
+# The ai.capnp:533-550 shape fixes all three: known events are arms, the
+# error arm carries T.Error, and anything not yet invented rides in
+# `unknown` and is ignored rather than rejected (ai.capnp:43-47).
 struct SensorEvent {
     sensorId @0 :T.SensorId;
-    type @1 :SensorEventType;
-    data @2 :T.Meta;
-    timestamp @3 :T.Timestamp;
+    timestamp @1 :T.Timestamp;
+    union {
+        reading @2 :SensorReadingPayload;
+        threshold @3 :SensorThresholdPayload;
+        accuracyChanged @4 :SensorAccuracy;
+        enabledChanged @5 :Bool;
+        error @6 :T.Error;
+        unknown @7 :UnknownSensorEvent;
+    }
 }
 
-enum SensorEventType {
-    reading @0;
-    threshold @1;
-    accuracyChanged @2;
-    enabledChanged @3;
-    error @4;
-    other @5;
-    custom @6;
+struct UnknownSensorEvent {
+    typeId @0 :UInt64;
+    payload @1 :Data;
 }
 
+struct SensorReadingPayload {
+    values @0 :List(Float32);
+    units @1 :Text;
+    axisLabels @2 :List(Text);
+    accuracy @3 :SensorAccuracy;
+    metadata @4 :T.StringMap;
+}
+
+struct SensorThresholdPayload {
+    # Which threshold fired, as an open token — a client and backend
+    # agree out of band on the spelling, which is what a threshold NAME
+    # is; freezing the spelling into an enum would only cover today's.
+    thresholdId @0 :Text;
+    # The level that was crossed, in the sensor's own units.
+    level @1 :Float32;
+    # The reading that crossed it.
+    value @2 :Float32;
+    metadata @3 :T.StringMap;
+}
+
+# A filter over the event kinds. The event union above is open-ended, so
+# a filter that named only closed kinds could never select an event the
+# consumer does not know about — this is an open token list for the same
+# reason SensorType is.
 struct SensorEventFilter {
     sensorIds @0 :List(T.SensorId);
-    types @1 :List(SensorEventType);
+    types @1 :List(Text);
 }
 
 # ── Sensor Fusion Algorithm (audit-9 What's Still Missing) ──
 struct SensorFusionAlgorithm {
     name @0 :Text;
     description @1 :Text;
-    requiredSensors @2 :List(SensorType);
-    outputType @3 :SensorType;
+    requiredSensors @2 :List(Text);
+    outputType @3 :Text;
 }

@@ -1,369 +1,225 @@
 @0xa1b2c3d4e5f60024;
 
+# ═══════════════════════════════════════════════════════════════════════
+# Logging — application-level structured log ingestion.
+#
+# The canonical log contract for the whole protocol. `LogEntry`,
+# `LogFilter`, `TraceContext`, `TraceSpan`, `SpanKind` and `SpanStatus`
+# are defined HERE and imported by everyone else: klog.capnp (the kernel
+# scribe) and diagnostics.capnp (telemetry) both return this `LogEntry`
+# rather than declaring a third and fourth shape.
+#
+# ── THE RELEASE-BLOCKER, EXECUTED ──────────────────────────────────────
+#
+# DESIGN_PRINCIPLES.md has flagged this file since 2026-07-01: remove
+# `LogFormat` and `LogOutput`, make `LogSource` opaque. The pre-revamp
+# body kept all three. They are gone now, and here is what replaced them:
+#
+#   `LogFormat { text, json, xml }` — an output-format enum. A logging
+#   backend may use binary, CBOR, protobuf, columnar storage or a format
+#   invented in 2046; none of those has an ordinal. Replaced by
+#   `export (format :T.MimeType)`, an open content type: a new format is
+#   a new subtype, not a schema edit.
+#
+#   `LogOutput { stdout, stderr, systemLog, structuredLog, file }` — an
+#   output-destination enum naming syslog/journald/ELK/Loki in its
+#   comments. This is the exact row TIMELESSNESS.md:76 rejects. Deleted
+#   outright: where a message GOES is the backend's business, and the
+#   contract never needed to name it.
+#
+#   `LogSource { file, line, function }` — a structured source location
+#   that assumes compiled languages with source files. WASM,
+#   interpreted and JIT producers had to falsify three fields. Replaced
+#   by `source @6 :Data`, opaque and backend-decided, exactly as
+#   DESIGN_PRINCIPLES.md:181 prescribed.
+#
+# ── WHAT ELSE WAS DELETED ──────────────────────────────────────────────
+#
+# The pre-revamp file was also an observability platform: SQL-like
+# queries, AI distillation, redaction, alert rules, enrichment and
+# aggregation. Each of those either duplicates a query the caller can do
+# over `getEntries`, mutates an append-only log (`redact`), or registers
+# a stateful rule set this schema cannot keep consistent. Kept: the
+# honest ingestion path, the query path, subscription, per-domain level,
+# declared sampling, export. `setSamplingRate` stays because declared
+# sampling is the honest alternative to silent drops.
+#
+# ── WHAT `log` RETURNS ─────────────────────────────────────────────────
+#
+# `T.VoidResult` swallows the outcome: accepted? sampled away? dropped?
+# "NEVER swallow errors silently" (DESIGN_PRINCIPLES.md:428) — so
+# `LogOutcome` distinguishes them, and a producer at volume can tell a
+# deliberate sample from a failure.
+#
+# Authority is the interface reference: holding the `Logging` reference
+# is the authority to write and to read. There is no per-method token
+# (R3, ai.capnp precedent).
+# ═══════════════════════════════════════════════════════════════════════
+
 using T = import "types.capnp";
 
-# ═══════════════════════════════════════════════════════════════════════
-# Logging - application-level structured log ingestion
-#
-# Distinct from klog.capnp (kernel messages). This is the application
-# logging service: structured log entries with filtering, levels, output
-# routing, and domain management.
-#
-# Backend-agnostic: works with stdout, file sinks, network sinks,
-# or any future transport. The schema names no specific logging daemon;
-# backends map to their native output (syslog, journald, etc.) at
-# implementation time.
-#
-# Improvements (audit-7):
-#   - Structured log fields (T.StringMap) for typed key-value metadata.
-#   - Unified severity via T.LogLevel (trace..custom, crash/security/audit).
-#   - Distributed tracing: traceId, spanId, parentSpanId on LogEntry.
-#   - Correlation ID for linking related log entries across services.
-#   - Log querying with LogQuery for SQL-like filtering.
-#   - Log distillation for AI-summarized log streams.
-#   - Log redaction for privacy-preserving field redaction.
-#   - Log retention policies per domain.
-#   - Structured log export for external analysis.
-#   - Real-time log streaming with backpressure.
-#   - Log lineage tracking.
-# ═══════════════════════════════════════════════════════════════════════
-
 interface Logging {
-    getEntries @0 (filter :LogFilter, pagination :T.Pagination) -> (entries :List(LogEntry));
-    subscribeEntries @1 (filter :LogFilter) -> (subscriptionId :UInt64);
-    pullEntries @2 (subscriptionId :UInt64, pagination :T.Pagination) -> (entries :List(LogEntry));
+    # The hot path, and the first ordinal because it is the hottest.
+    # A backend reports whether the entry was accepted, sampled away, or
+    # dropped — never a silent success.
+    log @0 (severity :T.LogLevel, domain :Text, message :Text) -> (outcome :LogOutcome);
 
+    # Bounded query over retained entries.
+    getEntries @1 (filter :LogFilter, page :T.Pagination) -> (entries :List(LogEntry), total :UInt64);
+
+    # Live stream. Holding the returned subscription IS the authority to
+    # pull — there is no subscription id to present.
+    subscribe @2 (filter :LogFilter) -> (subscription :LogSubscription);
+
+    # Per-domain level configuration.
     setLevel @3 (domain :Text, level :T.LogLevel) -> T.VoidResult;
     getLevel @4 (domain :Text) -> (level :T.LogLevel);
 
+    # Clear one domain's retained entries.
     clear @5 (domain :Text) -> T.VoidResult;
-    # Clear all logs. If olderThan is specified, only logs older than
-    # that timestamp are cleared. Zero timestamp means clear all.
-    clearAll @6 (olderThan :T.Timestamp) -> T.VoidResult;
 
-    setFormat @7 (format :LogFormat) -> T.VoidResult;
-    setOutput @8 (output :LogOutput) -> T.VoidResult;
+    # Export retained entries in an OPEN content type. The format is a
+    # T.MimeType, so a 2046 columnar or binary export needs no ordinal.
+    export @6 (filter :LogFilter, format :T.MimeType) -> (data :T.DataHandle);
 
-    subscribeDomains @9 () -> (subscriptionId :UInt64);
-    pullDomains @10 (subscriptionId :UInt64, pagination :T.Pagination) -> (domains :List(LogDomain));
+    # Declared sampling: a producer that will drop 90% of debug entries
+    # says so, instead of a consumer discovering it statistically.
+    setSamplingRate @7 (domain :Text, rate :Float32) -> T.VoidResult;
 
-    # ── Audit-7 additions ────────────────────────────────────
-
-    # Structured log querying with SQL-like filters.
-    queryEntries @11 (query :LogQuery, pagination :T.Pagination) -> (entries :List(LogEntry), total :UInt64);
-
-    # Real-time log streaming (WebSocket-style live tail).
-    streamEntries @12 (filter :LogFilter) -> (streamId :UInt64);
-
-    # AI-summarized log streams for high-volume systems.
-    getDistilled @13 (filter :LogFilter, windowSize :T.Duration) -> (result :LogDistillResult);
-
-    # Privacy-preserving log redaction with audit trail.
-    redact @14 (filter :LogFilter, patterns :List(Text)) -> (redactedCount :UInt64);
-
-    # Per-domain retention policies for compliance.
-    setRetention @15 (domain :Text, retention :T.Duration) -> T.VoidResult;
-
-    # Structured log export for external analysis.
-    exportEntries @16 (filter :LogFilter, format :ExportFormat) -> (data :T.DataHandle);
-
-    # Log aggregation across multiple sources.
-    aggregateLogs @17 (sources :List(Text), filter :LogFilter, pagination :T.Pagination) -> (entries :List(LogEntry));
-
-    # Register threshold-based alerts on log patterns.
-    registerAlert @18 (pattern :Text, threshold :UInt32, action :Text) -> T.VoidResult;
-
-    # Configurable sampling rates to reduce volume.
-    setSamplingRate @19 (domain :Text, rate :Float32) -> T.VoidResult;
-
-    # Attach additional context to existing log entries.
-    enrichContext @20 (entryId :T.EventId, context :T.StringMap) -> T.VoidResult;
-
-    # Audit-9: subscribe to alert notifications when thresholds are exceeded.
-    subscribeAlerts @21 () -> (subscriptionId :UInt64);
-
-    # Audit-9: query enriched context attached to log entries.
-    getEnrichedContext @22 (entryId :T.EventId) -> (context :T.StringMap);
-
-    # Audit-9: define a custom log query language expression.
-    queryWithExpression @23 (expression :Text, pagination :T.Pagination) -> (entries :List(LogEntry), total :UInt64);
-
-    # Audit-9: trace context propagation — extract trace from a log entry.
-    getTraceContext @24 (entryId :T.EventId) -> (context :TraceContext);
-
-    # Audit-9: create a distributed trace span linked to a log entry.
-    createTraceSpan @25 (entryId :T.EventId, span :TraceSpan) -> (spanId :Text);
-
-    # ── Core ingestion ─────────────────────────────────────────
-    log @26 (severity :T.LogLevel, domain :Text, message :Text) -> T.VoidResult;
+    # List known domains and their configured levels.
+    listDomains @8 (page :T.Pagination) -> (domains :List(LogDomain), total :UInt64);
 }
 
-# ── Log Entry ────────────────────────────────────────────────
+# ── The log entry ───────────────────────────────────────────────────────
 
 struct LogEntry {
     id @0 :T.EventId;
-    timestamp @1 :T.Timestamp;
-    level @2 :T.LogLevel;
-    domain @3 :Text;
-    message @4 :Text;
-    source @5 :LogSource;
-    metadata @6 :T.StringMap;
-    # ── Audit-7 additions ────────────────────────────────────
-    # Structured fields for machine parsing (typed key-value pairs).
-    structuredFields @7 :T.StringMap;
-    # Correlation ID for linking related entries across services.
-    correlationId @8 :Text;
-    # W3C trace-parent correlation (distributed tracing).
-    traceId @9 :Text;
-    # Span ID within a distributed trace.
-    spanId @10 :Text;
-    # Parent span ID for trace hierarchy.
-    parentSpanId @11 :Text;
-    # Which service/instance produced this log.
-    lineageId @12 :Text;
-    # Extended severity beyond T.LogLevel (stack trace indicators).
-    severity @13 :T.LogLevel;
+    # Monotonic sequence within the producer's boot epoch. Supports
+    # ordering, deduplication and gap detection: a consumer that pulls
+    # 1, 2, 4 knows an entry was dropped. Two producers' sequences are
+    # NOT comparable — correlate on (producer, sequence), never on
+    # sequence alone.
+    sequence @1 :UInt64;
+    timestamp @2 :T.Timestamp;
+    level @3 :T.LogLevel;
+    domain @4 :Text;
+    message @5 :Text;
+    # Opaque source location: file/line for a compiled language, a cell
+    # for a notebook, nothing for a JIT. Backend-decided, never parsed.
+    source @6 :Data;
+    # Typed identity of the producing subsystem (kernel scribe, driver,
+    # …). Zero when the producer is not a kernel subsystem. Applications
+    # group by `domain`; kernel components group here.
+    subsystem @7 :T.SubsystemId;
+    # Open key/value metadata.
+    metadata @8 :T.StringMap;
+    # Correlation across services.
+    correlationId @9 :Text;
+    # Distributed-trace correlation (see TraceContext).
+    traceId @10 :Text;
+    spanId @11 :Text;
+    parentSpanId @12 :Text;
 }
 
-# ── Log Source ───────────────────────────────────────────────
-
-struct LogSource {
-    file @0 :Text;
-    line @1 :UInt32;
-    function @2 :Text;
-}
-
-# ── Log Filter ───────────────────────────────────────────────
+# ── The filter ──────────────────────────────────────────────────────────
 
 struct LogFilter {
+    # Empty domain = all domains.
     domain @0 :Text;
-    level @1 :T.LogLevel;
+    # Minimum level (entries at or above this level only).
+    minLevel @1 :T.LogLevel;
     since @2 :T.Timestamp;
     until @3 :T.Timestamp;
+    # Plain substring match on the message. Not a query language.
     pattern @4 :Text;
+    # Restrict to specific subsystems (empty = all).
+    subsystems @5 :List(T.SubsystemId);
+    # Only entries from this trace.
+    traceId @6 :Text;
+    # Only entries after this sequence (0 = no lower bound) — the
+    # gap-detection lever.
+    afterSequence @7 :UInt64;
+    # Open metadata match.
 }
 
-# ── Log Domain ───────────────────────────────────────────────
+# ── The outcome ─────────────────────────────────────────────────────────
+
+struct LogOutcome {
+    union {
+        accepted @0 :Void;
+        # Accepted by the sampling policy and not retained. Declared, so
+        # a producer can reason about it.
+        sampled @1 :Void;
+        # Not retained for another reason (buffer full, rate limited).
+        # `reason` is open; the caller decides what to do.
+        dropped @2 :Void;
+        error @3 :T.Error;
+        unknown @4 :T.UnknownEvent;
+    }
+}
 
 struct LogDomain {
     name @0 :Text;
     level @1 :T.LogLevel;
     description @2 :Text;
+    # Configured sampling rate, so a consumer can see what it is missing.
+    samplingRate @3 :Float32;
 }
 
-# ── Log Format ───────────────────────────────────────────────
-
-enum LogFormat {
-    text @0;
-    json @1;
-    xml @2;
-    custom @3;
+interface LogSubscription {
+    # Bounded pull: the caller states how many entries it will take.
+    pull @0 (maxEntries :UInt32) -> (entries :List(LogEntry));
+    cancel @1 () -> T.VoidResult;
 }
 
-# ── Log Output ───────────────────────────────────────────────
-
-enum LogOutput {
-    stdout @0;
-    stderr @1;
-    # System log daemon (e.g., syslog, journald, Windows Event Log).
-    # Backend maps to its native transport at implementation time.
-    systemLog @2;
-    # Structured log store (e.g., ELK, Loki, InfluxDB).
-    structuredLog @3;
-    file @4;
-    custom @5;
-}
-
-# ── Log Query (audit-7) ──────────────────────────────────────
-# Structured query for SQL-like log filtering without client-side scan.
-
-struct LogQuery {
-    # Full-text search pattern.
-    search @0 :Text;
-    # Filter by domain(s).
-    domains @1 :List(Text);
-    # Filter by minimum severity level.
-    minSeverity @2 :T.LogLevel;
-    # Filter by maximum severity level.
-    maxSeverity @3 :T.LogLevel;
-    # Filter by time range.
-    since @4 :T.Timestamp;
-    until @5 :T.Timestamp;
-    # Filter by correlation ID.
-    correlationId @6 :Text;
-    # Filter by distributed trace ID.
-    traceId @7 :Text;
-    # Filter by field values (key:value syntax).
-    fieldFilters @8 :List(LogFieldFilter);
-    # Sort order.
-    sortBy @9 :LogSortField;
-    sortOrder @10 :LogSortOrder;
-}
-
-struct LogFieldFilter {
-    field @0 :Text;
-    operator @1 :LogFilterOperator;
-    value @2 :Text;
-}
-
-enum LogFilterOperator {
-    equals @0;
-    contains @1;
-    startsWith @2;
-    endsWith @3;
-    regex @4;
-    greaterThan @5;
-    lessThan @6;
-    custom @7;
-}
-
-enum LogSortField {
-    timestamp @0;
-    level @1;
-    domain @2;
-    custom @3;
-}
-
-enum LogSortOrder {
-    ascending @0;
-    descending @1;
-    custom @2;
-}
-
-# ── Log Distillation (audit-7) ───────────────────────────────
-# AI-summarized log streams for high-volume systems.
-
-struct LogDistillResult {
-    # Summary of the log window.
-    summary @0 :Text;
-    # Anomalies detected in the log window.
-    anomalies @1 :List(LogAnomaly);
-    # Patterns extracted from the log window.
-    patterns @2 :List(LogPattern);
-    # Aggregate statistics.
-    stats @3 :LogStats;
-}
-
-struct LogAnomaly {
-    # The anomalous log entry.
-    entry @0 :LogEntry;
-    # Anomaly score (0.0 = normal, 1.0 = highly anomalous).
-    score @1 :Float32;
-    # Human-readable explanation of why this is anomalous.
-    reason @2 :Text;
-}
-
-struct LogPattern {
-    # Regex or template pattern.
-    pattern @0 :Text;
-    # How many times this pattern appeared.
-    count @1 :UInt64;
-    # Example entries matching this pattern.
-    examples @2 :List(LogEntry);
-    # Severity level of this pattern.
-    severity @3 :T.LogLevel;
-}
-
-struct LogStats {
-    # Total entries in the window.
-    total @0 :UInt64;
-    # Count by severity level.
-    bySeverity @1 :List(LogSeverityCount);
-    # Count by domain.
-    byDomain @2 :List(LogDomainCount);
-    # Time range covered.
-    timeRange @3 :T.Duration;
-}
-
-struct LogSeverityCount {
-    severity @0 :T.LogLevel;
-    count @1 :UInt64;
-}
-
-struct LogDomainCount {
-    domain @0 :Text;
-    count @1 :UInt64;
-}
-
-# ── Export Format (audit-7) ──────────────────────────────────
-
-enum ExportFormat {
-    json @0;
-    jsonl @1;        # JSON Lines
-    csv @2;
-    text @3;
-    custom @4;
-}
-
-# ═══════════════════════════════════════════════════════════════════════
-# Audit-9: Alert notifications, context enrichment query, log query
-# language, distributed trace context propagation.
-# ═══════════════════════════════════════════════════════════════════════
-
-# ── Alert Notification ────────────────────────────────────────
-
-struct LogAlertNotification {
-    # Alert identifier.
-    alertId @0 :Text;
-    # Pattern that was matched.
-    pattern @1 :Text;
-    # Number of matching entries.
-    matchCount @2 :UInt64;
-    # Threshold that was exceeded.
-    threshold @3 :UInt32;
-    # When the alert fired.
-    firedAt @4 :T.Timestamp;
-    # Sample matching entries.
-    samples @5 :List(LogEntry);
-}
-
-# ── Trace Context (audit-9) ──────────────────────────────────
-# Distributed trace context for W3C trace-parent and OpenTelemetry.
+# ── Distributed tracing ─────────────────────────────────────────────────
+# The canonical trace primitives, shared with diagnostics.capnp. Carriers
+# are OPEN: the pre-revamp `TraceCarrierFormat { httpHeaders,
+# grpcMetadata, … }` named a 2016 transport in a file whose header
+# claimed "no Prometheus, no OpenTelemetry". A trace context is
+# propagated as a string map, so whatever carries it in 2046 — a header,
+# a socket option, a kernel channel — needs no schema change.
 
 struct TraceContext {
-    # W3C trace-parent header value.
-    traceParent @0 :Text;
-    # OpenTelemetry trace ID.
-    traceId @1 :Text;
-    # OpenTelemetry span ID.
-    spanId @2 :Text;
-    # Trace flags (sampled, etc.).
-    traceFlags @3 :UInt8;
-    # Vendor-specific trace state.
-    traceState @4 :Text;
-    # Baggage items.
-    baggage @5 :T.StringMap;
+    # Opaque trace id (the producer's spelling: W3C trace-parent, a
+    # 128-bit hex id, or anything else). Consumers correlate on bytes,
+    # not on a format.
+    traceId @0 :Text;
+    spanId @1 :Text;
+    # Trace flags as an opaque octet (sampled bit, etc.).
+    traceFlags @2 :UInt8;
+    # Vendor/transport-specific trace state.
+    traceState @3 :Text;
+    # Propagation baggage — open key/value.
+    baggage @4 :T.StringMap;
 }
 
 struct TraceSpan {
-    # Span name.
     name @0 :Text;
-    # Parent span ID (empty for root span).
+    # Parent span id (empty for a root span).
     parentSpanId @1 :Text;
-    # Span kind.
     kind @2 :SpanKind;
-    # Start time.
     startTime @3 :T.Timestamp;
-    # End time.
     endTime @4 :T.Timestamp;
-    # Span status.
     status @5 :SpanStatus;
     # Key-value attributes.
     attributes @6 :T.StringMap;
 }
 
 enum SpanKind {
-    internal @0;
-    server @1;
-    client @2;
-    producer @3;
-    consumer @4;
-    custom @5;
+    unknown @0;
+    internal @1;
+    server @2;
+    client @3;
+    producer @4;
+    consumer @5;
+    custom @6;
 }
 
 enum SpanStatus {
-    ok @0;
-    error @1;
-    cancelled @2;
-    custom @3;
+    unknown @0;
+    ok @1;
+    error @2;
+    cancelled @3;
+    custom @4;
 }

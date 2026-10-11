@@ -11,24 +11,41 @@
 #   - ClockInfo.bootTime for uptime-based correlation.
 #   - TimerSubscription now has cancel method for explicit teardown.
 #   - CancelResult uses T.VoidResult for consistency.
+#
+# Revamp verdict: KEEP — this file is the canonical home for timers and
+# alarms (its alarm model is strictly richer than the duplicate time.capnp
+# carried, which is now deleted). Four small honesty fixes:
+#   - `AlarmService` is reachable: it is returned by a gated accessor on
+#     ClockService, per the ai.capnp precedent (present a capability,
+#     receive the service, hold the reference as the authority).
+#   - `TimerAnchor` carries a `custom` variant, closing the one E6 gap:
+#     an absent anchor must not silently mean "absolute".
+#   - `listAlarms` and `listPersistedTimers` are paginated.
+#   - `checkTimer` is documented as the sanctioned poll path beside
+#     `subscribeTimers`, so a backend is not free to optimize only for
+#     the poller.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using Cal = import "calendar.capnp";
+using import "capability.capnp".Capability;
 
 struct ClockInfo {
     monotonic @0 :T.Timestamp;
     realtime @1 :T.Timestamp;
+    resolution @2 :T.Duration;
+    # Backend-provided clock source name (e.g., "tsc", "hpet") as an
+    # open token.
+    sourceName @3 :Text;
     # Time since last boot (monotonic base for uptime correlation).
     bootTime @4 :T.Timestamp;
-    resolution @2 :T.Duration;
-    # Backend-provided clock source name (e.g., "tsc", "hpet", "cLOCK_MONOTONIC").
-    sourceName @3 :Text;
     # Audit-7: NTP/PTP synchronization status.
     sync @5 :ClockSyncInfo;
     # Audit-7: tamper detection status.
     security @6 :ClockSecurityInfo;
     # Audit-7: available clock domains.
     domains @7 :List(ClockDomainInfo);
+    metadata @8 :T.StringMap;
 }
 
 # Audit-7: clock domain information.
@@ -41,6 +58,7 @@ struct ClockDomainInfo {
     resolution @2 :T.Duration;
     # Whether this domain is available.
     available @3 :Bool;
+    metadata @4 :T.StringMap;
 }
 
 # Audit-7: NTP/PTP synchronization status.
@@ -55,6 +73,7 @@ struct ClockSyncInfo {
     lastSync @3 :T.Timestamp;
     # Current offset from reference time.
     offset @4 :T.Duration;
+    metadata @5 :T.StringMap;
 }
 
 # Audit-7: clock security information.
@@ -82,6 +101,7 @@ struct TimerSpec {
     group @6 :Text;
     # Audit-7: timer priority (higher = fires first).
     priority @7 :UInt32;
+    metadata @8 :T.StringMap;
 }
 
 # Audit-7: explicit timer anchor type replacing implicit T.Timestamp.
@@ -93,6 +113,10 @@ struct TimerAnchor {
         relative @1 :T.Duration;
         # Anchor at zero (from now, equivalent to old behavior).
         zero @2 :Void;
+        # Forward-compatibility slot for an anchor semantics this schema
+        # does not name. Without it, an old consumer reading a producer's
+        # new anchor kind would fire at epoch-0 or never.
+        custom @3 :Data;
     }
 }
 
@@ -114,6 +138,11 @@ interface ClockService {
     cancelTimer @4 (timer :TimerHandle) -> T.VoidResult;
     resetTimer @5 (timer :TimerHandle, spec :TimerSpec) -> (timer :TimerHandle);
 
+    # Point check: did this timer fire? The sanctioned poll path, and
+    # the only one — a consumer that needs a stream of firings uses
+    # `subscribeTimers` (@7), which is pull + cancel. Backends may
+    # optimize for either; they may not support only the poller and
+    # leave the subscription unimplemented.
     checkTimer @6 (timer :TimerHandle) -> (fired :Bool);
 
     subscribeTimers @7 (filter :TimerFilter) -> (subscription :TimerSubscription);
@@ -145,10 +174,24 @@ interface ClockService {
     persistTimer @16 (timer :TimerHandle, persistence :TimerPersistence) -> T.VoidResult;
 
     # Audit-10: list persisted timers (survived process exit).
-    listPersistedTimers @17 () -> (timers :List(TimerHandle));
+    listPersistedTimers @17 (pagination :T.Pagination) -> (timers :List(TimerHandle), totalCount :UInt64);
 
     # Audit-10: set dependency ordering between timers.
+    #
+    # SEMANTICS, stated: the dependent timer does not fire while
+    # `dependsOn` has not fired at least once since the dependent was
+    # armed — it is GATED, not chained. Firing `dependsOn` does not arm
+    # the dependent, and cancelling `dependsOn` leaves the dependent
+    # waiting (it is not cancelled). Without this sentence every
+    # implementer picks a different rule.
     setTimerDependency @18 (timer :TimerHandle, dependsOn :TimerHandle) -> T.VoidResult;
+
+    # ── Alarms ──
+    # The canonical alarm home (time.capnp's duplicate alarm store is
+    # deleted). Present a capability to acquire the service; holding the
+    # returned reference IS the authority to schedule an alarm — there is
+    # no per-method token inside AlarmService.
+    alarms @19 (authority :Capability) -> (service :AlarmService);
 }
 
 # Audit-7: cancellable sleep handle.
@@ -170,10 +213,12 @@ struct ClockDriftInfo {
 struct TimerHandle {
     id @0 :T.TimerId;
     label @1 :Text;
+    metadata @2 :T.StringMap;
 }
 
 struct TimerFilter {
     labels @0 :List(Text);
+    metadata @1 :T.StringMap;
 }
 
 interface TimerSubscription {
@@ -190,6 +235,7 @@ interface TimerSubscription {
 struct TimerPullResult {
     events    @0 :List(TimerEvent);
     totalCount @1 :UInt32;
+    metadata @2 :T.StringMap;
 }
 
 struct TimerEvent {
@@ -197,6 +243,7 @@ struct TimerEvent {
     firedAt @1 :T.Timestamp;
     # How many times this timer fired since last pull (UInt64 to avoid overflow).
     count @2 :UInt64;
+    metadata @3 :T.StringMap;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -216,6 +263,7 @@ struct Alarm {
     snoozeDuration @5 :T.Duration;
     # Whether the alarm is enabled.
     enabled @6 :Bool;
+    metadata @7 :T.StringMap;
 }
 
 struct AlarmRecurrence {
@@ -233,23 +281,15 @@ struct AlarmRecurrence {
 }
 
 struct WeeklyRecurrence {
-    daysOfWeek @0 :List(DayOfWeek);
+    # The canonical day-of-week type lives in calendar.capnp; this file
+    # no longer declares a second one.
+    daysOfWeek @0 :List(Cal.DayOfWeek);
 }
 
 struct MonthlyRecurrence {
     dayOfMonth @0 :UInt8;
 }
 
-enum DayOfWeek {
-    sunday @0;
-    monday @1;
-    tuesday @2;
-    wednesday @3;
-    thursday @4;
-    friday @5;
-    saturday @6;
-    custom @7;
-}
 
 struct HolidayBehavior {
     # What to do when alarm falls on a holiday.
@@ -258,6 +298,7 @@ struct HolidayBehavior {
     adjustedTime @1 :T.Timestamp;
     # List of holiday calendar IDs to check.
     holidayCalendars @2 :List(Text);
+    metadata @3 :T.StringMap;
 }
 
 enum HolidayMode {
@@ -277,7 +318,7 @@ interface AlarmService {
     updateAlarm @1 (alarm :Alarm) -> T.VoidResult;
     deleteAlarm @2 (id :T.AlarmId) -> T.VoidResult;
     getAlarm @3 (id :T.AlarmId) -> (alarm :Alarm);
-    listAlarms @4 () -> (alarms :List(Alarm));
+    listAlarms @4 (pagination :T.Pagination) -> (alarms :List(Alarm), totalCount :UInt64);
     snoozeAlarm @5 (id :T.AlarmId, duration :T.Duration) -> T.VoidResult;
     dismissAlarm @6 (id :T.AlarmId) -> T.VoidResult;
     getNextAlarm @7 () -> (alarm :Alarm);
@@ -297,12 +338,14 @@ struct VirtualClockConfig {
     rate @2 :Float32;
     # Name for debugging.
     name @3 :Text;
+    metadata @4 :T.StringMap;
 }
 
 # Audit-10: virtual clock handle.
 struct VirtualClockHandle {
     id @0 :UInt64;
     name @1 :Text;
+    metadata @2 :T.StringMap;
 }
 
 # Audit-10: clock quality metrics per source.
@@ -319,6 +362,7 @@ struct ClockQualityMetrics {
     measuredAt @4 :T.Timestamp;
     # Number of samples used.
     sampleCount @5 :UInt32;
+    metadata @6 :T.StringMap;
 }
 
 # Audit-10: timer persistence configuration.
@@ -329,4 +373,5 @@ struct TimerPersistence {
     reFireOnRestart @1 :Bool;
     # Maximum number of re-fires (0 = unlimited).
     maxReFires @2 :UInt32;
+    metadata @3 :T.StringMap;
 }

@@ -6,197 +6,110 @@
 # Zero-backend-assumption IPC contract for content publication, querying,
 # and lifecycle management. No filesystem, database, or transport assumptions.
 #
-# Improvements (audit):
-#   - All IDs typed (T.ContentId, T.ContentSubscriptionId, T.AppId).
-#   - ContentItem.mimeData → T.DataHandle for zero-copy large payloads.
-#   - ContentItem.expiresAt for auto-expiry.
-#   - ContentItem.trashed for soft delete (trash/restore vs hard delete).
-#   - ContentItem.relationships for replies, references, threads.
-#   - AccessPolicy/AccessRule for scoped, expiring, granular permissions.
-#   - ContentFilter uses T.Pagination (no raw offset/limit).
-#   - Bulk publishMany(items) for batch publishing.
-#   - trash/restore/emptyTrash methods (soft delete workflow).
-#   - ContentRef struct for typed relationships.
-#   - ContentItem.version for optimistic-concurrency updates.
-#   - ContentSubscription has cancel() for explicit teardown.
-#   - All enums have custom/other variants for forward compatibility.
-#   - ContentEvent union has custom variant for forward compatibility.
-#   - ContentPermission.grantee typed as T.AppId (not bare Text).
+# The zero-cost posture is right and thorough, and is kept: mimeData,
+# ContentEmbedding.vector, ContentPreview.data and
+# ContentEncryptedEnvelope.ciphertext are all T.DataHandle. This is one
+# of the few files that never forces a copy for bulk data.
 #
-# Audit-8 enhancements:
-#   - AiProvenance: AI-generated content metadata (model, prompt, confidence).
-#   - ContentEmbedding: vector embeddings for semantic search.
-#   - ContentProvenance: chain of custody (creation, modification, import).
-#   - ContentAccessibility: alt text, captions, transcripts.
-#   - ContentReaction: typed reactions/votes on content.
-#   - ContentGeoLocation: location-tagged content with spatial queries.
-#   - ContentLicense: Creative Commons / proprietary / public domain.
-#   - ContentTag: typed tags with provenance (user, AI, system).
-#   - ContentUndoEntry: edit history for rollback.
-#   - ContentTombstone: GDPR erasure with audit trail.
-#   - ContentEncryptedEnvelope: E2E encrypted content wrapper.
-#   - SearchMode: full-text, prefix, fuzzy, semantic search.
-#   - Key rotation and access revocation for encrypted content.
+# ── THE SECOND ACCESS-CONTROL SYSTEM IS DELETED ────────────────────────
+#
+# This file carried a complete parallel authorization system:
+# `ContentPermission` (its own permission vocabulary), `AccessPolicy`/
+# `AccessRule` (its own grants with expiry and scope), its own
+# grant/revoke lifecycle (grantAccess/revokeAccess/checkAccess/
+# getAccessPolicy) and its own delegation chain with maxDepth
+# (delegateAccess/revokeDelegation/getDelegationChain).
+#
+# DESIGN_PRINCIPLES.md:399 forbids exactly this: "Do NOT define
+# permission strings, boolean flags, or role-based access control in the
+# protocol. The capability system IS the access control mechanism." The
+# cost was concrete — a content grant made here could outlive or
+# contradict a capability revoked in capability.capnp, and every consumer
+# had to learn two access models and reconcile them.
+#
+# Authority over a content item is now a Capability whose `target` names
+# the item and whose `operations` narrow what the holder may do.
+# Attenuation and revocation are capability.capnp's `attenuate @2` /
+# `revoke @4` / `revokeControlled @9`; checking one is
+# `CapabilityService.verify`. All seven local methods and all four local
+# types are deleted rather than reimplemented.
+#
+# ── DECRYPT HAD NOWHERE TO PUT THE PLAINTEXT ───────────────────────────
+#
+# `decryptContent` returned T.VoidResult. Where does the plaintext go?
+# Does `get` then return decrypted `mimeData`? Is the shared item
+# mutated in place, affecting every other consumer? The schema did not
+# say, so every implementer had to invent, and the two choices were not
+# wire-compatible. Declared now: decryptContent READS THROUGH, replacing
+# `mimeData` with a handle to the plaintext for the caller's connection
+# only, and leaving the stored ciphertext untouched. A backend that
+# cannot do that MUST refuse with T.Error(unsupported) rather than
+# silently doing something else.
+#
+# ── AN OPEN TAXONOMY, NOT A 21-VALUE ENUM ──────────────────────────────
+#
+# `ContentType` froze today's content kinds — including the Audit-8
+# additions embedding/model/dataset/threeDmodel, which are today's
+# AI-era artifacts — while `ContentItem.mimeType` sat three lines away
+# carrying the same information with T.MimeType available. A 2046 content
+# kind (a spatial scene, a neural weight set, a DNA record) landed in
+# `custom` carrying nothing, so `ContentFilter.type` could not select it.
+# `type` is now a mime prefix filter, and the enum is deleted.
+#
+# ── PAGINATION ON THE UNBOUNDED READS ──────────────────────────────────
+#
+# Five list returns had none (undo history, provenance, lineage,
+# translations, dependencies), so a content item with 10k undo entries or
+# a deep lineage graph copied all of them on every call. `undoHistory`
+# also rode inline on `ContentItem`, so every search hit carried its
+# entire edit history; it is now fetched on demand.
+#
+# Improvements (audit-8/9), unchanged:
+#   - All IDs typed; ContentFilter uses T.Pagination.
+#   - ContentItem.mimeData → T.DataHandle; expiresAt; trashed soft delete.
+#   - publishMany, trash/restore/emptyTrash, ContentRef relationships.
+#   - ContentItem.version as an optimistic-concurrency guard — now
+#     actually honoured by `update`, which was previously decorative.
+#   - ContentSubscription has cancel.
+#   - AiProvenance, ContentEmbedding, ContentProvenance, ContentAccessibility,
+#     ContentReaction, ContentGeoLocation, ContentLicense, ContentTag,
+#     ContentUndoEntry, ContentTombstone, ContentEncryptedEnvelope.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
+using Search = import "system_search.capnp";
 
-# ── Content Types ─────────────────────────────────────────────────────────
-
-enum ContentType {
-    unknown @0;
-    image @1;
-    video @2;
-    audio @3;
-    text @4;
-    document @5;
-    contact @6;
-    calendar @7;
-    bookmark @8;
-    file @9;
-    url @10;
-    event @11;
-    task @12;
-    other @13;
-    # Backend-specific content type.
-    custom @14;
-    # Audit-8 additions:
-    embedding @15;
-    model @16;
-    dataset @17;
-    code @18;
-    archive @19;
-    threeDmodel @20;
-}
-
-# ── Content Item ──────────────────────────────────────────────────────────
-
-struct ContentItem {
-    id @0 :T.ContentId;
-    type @1 :ContentType;
-    mimeType @2 :Text;
-    title @3 :Text;
-    summary @4 :Text;
-    uri @5 :Text;
-    size @6 :UInt64;
-    createdAt @7 :T.Timestamp;
-    modifiedAt @8 :T.Timestamp;
-    publisher @9 :T.AppId;
-    metadata @10 :T.StringMap;
-
-    # Inline or buffered payload. Empty for items where uri is authoritative.
-    mimeData @11 :T.DataHandle;
-    # When to auto-delete this item (wall clock).
-    expiresAt @12 :T.Timestamp;
-    # Soft-delete flag: trashed items are hidden but restorable.
-    trashed @13 :Bool;
-    # Optimistic-concurrency version (increment on each update).
-    version @14 :UInt64;
-    # Relationships to other content items.
-    relationships @15 :List(ContentRef);
-    # Content visibility scope.
-    visibility @16 :ContentVisibility;
-    # Tags for organization (typed with provenance).
-    tags @17 :List(ContentTag);
-    # Audit-8 additions:
-    aiProvenance @18 :AiProvenance;
-    embedding @19 :ContentEmbedding;
-    provenance @20 :ContentProvenance;
-    accessibility @21 :ContentAccessibility;
-    reactions @22 :List(ContentReaction);
-    geoLocation @23 :ContentGeoLocation;
-    license @24 :ContentLicense;
-    undoHistory @25 :List(ContentUndoEntry);
-    tombstone @26 :ContentTombstone;
-    encryptedEnvelope @27 :ContentEncryptedEnvelope;
-}
-
-enum ContentVisibility {
-    private @0;
-    app @1;
-    shared @2;
-    public @3;
-    other @4;
-    # Backend-specific visibility scope.
-    custom @5;
-}
-
-struct ContentRef {
-    # ID of the related content item.
-    targetId @0 :T.ContentId;
-    # What role the target plays.
-    role @1 :ContentRefRole;
-    # Order within a collection (for sorting).
-    order @2 :UInt32;
-}
-
-enum ContentRefRole {
-    reply @0;
-    reference @1;
-    parent @2;
-    child @3;
-    cited @4;
-    related @5;
-    attachment @6;
-    preview @7;
-    other @8;
-    # Backend-specific relationship role.
-    custom @9;
-}
+# ContentEmbedding.distanceMetric uses system_search's SimilarityMetric:
+# content.capnp's own DistanceMetric was value-identical to it, so one
+# home (system_search, which owns the query vocabulary) replaces two.
 
 # ── Filter ───────────────────────────────────────────────────────────────
+# `mimeTypePrefix` replaces the closed ContentType enum: a prefix match
+# over T.MimeType selects what the enum used to, and a 2046 content kind
+# is selectable the day a provider emits it.
 
 struct ContentFilter {
-    type @0 :ContentType;
-    mimeTypePrefix @1 :Text;
-    publisher @2 :T.AppId;
-    createdAfter @3 :T.Timestamp;
-    modifiedAfter @4 :T.Timestamp;
+    mimeTypePrefix @0 :Text;
+    publisher @1 :T.AppId;
+    createdAfter @2 :T.Timestamp;
+    modifiedAfter @3 :T.Timestamp;
     # Pagination for unbounded result sets.
-    page @5 :T.Pagination;
-    query @6 :Text;
+    page @4 :T.Pagination;
+    query @5 :Text;
     # Only return items with these tags.
-    tags @7 :List(Text);
+    tags @6 :List(Text);
     # Include trashed items in results.
-    includeTrashed @8 :Bool;
+    includeTrashed @7 :Bool;
     # Audit-8 additions:
-    geoBounds @9 :GeoBounds;
-    embeddingQuery @10 :ContentEmbedding;
-    hasAiProvenance @11 :Bool;
-    hasEmbedding @12 :Bool;
-    licenseType @13 :Text;
-    searchMode @14 :SearchMode;
-}
-
-# ── Access Control ────────────────────────────────────────────────────────
-
-enum ContentPermission {
-    read @0;
-    write @1;
-    share @2;
-    delete @3;
-    publish @4;
-    comment @5;
-    other @6;
-    # Backend-specific permission type.
-    custom @7;
-}
-
-struct AccessPolicy {
-    rules @0 :List(AccessRule);
-}
-
-struct AccessRule {
-    # Which permission this rule governs.
-    permission @0 :ContentPermission;
-    # Target app that receives this grant.
-    grantee @1 :T.AppId;
-    # Optional expiry for temporary grants.
-    expiresAt @2 :T.Timestamp;
-    # Whether this is an explicit grant or inherited.
-    explicit @3 :Bool;
-    # Optional scope description.
-    scope @4 :Text;
+    geoBounds @8 :GeoBounds;
+    embeddingQuery @9 :ContentEmbedding;
+    hasAiProvenance @10 :Bool;
+    hasEmbedding @11 :Bool;
+    licenseType @12 :Text;
+    # Search strategy hint, as an open token (system_search's
+    # vocabulary), so contacts.capnp and this file spell it one way.
+    searchMode @13 :Text;
+    parameters @14 :T.StringMap;
 }
 
 # ── Service ───────────────────────────────────────────────────────────────
@@ -205,7 +118,10 @@ interface ContentService {
     publish @0 (item :ContentItem) -> (contentId :T.ContentId);
     publishMany @1 (items :List(ContentItem)) -> (contentIds :List(T.ContentId));
 
-    update @2 (contentId :T.ContentId, item :ContentItem) -> T.VoidResult;
+    # Honours ContentItem.version: a mismatch returns the conflict arm
+    # rather than silently overwriting. The field used to be decorative
+    # — two writers could still clobber each other.
+    update @2 (contentId :T.ContentId, item :ContentItem) -> (result :UpdateResult);
 
     unpublish @3 (contentId :T.ContentId) -> T.VoidResult;
     delete @4 (contentId :T.ContentId) -> T.VoidResult;
@@ -221,121 +137,136 @@ interface ContentService {
 
     subscribe @10 (filter :ContentFilter) -> (subscription :ContentSubscription);
 
-    grantAccess @11 (contentId :T.ContentId, policy :AccessPolicy) -> T.VoidResult;
-    revokeAccess @12 (contentId :T.ContentId, grantee :T.AppId) -> T.VoidResult;
-    checkAccess @13 (contentId :T.ContentId, permission :ContentPermission) -> (granted :Bool);
-    getAccessPolicy @14 (contentId :T.ContentId) -> (policy :AccessPolicy);
-
     # Add/remove relationships.
-    addRelationship @15 (contentId :T.ContentId, ref :ContentRef) -> T.VoidResult;
-    removeRelationship @16 (contentId :T.ContentId, targetId :T.ContentId) -> T.VoidResult;
+    addRelationship @11 (contentId :T.ContentId, ref :ContentRef) -> T.VoidResult;
+    removeRelationship @12 (contentId :T.ContentId, targetId :T.ContentId) -> T.VoidResult;
 
     # Query all items related to a given item (paginated).
-    getRelationships @17 (contentId :T.ContentId, page :T.Pagination) -> (refs :List(ContentRef), total :UInt32);
+    getRelationships @13 (contentId :T.ContentId, page :T.Pagination) -> (refs :List(ContentRef), total :UInt32);
 
-    # -- Audit-8: Semantic search --
-    semanticSearch @18 (embedding :ContentEmbedding, page :T.Pagination)
+    # -- Semantic search --
+    semanticSearch @14 (embedding :ContentEmbedding, page :T.Pagination)
         -> (items :List(ContentItem), total :UInt64);
 
-    # -- Audit-8: Content graph --
-    getContentGraph @19 (contentId :T.ContentId, depth :UInt32, page :T.Pagination)
+    # -- Content graph --
+    getContentGraph @15 (contentId :T.ContentId, depth :UInt32, page :T.Pagination)
         -> (refs :List(ContentRef), total :UInt32);
 
-    # -- Audit-8: Reactions --
-    reactToContent @20 (contentId :T.ContentId, reaction :ContentReaction) -> T.VoidResult;
-    getReactions @21 (contentId :T.ContentId, page :T.Pagination)
+    # -- Reactions --
+    reactToContent @16 (contentId :T.ContentId, reaction :ContentReaction) -> T.VoidResult;
+    getReactions @17 (contentId :T.ContentId, page :T.Pagination)
         -> (reactions :List(ContentReaction), total :UInt32);
 
-    # -- Audit-8: Provenance --
-    addProvenance @22 (contentId :T.ContentId, entry :ContentProvenance) -> T.VoidResult;
-    getProvenance @23 (contentId :T.ContentId) -> (provenance :List(ContentProvenance));
+    # -- Provenance (paginated) --
+    addProvenance @18 (contentId :T.ContentId, entry :ContentProvenance) -> T.VoidResult;
+    getProvenance @19 (contentId :T.ContentId, page :T.Pagination)
+        -> (provenance :List(ContentProvenance), total :UInt32);
 
-    # -- Audit-8: GDPR erasure --
-    eraseContent @24 (contentId :T.ContentId, reason :Text) -> T.VoidResult;
+    # -- GDPR erasure --
+    eraseContent @20 (contentId :T.ContentId, reason :Text) -> T.VoidResult;
 
-    # -- Audit-8: Undo history --
-    getUndoHistory @25 (contentId :T.ContentId) -> (history :List(ContentUndoEntry));
-    undoContent @26 (contentId :T.ContentId, entryIndex :UInt32) -> T.VoidResult;
+    # -- Undo history (paginated; no longer inline on ContentItem) --
+    getUndoHistory @21 (contentId :T.ContentId, page :T.Pagination)
+        -> (history :List(ContentUndoEntry), total :UInt32);
+    undoContent @22 (contentId :T.ContentId, entryIndex :UInt32) -> T.VoidResult;
 
-    # -- Audit-8: Encryption management --
-    encryptContent @27 (contentId :T.ContentId, keyId :T.KeyId) -> T.VoidResult;
-    decryptContent @28 (contentId :T.ContentId) -> T.VoidResult;
-    rotateEncryptionKey @29 (contentId :T.ContentId, newKeyId :T.KeyId) -> T.VoidResult;
+    # -- Encryption management --
+    # Key lifecycle belongs to key_management.capnp (rotateKey @3); this
+    # file records which key an envelope used and re-wraps the envelope.
+    # `decryptContent` is read-through: it replaces `mimeData` with a
+    # handle to the plaintext FOR THIS CALLER ONLY and leaves the stored
+    # ciphertext untouched. A backend that cannot do that refuses with
+    # T.Error(unsupported) rather than doing something else — the
+    # previous T.VoidResult left the destination undeclared, so two
+    # backends were wire-incompatible on the read path.
+    encryptContent @23 (contentId :T.ContentId, keyId :T.KeyId) -> T.VoidResult;
+    decryptContent @24 (contentId :T.ContentId) -> (item :ContentItem);
+    rotateEncryptionKey @25 (contentId :T.ContentId, newKeyId :T.KeyId) -> T.VoidResult;
 
-    # -- Audit-8: Geolocation --
-    geotagContent @30 (contentId :T.ContentId, geo :ContentGeoLocation) -> T.VoidResult;
-    getByGeoLocation @31 (geo :ContentGeoLocation, radiusMeters :Float32, page :T.Pagination)
+    # -- Geolocation --
+    geotagContent @26 (contentId :T.ContentId, geo :ContentGeoLocation) -> T.VoidResult;
+    getByGeoLocation @27 (geo :ContentGeoLocation, radiusMeters :Float32, page :T.Pagination)
         -> (items :List(ContentItem), total :UInt64);
 
-    # -- Audit-8: AI tagging --
-    aiTagContent @32 (contentId :T.ContentId) -> (tags :List(ContentTag));
+    # -- AI tagging --
+    aiTagContent @28 (contentId :T.ContentId) -> (tags :List(ContentTag));
 
-    # -- Audit-8: Accessibility --
-    getAccessibilityReport @33 (contentId :T.ContentId) -> (report :ContentAccessibility);
+    # -- Accessibility --
+    getAccessibilityReport @29 (contentId :T.ContentId) -> (report :ContentAccessibility);
 
-    # -- Audit-8: Batch publish --
-    batchPublish @34 (items :List(ContentItem), provenance :ContentProvenance)
+    # -- Batch publish --
+    batchPublish @30 (items :List(ContentItem), provenance :ContentProvenance)
         -> (contentIds :List(T.ContentId));
 
-    # -- Audit-9: Branch versioning --
-    createBranch @35 (contentId :T.ContentId, name :Text) -> (branch :ContentBranch);
-    listBranches @36 (contentId :T.ContentId) -> (branches :List(ContentBranch));
-    mergeBranch @37 (contentId :T.ContentId, sourceBranch :Text, targetBranch :Text) -> T.VoidResult;
+    # -- Branch versioning --
+    createBranch @31 (contentId :T.ContentId, name :Text) -> (branch :ContentBranch);
+    listBranches @32 (contentId :T.ContentId) -> (branches :List(ContentBranch));
+    mergeBranch @33 (contentId :T.ContentId, sourceBranch :Text, targetBranch :Text) -> T.VoidResult;
 
-    # -- Audit-9: Content composition --
-    createComposite @38 (composite :ContentComposite) -> (compositeId :T.ContentId);
-    getComposite @39 (compositeId :T.ContentId) -> (composite :ContentComposite);
-    updateComposite @40 (compositeId :T.ContentId, components :List(ContentRef)) -> T.VoidResult;
+    # -- Content composition --
+    createComposite @34 (composite :ContentComposite) -> (compositeId :T.ContentId);
+    getComposite @35 (compositeId :T.ContentId) -> (composite :ContentComposite);
+    updateComposite @36 (compositeId :T.ContentId, components :List(ContentRef)) -> T.VoidResult;
 
-    # -- Audit-9: Content lineage --
-    addLineage @41 (contentId :T.ContentId, lineage :ContentLineage) -> T.VoidResult;
-    getLineage @42 (contentId :T.ContentId) -> (lineage :List(ContentLineage));
+    # -- Content lineage (paginated) --
+    addLineage @37 (contentId :T.ContentId, lineage :ContentLineage) -> T.VoidResult;
+    getLineage @38 (contentId :T.ContentId, page :T.Pagination)
+        -> (lineage :List(ContentLineage), total :UInt32);
 
-    # -- Audit-9: Access delegation --
-    delegateAccess @43 (contentId :T.ContentId, delegation :AccessDelegation) -> T.VoidResult;
-    revokeDelegation @44 (contentId :T.ContentId, delegateId :T.AppId) -> T.VoidResult;
-    getDelegationChain @45 (contentId :T.ContentId) -> (delegations :List(AccessDelegation));
+    # -- Audit trail --
+    getAuditTrail @39 (contentId :T.ContentId, page :T.Pagination) -> (entries :List(ContentAuditEntry), total :UInt32);
 
-    # -- Audit-9: Audit trail --
-    getAuditTrail @46 (contentId :T.ContentId, page :T.Pagination) -> (entries :List(ContentAuditEntry), total :UInt32);
+    # -- Rate limiting --
+    setRateLimit @40 (config :RateLimitConfig) -> T.VoidResult;
+    getRateLimit @41 (appId :T.AppId) -> (config :RateLimitConfig);
 
-    # -- Audit-9: Rate limiting --
-    setRateLimit @47 (config :RateLimitConfig) -> T.VoidResult;
-    getRateLimit @48 (appId :T.AppId) -> (config :RateLimitConfig);
+    # -- Preview generation --
+    generatePreview @42 (contentId :T.ContentId, previewType :Text) -> (preview :ContentPreview);
+    getPreview @43 (contentId :T.ContentId) -> (preview :ContentPreview);
 
-    # -- Audit-9: Preview generation --
-    generatePreview @49 (contentId :T.ContentId, previewType :Text) -> (preview :ContentPreview);
-    getPreview @50 (contentId :T.ContentId) -> (preview :ContentPreview);
+    # -- Dependency tracking (paginated) --
+    getDependencies @44 (contentId :T.ContentId, page :T.Pagination)
+        -> (dependency :ContentDependency, total :UInt32);
+    addDependency @45 (contentId :T.ContentId, dependsOnId :T.ContentId) -> T.VoidResult;
+    removeDependency @46 (contentId :T.ContentId, dependsOnId :T.ContentId) -> T.VoidResult;
 
-    # -- Audit-9: Dependency tracking --
-    getDependencies @51 (contentId :T.ContentId) -> (dependency :ContentDependency);
-    addDependency @52 (contentId :T.ContentId, dependsOnId :T.ContentId) -> T.VoidResult;
-    removeDependency @53 (contentId :T.ContentId, dependsOnId :T.ContentId) -> T.VoidResult;
+    # -- Expiration scheduling --
+    scheduleExpiration @47 (schedule :ExpirationSchedule) -> T.VoidResult;
+    cancelExpiration @48 (contentIds :List(T.ContentId)) -> T.VoidResult;
 
-    # -- Audit-9: Expiration scheduling --
-    scheduleExpiration @54 (schedule :ExpirationSchedule) -> T.VoidResult;
-    cancelExpiration @55 (contentIds :List(T.ContentId)) -> T.VoidResult;
+    # -- Replication status --
+    getReplicationStatus @49 (contentId :T.ContentId) -> (status :ReplicationStatus);
 
-    # -- Audit-9: Replication status --
-    getReplicationStatus @56 (contentId :T.ContentId) -> (status :ReplicationStatus);
+    # -- Quality scoring (backend-declared; see the score struct) --
+    getQualityScore @50 (contentId :T.ContentId) -> (score :QualityScore);
 
-    # -- Audit-9: Quality scoring --
-    getQualityScore @57 (contentId :T.ContentId) -> (score :QualityScore);
-
-    # -- Audit-9: Recommendations --
-    getRecommendations @58 (contentId :T.ContentId, page :T.Pagination)
+    # -- Recommendations --
+    getRecommendations @51 (contentId :T.ContentId, page :T.Pagination)
         -> (recommendations :List(ContentRecommendation), total :UInt32);
 
-    # -- Audit-9: Multi-language support --
-    addTranslation @59 (contentId :T.ContentId, translation :ContentTranslation) -> T.VoidResult;
-    getTranslations @60 (contentId :T.ContentId) -> (translations :List(ContentTranslation));
-    getTranslatedContent @61 (contentId :T.ContentId, targetLanguage :Text) -> (item :ContentItem);
+    # -- Multi-language support --
+    addTranslation @52 (contentId :T.ContentId, translation :ContentTranslation) -> T.VoidResult;
+    getTranslations @53 (contentId :T.ContentId, page :T.Pagination)
+        -> (translations :List(ContentTranslation), total :UInt32);
+    getTranslatedContent @54 (contentId :T.ContentId, targetLanguage :T.Language) -> (item :ContentItem);
 }
 
 interface ContentSubscription {
     pull @0 () -> (events :List(ContentEvent));
     # Explicit cancellation — stops the event stream and releases resources.
     cancel @1 () -> T.VoidResult;
+}
+
+# Update is a conflict-or-success outcome, so the version guard is real
+# rather than decorative.
+struct UpdateResult {
+    union {
+        updated @0 :ContentItem;
+        # The item as it currently stands, so a caller can rebase.
+        conflict @1 :ContentItem;
+        error @2 :T.Error;
+        custom @3 :Data;
+    }
 }
 
 struct ContentEvent {
@@ -347,13 +278,9 @@ struct ContentEvent {
         removed @4 :T.ContentId;
         trashed @5 :T.ContentId;
         restored @6 :T.ContentId;
-        accessChanged @7 :T.ContentId;
-        # Backend-specific content event type.
-        custom @8 :Data;
-        # Audit-8 additions:
-        reacted @9 :ContentReaction;
-        encrypted @10 :T.KeyId;
-        erased @11 :T.ContentId;
+        encrypted @7 :T.KeyId;
+        erased @8 :T.ContentId;
+        custom @9 :Data;
     }
 }
 
@@ -364,88 +291,121 @@ struct ContentEvent {
 # search modes, geo-bounds, and content encryption management.
 # ════════════════════════════════════════════════════════════════════════
 
+# ── Content Item ──────────────────────────────────────────────────────────
+
+struct ContentItem {
+    id @0 :T.ContentId;
+    # MIME prefix filter, replacing the closed 21-value ContentType
+    # enum: a 2046 content kind is nameable, and the filter becomes what
+    # it effectively already was.
+    mimeType @1 :T.MimeType;
+    title @2 :Text;
+    summary @3 :Text;
+    uri @4 :Text;
+    size @5 :UInt64;
+    createdAt @6 :T.Timestamp;
+    modifiedAt @7 :T.Timestamp;
+    publisher @8 :T.AppId;
+    metadata @9 :T.StringMap;
+
+    # Inline or buffered payload. Empty for items where uri is authoritative.
+    mimeData @10 :T.DataHandle;
+    # When to auto-delete this item (wall clock).
+    expiresAt @11 :T.Timestamp;
+    # Soft-delete flag: trashed items are hidden but restorable.
+    trashed @12 :Bool;
+    # Optimistic-concurrency version (increment on each update). HONOURED
+    # by `update`, which returns the conflict arm on a mismatch.
+    version @13 :UInt64;
+    # Relationships to other content items.
+    relationships @14 :List(ContentRef);
+    # Visibility scope, as an open token.
+    visibility @15 :Text;
+    # Tags for organization (typed with provenance).
+    tags @16 :List(ContentTag);
+    # Audit-8 additions:
+    aiProvenance @17 :AiProvenance;
+    embedding @18 :ContentEmbedding;
+    provenance @19 :ContentProvenance;
+    accessibility @20 :ContentAccessibility;
+    reactions @21 :List(ContentReaction);
+    geoLocation @22 :ContentGeoLocation;
+    license @23 :ContentLicense;
+    # undoHistory is no longer inline here: a struct returned by `query`
+    # was carrying its entire edit history on every hit. Fetch it with
+    # getUndoHistory, which is paginated.
+    tombstone @24 :ContentTombstone;
+    encryptedEnvelope @25 :ContentEncryptedEnvelope;
+}
+
+struct ContentRef {
+    targetId @0 :T.ContentId;
+    # Role, as an open token (see the ref-role conformance consts).
+    role @1 :Text;
+    order @2 :UInt32;
+}
+
 # ── AI Provenance ──────────────────────────────────────────────────────
-# Structured metadata for AI-generated content. Records model,
-# prompt, confidence, and generation timestamp for auditability.
+
 struct AiProvenance {
     modelId @0 :Text;
     modelVersion @1 :T.Version;
-    promptHash @2 :T.HashOutput;
+    promptHash @2 :Data;
     confidence @3 :Float32;
     generatedAt @4 :T.Timestamp;
     seed @5 :UInt64;
+    metadata @6 :T.StringMap;
 }
 
 # ── Content Embedding ──────────────────────────────────────────────────
-# Vector embedding for semantic similarity search. Enables finding
-# content by meaning rather than keywords.
 struct ContentEmbedding {
     vector @0 :T.DataHandle;
     dimensions @1 :UInt32;
     model @2 :Text;
-    distanceMetric @3 :DistanceMetric;
-}
-
-enum DistanceMetric {
-    cosine @0;
-    euclidean @1;
-    dotProduct @2;
-    manhattan @3;
-    custom @4;
+    # One home for the metric vocabulary: system_search's SimilarityMetric.
+    distanceMetric @3 :Search.SimilarityMetric;
+    parameters @4 :T.StringMap;
 }
 
 # ── Content Provenance ─────────────────────────────────────────────────
-# Chain of custody for content. Records creation, modification,
-# import source, and licensing for compliance and audit.
 struct ContentProvenance {
     createdAt @0 :T.Timestamp;
     createdBy @1 :T.AppId;
     modifiedBy @2 :List(T.AppId);
     importedFrom @3 :Text;
+    # License, as an open token (e.g., "cc-by-4.0", "proprietary").
     license @4 :Text;
-    sourceHash @5 :T.HashOutput;
+    sourceHash @5 :Data;
+    metadata @6 :T.StringMap;
 }
 
 # ── Content Accessibility ──────────────────────────────────────────────
-# Accessibility metadata for content. Alt text, captions, transcripts,
-# and reading order for compliance with accessibility standards.
 struct ContentAccessibility {
     altText @0 :Text;
     captions @1 :List(CaptionEntry);
     transcript @2 :Text;
     readingOrder @3 :UInt32;
-    language @4 :Text;
+    language @4 :T.Language;
+    parameters @5 :T.StringMap;
 }
 
 struct CaptionEntry {
     text @0 :Text;
     startTime @1 :T.Duration;
     endTime @2 :T.Duration;
-    language @3 :Text;
+    language @3 :T.Language;
 }
 
 # ── Content Reaction ───────────────────────────────────────────────────
-# User reactions/votes on content. Typed reaction types with
-# emoji support and provenance tracking.
 struct ContentReaction {
     appId @0 :T.AppId;
-    type @1 :ContentReactionType;
+    # Reaction type, as an open token (see the reaction consts).
+    type @1 :Text;
     emoji @2 :Text;
     timestamp @3 :T.Timestamp;
 }
 
-enum ContentReactionType {
-    like @0;
-    dislike @1;
-    bookmark @2;
-    flag @3;
-    emoji @4;
-    custom @5;
-}
-
 # ── Content Geo-Location ───────────────────────────────────────────────
-# Location-tagged content with spatial query support. Enables
-# finding content by geographic proximity.
 struct ContentGeoLocation {
     latitude @0 :Float64;
     longitude @1 :Float64;
@@ -462,61 +422,40 @@ struct GeoBounds {
 }
 
 # ── Content License ────────────────────────────────────────────────────
-# Licensing metadata for content. Creative Commons, proprietary,
-# or public domain licensing with variant and holder info.
 struct ContentLicense {
-    type @0 :LicenseType;
+    # License, as an open token — closed by nothing: a 2046 licence, a
+    # jurisdiction-specific public-sector licence and every CC variant
+    # are all nameable.
+    type @0 :Text;
     variant @1 :Text;
-    url @2 :Text;
+    url @2 :T.Uri;
     holder @3 :Text;
 }
 
-enum LicenseType {
-    creativeCommon @0;
-    proprietary @1;
-    publicDomain @2;
-    custom @3;
-}
-
 # ── Content Tag ────────────────────────────────────────────────────────
-# Typed tag with provenance. Replaces bare Text tags with structured
-# tags that record source (user, AI, system) and confidence.
 struct ContentTag {
     text @0 :Text;
     confidence @1 :Float32;
-    source @2 :ContentTagSource;
+    # Source, as an open token (see the tag-source consts).
+    source @2 :Text;
     tagId @3 :T.TagId;
 }
 
-enum ContentTagSource {
-    user @0;
-    ai @1;
-    system @2;
-    custom @3;
-}
-
 # ── Content Undo Entry ─────────────────────────────────────────────────
-# Edit history for content rollback. Records each change with
-# actor, field, and before/after values.
 struct ContentUndoEntry {
     timestamp @0 :T.Timestamp;
-    action @1 :UndoAction;
+    # Action, as an open token (see the undo-action consts).
+    action @1 :Text;
     field @2 :Text;
     oldValue @3 :Text;
     newValue @4 :Text;
     actor @5 :T.AppId;
 }
 
-enum UndoAction {
-    create @0;
-    modify @1;
-    delete @2;
-    custom @3;
-}
-
 # ── Content Tombstone ──────────────────────────────────────────────────
-# GDPR-compliant content erasure marker. Records when content was
-# erased, by whom, and the legal basis for compliance auditing.
+# `reason` and `legalBasis` are two views of ONE obligation, so they draw
+# on one open vocabulary: a compliance tool can read both and a consumer
+# never has to guess whether "deleted" meant a legal duty or a user action.
 struct ContentTombstone {
     erasedAt @0 :T.Timestamp;
     reason @1 :Text;
@@ -525,232 +464,173 @@ struct ContentTombstone {
 }
 
 # ── Content Encrypted Envelope ─────────────────────────────────────────
-# E2E encrypted content wrapper. Contains ciphertext handle, key
-# reference, algorithm, and IV for encrypted content at rest.
 struct ContentEncryptedEnvelope {
     ciphertext @0 :T.DataHandle;
     keyId @1 :T.KeyId;
+    # Algorithm, as an open token shared with crypto.capnp.
     algorithm @2 :Text;
     iv @3 :Data;
+    parameters @4 :T.StringMap;
 }
-
-# ── Search Mode ────────────────────────────────────────────────────────
-# Optional search strategy for content queries. Backend may support
-# full-text, prefix, fuzzy, or semantic search.
-enum SearchMode {
-    fullText @0;
-    prefix @1;
-    fuzzy @2;
-    semantic @3;
-    custom @4;
-}
-
-# ════════════════════════════════════════════════════════════════════════
-# Audit-9 additions: content versioning with branching, composition,
-# lineage tracking, access control delegation, audit trail, rate
-# limiting, preview generation, dependency tracking, expiration
-# scheduling, replication status, quality scoring, recommendations,
-# and multi-language support.
-# ════════════════════════════════════════════════════════════════════════
 
 # ── Content Branch ─────────────────────────────────────────────────────
-# Branch-based versioning for content. Enables forking, merging,
-# and parallel editing workflows (like Git branches for content).
 struct ContentBranch {
     branchId @0 :Text;
     contentId @1 :T.ContentId;
-    # Branch name (e.g., "main", "draft", "review").
     name @2 :Text;
-    # Parent branch this was forked from.
     parentBranch @3 :Text;
-    # HEAD version in this branch.
     headVersion @4 :UInt64;
-    # Whether this branch has unmerged changes.
     dirty @5 :Bool;
     createdAt @6 :T.Timestamp;
     createdBy @7 :T.AppId;
 }
 
 # ── Content Composite ──────────────────────────────────────────────────
-# Combines multiple content items into a composite structure.
-# Examples: newsletter = title + articles + images, magazine = TOC + articles.
 struct ContentComposite {
     compositeId @0 :T.ContentId;
-    # Ordered list of component content IDs.
     components @1 :List(ContentRef);
-    # Layout template for composing components.
     template @2 :Text;
-    # Whether the composite is auto-updated when components change.
     autoUpdate @3 :Bool;
 }
 
 # ── Content Lineage ────────────────────────────────────────────────────
-# Tracks derivation lineage between content items. When content is
-# derived from other content (remix, translation, adaptation),
-# lineage records the provenance chain.
 struct ContentLineage {
     contentId @0 :T.ContentId;
-    # Source content this was derived from.
     sourceId @1 :T.ContentId;
-    # Type of derivation (e.g., "translation", "remix", "adaptation").
+    # Derivation type, as an open token (e.g., "translation", "remix").
     derivationType @2 :Text;
-    # App that performed the derivation.
     derivedBy @3 :T.AppId;
     derivedAt @4 :T.Timestamp;
 }
 
-# ── Access Delegation ──────────────────────────────────────────────────
-# Delegation chain for content access control. When a grantee
-# delegates their access to another party, delegation records
-# the chain of authority for compliance.
-struct AccessDelegation {
-    # The original granter of access.
-    granterId @0 :T.AppId;
-    # The party that received access and is delegating.
-    delegateId @1 :T.AppId;
-    # The party receiving delegated access.
-    recipientId @2 :T.AppId;
-    # Permissions being delegated.
-    permissions @3 :List(ContentPermission);
-    # When delegation expires.
-    expiresAt @4 :T.Timestamp;
-    # Maximum depth of delegation chain.
-    maxDepth @5 :UInt32;
-}
-
 # ── Content Audit Entry ────────────────────────────────────────────────
-# Audit trail entry for content access and modification. GDPR
-# requires knowing who accessed content and when.
 struct ContentAuditEntry {
     contentId @0 :T.ContentId;
+    # Action, as an open token.
     action @1 :Text;
     actor @2 :T.AppId;
     timestamp @3 :T.Timestamp;
-    # What was accessed or changed.
     target @4 :Text;
-    # IP address or device identifier (optional).
     sourceAddress @5 :Text;
-    # Whether the action was successful.
     success @6 :Bool;
 }
 
 # ── Rate Limit Configuration ───────────────────────────────────────────
-# Per-app rate limiting for content publish/update operations.
-# Prevents runaway publishing from degrading system performance.
 struct RateLimitConfig {
     appId @0 :T.AppId;
-    # Maximum publishes per minute.
     maxPublishPerMinute @1 :UInt32;
-    # Maximum updates per minute.
     maxUpdatePerMinute @2 :UInt32;
-    # Maximum bulk operations per minute.
     maxBulkPerMinute @3 :UInt32;
-    # Burst allowance (number of operations above limit before throttling).
     burstAllowance @4 :UInt32;
+    parameters @5 :T.StringMap;
 }
 
 # ── Content Preview ────────────────────────────────────────────────────
-# Generated preview for content items. Backends may generate
-# thumbnails, summaries, or previews for content discovery.
 struct ContentPreview {
     contentId @0 :T.ContentId;
-    # Preview type (e.g., "thumbnail", "summary", "excerpt").
+    # Preview type, as an open token (e.g., "thumbnail", "summary").
     type @1 :Text;
-    # Preview data (image thumbnail, text summary, etc.).
     data @2 :T.DataHandle;
-    # MIME type of the preview data.
-    mimeType @3 :Text;
+    mimeType @3 :T.MimeType;
     generatedAt @4 :T.Timestamp;
 }
 
 # ── Content Dependency ─────────────────────────────────────────────────
-# Tracks dependencies between content items. When content depends
-# on other items (CSS depends on images, articles depend on media),
-# dependency tracking enables cascading updates.
 struct ContentDependency {
     contentId @0 :T.ContentId;
-    # IDs of content items this content depends on.
     dependsOn @1 :List(T.ContentId);
-    # IDs of content items that depend on this content.
     dependedOnBy @2 :List(T.ContentId);
-    # Whether changes should cascade to dependents.
     cascadeChanges @3 :Bool;
 }
 
 # ── Expiration Schedule ────────────────────────────────────────────────
-# Batch scheduling for content expiration. Enables setting
-# expiration policies across multiple content items at once.
 struct ExpirationSchedule {
-    # Content IDs to schedule for expiration.
     contentIds @0 :List(T.ContentId);
-    # When to expire the content.
     expiresAt @1 :T.Timestamp;
-    # Action to take on expiration ("delete", "archive", "notify").
+    # Action, as an open token ("delete", "archive", "notify").
     action @2 :Text;
-    # Notification recipients before expiration.
     notifyBefore @3 :T.Duration;
 }
 
 # ── Replication Status ─────────────────────────────────────────────────
-# Tracks content replication state across distributed backends.
-# Useful for multi-region content delivery.
 struct ReplicationStatus {
     contentId @0 :T.ContentId;
-    # Number of replicas across all backends.
     replicaCount @1 :UInt32;
-    # Whether all replicas are in sync.
     inSync @2 :Bool;
-    # Timestamp of last successful replication.
     lastReplicated @3 :T.Timestamp;
-    # Backend regions where replicas exist.
     regions @4 :List(Text);
 }
 
 # ── Quality Score ──────────────────────────────────────────────────────
-# Content quality scoring based on readability, completeness,
-# and freshness metrics. Enables content curation workflows.
+# The components are DECLARED backend-specific: readability follows no
+# published formula, so the score is only comparable within one backend.
+# Previously the formulas existed only in comments and two backends
+# scored incomparably with no way for a consumer to know.
 struct QualityScore {
     contentId @0 :T.ContentId;
-    # Overall quality score (0.0–1.0).
     overall @1 :Float32;
-    # Readability score (0.0–1.0, based on Flesch-Kincaid or similar).
     readability @2 :Float32;
-    # Completeness score (0.0–1.0, based on required fields present).
     completeness @3 :Float32;
-    # Freshness score (0.0–1.0, based on last modified vs current date).
     freshness @4 :Float32;
     scoredAt @5 :T.Timestamp;
+    # Which formula produced the components, as an open token, so a
+    # consumer can tell whether two scores are comparable.
+    formula @6 :Text;
 }
 
 # ── Content Recommendation ─────────────────────────────────────────────
-# Personalized content recommendation with scoring and reasoning.
-# Based on content graph analysis and user behavior.
 struct ContentRecommendation {
     contentId @0 :T.ContentId;
-    # Recommendation score (0.0–1.0, higher = more relevant).
     score @1 :Float32;
-    # Reason for this recommendation (e.g., "similar to X", "trending").
     reason @2 :Text;
-    # Source of the recommendation (e.g., "collaborative", "content-based").
     source @3 :Text;
     recommendedAt @4 :T.Timestamp;
 }
 
 # ── Content Translation ────────────────────────────────────────────────
-# Multi-language support for content items. Tracks translations
-# of content across languages with linkage to the original.
 struct ContentTranslation {
-    # Original content ID.
     originalContentId @0 :T.ContentId;
-    # Translated content ID.
     translatedContentId @1 :T.ContentId;
-    # Source language.
-    sourceLanguage @2 :Text;
-    # Target language.
-    targetLanguage @3 :Text;
-    # Translation provider (e.g., "human", "ai-deepl", "ai-google").
+    sourceLanguage @2 :T.Language;
+    targetLanguage @3 :T.Language;
+    # Provider, as an open token. The previous examples ("ai-deepl",
+    # "ai-google") were vendor names in a doc comment — a comment that
+    # becomes an enum.
     provider @4 :Text;
-    # Quality score of the translation (0.0–1.0).
     quality @5 :Float32;
     translatedAt @6 :T.Timestamp;
 }
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Today's spellings for the open tokens above. Nothing requires them; an
+# unrecognized token MUST be ignored rather than rejected.
+# ══════════════════════════════════════════════════════════════════════
+
+const refRoleReply      :Text = "reply";
+const refRoleReference  :Text = "reference";
+const refRoleParent     :Text = "parent";
+const refRoleChild      :Text = "child";
+const refRoleCited      :Text = "cited";
+const refRoleRelated    :Text = "related";
+const refRoleAttachment :Text = "attachment";
+const refRolePreview    :Text = "preview";
+
+const tagSourceUser   :Text = "user";
+const tagSourceAi     :Text = "ai";
+const tagSourceSystem :Text = "system";
+
+const undoActionCreate  :Text = "create";
+const undoActionModify  :Text = "modify";
+const undoActionDelete  :Text = "delete";
+
+const reactionLike     :Text = "like";
+const reactionDislike  :Text = "dislike";
+const reactionBookmark :Text = "bookmark";
+const reactionFlag     :Text = "flag";
+
+const visibilityPrivate :Text = "private";
+const visibilityApp     :Text = "app";
+const visibilityShared  :Text = "shared";
+const visibilityPublic  :Text = "public";

@@ -1,6 +1,11 @@
 @0xa1b2c3d4e5f60026;
 
 using T = import "types.capnp";
+# The frame-delivery envelope (Frame, FramePullResult, FrameStream) has
+# its canonical home in capture.capnp — one contract serves a camera
+# stream and a screen-capture stream, so there is one spelling of what
+# a frame IS rather than two that drift (R6).
+using C = import "capture.capnp";
 
 # ═══════════════════════════════════════════════════════════════════════
 # Camera - photo/video capture, preview, zoom, flash, focus, HDR,
@@ -9,7 +14,6 @@ using T = import "types.capnp";
 # Improvements beyond the original schema:
 #   - CameraId, RecordingId, CaptureId, EventId typed IDs.
 #   - T.Pagination on listCameras.
-#   - CameraEventSubscription with pullPaginated.
 #   - Subscription cancel for clean teardown.
 #   - T.Duration for recording duration.
 #   - T.DataHandle for captured data.
@@ -33,15 +37,25 @@ interface CameraService {
     listCameras @0 (pagination :T.Pagination) -> (cameras :List(CameraInfo), totalCount :UInt32);
     getCamera @1 (cameraId :T.CameraId) -> (info :CameraInfo);
 
-    capturePhoto @2 (cameraId :T.CameraId, options :PhotoOptions) -> (captureId :T.CaptureId, data :T.DataHandle, metadata :PhotoMetadata);
+    # A photo is a single bounded image, so a T.DataHandle is the right
+    # shape here. The result also carries the error the previous bare
+    # result could not express: a failed capture (sensor busy, storage
+    # full, thermal shutdown) returned an empty DataHandle, which is
+    # indistinguishable from a zero-length image.
+    capturePhoto @2 (cameraId :T.CameraId, options :PhotoOptions) -> (result :PhotoCaptureResult);
+
+    # A recording is NOT returned by stopRecording. A 4K60 30-minute clip
+    # is ~22 GB; returning it as one result is a message no client can
+    # accept, with no partial read, no segment and no resume. The
+    # recording is read back through `openRecording` below, in bounded
+    # pulls the caller sizes.
     startRecording @3 (cameraId :T.CameraId, options :VideoOptions) -> (recordingId :T.RecordingId);
-    stopRecording @4 (recordingId :T.RecordingId) -> (data :T.DataHandle);
+    stopRecording @4 (recordingId :T.RecordingId) -> T.VoidResult;
     pauseRecording @5 (recordingId :T.RecordingId) -> T.VoidResult;
     resumeRecording @6 (recordingId :T.RecordingId) -> T.VoidResult;
 
     startPreview @7 (cameraId :T.CameraId, surfaceId :T.SurfaceId) -> T.VoidResult;
     stopPreview @8 (cameraId :T.CameraId) -> T.VoidResult;
-
     setZoom @9 (cameraId :T.CameraId, zoom :Float32) -> T.VoidResult;
     setFlash @10 (cameraId :T.CameraId, mode :FlashMode) -> T.VoidResult;
     setFocus @11 (cameraId :T.CameraId, mode :FocusMode, x :Float32, y :Float32) -> T.VoidResult;
@@ -59,7 +73,7 @@ interface CameraService {
 
     # -- Audit-8: Calibration --
     calibrateCamera @18 (cameraId :T.CameraId) -> (result :CalibrationResult);
-    getCalibrationStatus @19 (cameraId :T.CameraId) -> (status :CalibrationStatus);
+    getCalibrationStatus @19 (cameraId :T.CameraId) -> (status :CameraCalibrationState);
 
     # -- Audit-9: Video stabilization options --
     setStabilization @20 (cameraId :T.CameraId, options :StabilizationOptions) -> T.VoidResult;
@@ -89,19 +103,34 @@ interface CameraService {
     # -- Audit-9: ProRAW/ProRes options --
     setRawCaptureOptions @31 (cameraId :T.CameraId, options :RawCaptureOptions) -> T.VoidResult;
     getRawCaptureOptions @32 (cameraId :T.CameraId) -> (options :RawCaptureOptions);
+
+    # ── Frame delivery ──
+    # These are what makes a headless consumer possible at all: an AR
+    # overlay, an OCR pass, a getUserMedia client. The previous revision
+    # had NO way to obtain a frame — `startPreview` routed to a compositor
+    # surface and `routeStream` pointed at a stream no method could read —
+    # so every backend filled the hole with a private side channel
+    # (V4L2 and AVFoundation already disagree on buffer semantics).
+    #
+    # The contract itself (handles not bytes, bounded by explicit
+    # request, sequence not offset, honest end-of-stream, cancel) lives
+    # in capture.capnp and is not restated here.
+    openStream @33 (cameraId :T.CameraId, options :VideoOptions) -> (stream :C.FrameStream, format :CameraFormat, startedAt :T.Timestamp);
+    closeStream @34 (streamId :T.CaptureId) -> T.VoidResult;
+
+    # Read back a stored recording as a frame stream. `stopRecording`
+    # never returns the bytes; this is the read path, and `ended` marks
+    # the end of the recording.
+    openRecording @35 (recordingId :T.RecordingId) -> (stream :C.FrameStream, format :CameraFormat, startedAt :T.Timestamp);
 }
 
+# One bounded pull path. The previous `pullPaginated @2 (pagination)`
+# offset into a live event queue, where an offset has no meaning; and
+# the unbounded `pull @0` beside it let a server's queue grow without
+# limit while a slow consumer's next pull shipped everything at once.
 interface CameraEventSubscription {
-    # Deprecated: use pullPaginated for bounded results.
-    pull @0 () -> (events :List(CameraEvent));
+    pull @0 (maxEvents :UInt32) -> (events :List(CameraEvent));
     cancel @1 () -> T.VoidResult;
-    # Paginated pull — returns at most `limit` events starting from `offset`.
-    pullPaginated @2 (pagination :T.Pagination) -> (result :CameraEventPullResult);
-}
-
-struct CameraEventPullResult {
-    events    @0 :List(CameraEvent);
-    totalCount @1 :UInt32;
 }
 
 struct CameraInfo {
@@ -171,7 +200,7 @@ struct PhotoOptions {
     timestamp @5 :T.Timestamp;
     # Audit-8 additions:
     privacyMask @6 :PrivacyMask;
-    watermark @7 :WatermarkRequest;
+    watermark @7 :C.WatermarkRequest;
     hdr @8 :HdrOptions;
     filters @9 :List(CaptureFilter);
 }
@@ -199,6 +228,19 @@ enum FocusMode {
     continuous @2;
     edof @3;
     custom @4;
+}
+
+struct PhotoCaptureResult {
+    union {
+        ok @0 :PhotoCapture;
+        error @1 :T.Error;
+    }
+}
+
+struct PhotoCapture {
+    captureId @0 :T.CaptureId;
+    data @1 :T.DataHandle;
+    metadata @2 :PhotoMetadata;
 }
 
 struct PhotoMetadata {
@@ -232,20 +274,42 @@ enum VideoFormat {
     custom @6;
 }
 
+# A union, for the same two reasons as capture.capnp's CaptureEvent: the
+# `error` arm carries no T.Error in the old shape, and a backend adding
+# a thermal-throttle or fold-state event had to overload `recordingStopped`.
 struct CameraEvent {
     id @0 :T.EventId;
     timestamp @1 :T.Timestamp;
     cameraId @2 :T.CameraId;
-    type @3 :CameraEventType;
+    union {
+        connect @3 :Void;
+        disconnect @4 :Void;
+        error @5 :T.Error;
+        recordingStarted @6 :T.RecordingId;
+        recordingStopped @7 :T.RecordingId;
+        unknown @8 :UnknownCameraEvent;
+    }
 }
 
-enum CameraEventType {
-    connect @0;
-    disconnect @1;
-    error @2;
-    recordingStarted @3;
-    recordingStopped @4;
-    custom @5;
+struct UnknownCameraEvent {
+    typeId @0 :UInt64;
+    payload @1 :Data;
+}
+
+# What openStream/openRecording agreed to. Same shape as
+# capture.capnp's CaptureStreamOpen, with the camera's own format type.
+struct CameraStreamOpen {
+    stream @0 :C.FrameStream;
+    format @1 :CameraFormat;
+    startedAt @2 :T.Timestamp;
+    metadata @3 :T.StringMap;
+}
+
+struct CameraStreamResult {
+    union {
+        ok @0 :CameraStreamOpen;
+        error @1 :T.Error;
+    }
 }
 
 # ════════════════════════════════════════════════════════════════════════
@@ -285,24 +349,10 @@ enum PrivacyMaskMode {
     custom @3;
 }
 
-# ── Watermark Request ──────────────────────────────────────────────────
-# Programmatic watermarking during capture. Text or image watermarks
-# with position and opacity control.
-struct WatermarkRequest {
-    text @0 :Text;
-    imageUri @1 :Text;
-    position @2 :WatermarkPosition;
-    opacity @3 :Float32;
-}
-
-enum WatermarkPosition {
-    topLeft @0;
-    topRight @1;
-    bottomLeft @2;
-    bottomRight @3;
-    center @4;
-    custom @5;
-}
+# ── Watermark ───────────────────────────────────────────────────────────
+# `WatermarkRequest` / `WatermarkPosition` have ONE canonical home in
+# capture.capnp (R6); this file uses `C.WatermarkRequest` so camera and
+# capture watermarking cannot drift into two spellings.
 
 # ── HDR Options ────────────────────────────────────────────────────────
 # Structured HDR capture options. Bracket count, EV spacing, and
@@ -415,7 +465,13 @@ struct CalibrationResult {
     calibratedAt @3 :T.Timestamp;
 }
 
-enum CalibrationStatus {
+# Renamed from CalibrationStatus, which is a STRUCT in display.capnp —
+# same identifier, different kind, so any consumer importing both got a
+# clash and a semantic fork. Calibration is still modelled two ways here
+# and there (a state machine here, a measured result there); that fork is
+# recorded as a cross-batch item rather than resolved by editing
+# display.capnp's shape from this file.
+enum CameraCalibrationState {
     uncalibrated @0;
     inProgress @1;
     calibrated @2;
@@ -466,6 +522,9 @@ struct NightModeOptions {
 # ── Camera Stream Route ────────────────────────────────────────────────
 # Describes a route for delivering a camera stream to a consumer.
 # Enables routing a single camera stream to multiple consumers.
+#
+# `streamId` names a stream opened by `openStream` — which, now that the
+# delivery contract exists, is a stream that can actually be read.
 struct CameraStreamRoute {
     streamId @0 :T.CaptureId;
     consumerId @1 :T.AppId;

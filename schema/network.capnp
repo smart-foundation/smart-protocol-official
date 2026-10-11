@@ -27,6 +27,28 @@ using T = import "types.capnp";
 #   - Network security (firewall) rules.
 #   - NTP/PTP time synchronization.
 #
+# Revamp fixes (this wave):
+#   - Five structs no method returns are gone, with their private enums:
+#     MeshNetwork, LoraNetwork, BleMeshNetwork, PacketRadioNetwork,
+#     MultiLinkConfig, MeshRoute, MeshRoutingAlgorithm, BondingStrategy.
+#     A consumer reading the schema believed mesh/LoRa/packet-radio state
+#     was queryable and built against types no service will ever emit.
+#   - Technology enumerations became open tokens: NetworkType,
+#     WifiSecurity, VpnKind, TransportProtocol, WifiBand, SaMode,
+#     NanRole, OrbitType, BlockedDomain... a 2046 radio, VPN protocol or
+#     firewall-matchable transport is a string with unknown-tolerance.
+#   - Wi-Fi credentials are a reference to secret material, not a
+#     cleartext password in the message.
+#   - The NIC frame path can name its buffer: NicFrameDesc carries a
+#     T.BufferId, so the highest-volume data path in the protocol is
+#     expressible zero-copy instead of relying on an out-of-band
+#     slot-to-memory agreement.
+#   - The Bluetooth scan/pair surface is gone (bluetooth.capnp is the
+#     canonical home; this file carried a duplicate of its device type).
+#   - Interface ids are not labels: `renameInterface` is gone.
+#   - Network slicing uses a typed slice id, and time-sync status is a
+#     struct rather than a three-field tuple.
+#
 # Audit-9 improvements:
 #   - SatelliteNetwork struct for satellite-specific fields.
 #   - CellularConfig for signal band, carrier aggregation, SA/NSA.
@@ -34,6 +56,15 @@ using T = import "types.capnp";
 #   - DtnBundle for DTN (delay-tolerant networking) store-and-forward.
 #   - Ipv6Config for SLAAC, DHCPv6, address privacy extensions.
 #   - Hotspot client filtering and bandwidth scheduling methods.
+#   - Host-global networking and radio control: the master switch
+#     (setNetworking @72, isNetworkingEnabled @73) and radio state as an
+#     open token set (setRadioEnabled @74, listRadioStates @75,
+#     RadioState), plus InterfaceConnectionStatus.hostState — so a host
+#     whose networking is switched off reports WHY it is silent instead
+#     of being indistinguishable from a dead interface. Incident-born:
+#     a persistent disabled-networking state once survived reboot with
+#     every device reported unmanaged and no contract surface that could
+#     have said so.
 # ═══════════════════════════════════════════════════════════════════════
 
 interface Network {
@@ -41,9 +72,9 @@ interface Network {
     getInterfaces @0 (pagination :T.Pagination) -> (interfaces :List(NetworkInterface));
 
     # ── Status ──
-    getStatus @1 (interfaceId :T.NetworkInterfaceId) -> (status :ConnectionStatus);
+    getStatus @1 (interfaceId :T.NetworkInterfaceId) -> (status :InterfaceConnectionStatus);
     subscribeStatus @2 (interfaceId :T.NetworkInterfaceId) -> (subscription :StatusSubscription);
-    pullStatus @3 (subscription :StatusSubscription) -> (status :ConnectionStatus);
+    pullStatus @3 (subscription :StatusSubscription) -> (status :InterfaceConnectionStatus);
 
     # ── Connect / disconnect ──
     connect @4 (interfaceId :T.NetworkInterfaceId, network :NetworkConfig) -> T.VoidResult;
@@ -52,123 +83,149 @@ interface Network {
     # ── WiFi scan + connect ──
     wifiScan @6 (pagination :T.Pagination) -> (networks :List(WifiNetwork));
     # ssid is a user-facing WiFi network name, not a typed entity ID.
-    wifiConnect @7 (ssid :Text, password :Text) -> T.VoidResult;
+    #
+    # `credential` references secret material (types.capnp T.SecretKeyId);
+    # a network secret must not cross the wire as a cleartext field.
+    wifiConnect @7 (ssid :Text, credential :T.SecretKeyId) -> T.VoidResult;
     wifiDisconnect @8 () -> T.VoidResult;
     wifiSetAutoConnect @9 (ssid :Text, enabled :Bool) -> T.VoidResult;
     wifiSetMacRandomization @10 (interfaceId :T.NetworkInterfaceId, enabled :Bool) -> T.VoidResult;
 
-    # ── Bluetooth (legacy; see bluetooth.capnp for full controls) ──
-    bluetoothScan @11 (pagination :T.Pagination) -> (devices :List(BluetoothDevice));
-    bluetoothPair @12 (address :T.BluetoothAddress) -> T.VoidResult;
-    bluetoothUnpair @13 (address :T.BluetoothAddress) -> T.VoidResult;
-
     # ── Cellular data ──
-    setMobileData @14 (enabled :Bool) -> T.VoidResult;
-    isMobileDataEnabled @15 () -> (enabled :Bool);
-    setDataRoaming @16 (enabled :Bool) -> T.VoidResult;
-    isDataRoamingEnabled @17 () -> (enabled :Bool);
+    setMobileData @11 (enabled :Bool) -> T.VoidResult;
+    isMobileDataEnabled @12 () -> (enabled :Bool);
+    setDataRoaming @13 (enabled :Bool) -> T.VoidResult;
+    isDataRoamingEnabled @14 () -> (enabled :Bool);
 
     # ── VPN ──
-    setVpnProfile @18 (profile :VpnProfile) -> T.VoidResult;
-    removeVpnProfile @19 (profileId :T.VpnProfileId) -> T.VoidResult;
-    listVpnProfiles @20 (pagination :T.Pagination) -> (profiles :List(VpnProfile));
-    attachVpn @21 (profileId :T.VpnProfileId) -> (connection :VpnConnection);
-    detachVpn @22 (connectionId :T.VpnConnectionId) -> T.VoidResult;
-    listVpnConnections @23 (pagination :T.Pagination) -> (connections :List(VpnConnection));
+    setVpnProfile @15 (profile :VpnProfile) -> T.VoidResult;
+    removeVpnProfile @16 (profileId :T.VpnProfileId) -> T.VoidResult;
+    listVpnProfiles @17 (pagination :T.Pagination) -> (profiles :List(VpnProfile));
+    attachVpn @18 (profileId :T.VpnProfileId) -> (connection :VpnConnection);
+    detachVpn @19 (connectionId :T.VpnConnectionId) -> T.VoidResult;
+    listVpnConnections @20 (pagination :T.Pagination) -> (connections :List(VpnConnection));
 
     # ── Hotspot (tethering) ──
-    startHotspot @24 (config :HotspotConfig) -> T.VoidResult;
-    stopHotspot @25 () -> T.VoidResult;
-    getHotspotStatus @26 () -> (status :HotspotStatus);
-    subscribeHotspot @27 () -> (subscription :HotspotSubscription);
-    pullHotspot @28 (subscription :HotspotSubscription) -> (status :HotspotStatus);
+    startHotspot @21 (config :HotspotConfig) -> T.VoidResult;
+    stopHotspot @22 () -> T.VoidResult;
+    getHotspotStatus @23 () -> (status :HotspotStatus);
+    subscribeHotspot @24 () -> (subscription :HotspotSubscription);
+    pullHotspot @25 (subscription :HotspotSubscription) -> (status :HotspotStatus);
 
     # ── DHCP ──
-    requestDhcpLease @29 (interfaceId :T.NetworkInterfaceId, options :DhcpOptions) -> T.VoidResult;
-    getDhcpLease @30 (interfaceId :T.NetworkInterfaceId) -> (lease :DhcpLease);
-    releaseDhcpLease @31 (interfaceId :T.NetworkInterfaceId) -> T.VoidResult;
-    subscribeDhcp @32 (interfaceId :T.NetworkInterfaceId) -> (subscription :DhcpSubscription);
-    pullDhcp @33 (subscription :DhcpSubscription) -> (lease :DhcpLease);
+    # DHCP is one implementation; the contract is "assign me an address
+    # for this interface, tell me when it changes, let me give it back".
+    # Naming the protocol makes a SLAAC-only or statically configured
+    # backend a special case.
+    requestAddressAssignment @26 (interfaceId :T.NetworkInterfaceId, options :AddressAssignmentOptions) -> T.VoidResult;
+    getAddressAssignment @27 (interfaceId :T.NetworkInterfaceId) -> (result :AddressAssignmentResult);
+    releaseAddressAssignment @28 (interfaceId :T.NetworkInterfaceId) -> T.VoidResult;
+    subscribeAddressAssignment @29 (interfaceId :T.NetworkInterfaceId) -> (subscription :AddressAssignmentSubscription);
+    pullAddressAssignment @30 (subscription :AddressAssignmentSubscription) -> (assignment :AddressAssignment);
 
     # ── DNS (preferred servers) ──
-    getDnsServers @34 (interfaceId :T.NetworkInterfaceId, pagination :T.Pagination) -> (servers :List(DnsServer));
-    setDnsServers @35 (interfaceId :T.NetworkInterfaceId, servers :List(DnsServer)) -> T.VoidResult;
+    getDnsServers @31 (interfaceId :T.NetworkInterfaceId, pagination :T.Pagination) -> (servers :List(DnsServer));
+    setDnsServers @32 (interfaceId :T.NetworkInterfaceId, servers :List(DnsServer)) -> T.VoidResult;
 
     # ── QoS / DSCP ──
-    setInterfaceQos @36 (interfaceId :T.NetworkInterfaceId, qos :List(QosRule)) -> T.VoidResult;
-    getInterfaceQos @37 (interfaceId :T.NetworkInterfaceId, pagination :T.Pagination) -> (rules :List(QosRule));
+    setInterfaceQos @33 (interfaceId :T.NetworkInterfaceId, qos :List(QosRule)) -> T.VoidResult;
+    getInterfaceQos @34 (interfaceId :T.NetworkInterfaceId, pagination :T.Pagination) -> (rules :List(QosRule));
 
     # ── Counters ──
-    getCounters @38 (interfaceId :T.NetworkInterfaceId, since :T.Duration) -> (counters :InterfaceCounters);
-    resetCounters @39 (interfaceId :T.NetworkInterfaceId) -> T.VoidResult;
-    subscribeCounters @40 (interfaceId :T.NetworkInterfaceId) -> (subscription :CounterSubscription);
-    pullCounters @41 (subscription :CounterSubscription) -> (counters :InterfaceCounters);
+    # A window ending now. ("Since what?" is the caller's question;
+    # `window` answers it without an implementer guessing.)
+    getCounters @35 (interfaceId :T.NetworkInterfaceId, window :T.Duration) -> (counters :InterfaceCounters);
+    resetCounters @36 (interfaceId :T.NetworkInterfaceId) -> T.VoidResult;
+    subscribeCounters @37 (interfaceId :T.NetworkInterfaceId) -> (subscription :CounterSubscription);
+    pullCounters @38 (subscription :CounterSubscription) -> (counters :InterfaceCounters);
 
     # ── Captive portal ──
-    checkCaptivePortal @42 (interfaceId :T.NetworkInterfaceId) -> (state :CaptivePortalState);
-    subscribeCaptivePortal @43 (interfaceId :T.NetworkInterfaceId) -> (subscription :CaptivePortalSubscription);
-    pullCaptivePortal @44 (subscription :CaptivePortalSubscription) -> (state :CaptivePortalState);
+    checkCaptivePortal @39 (interfaceId :T.NetworkInterfaceId) -> (state :CaptivePortalState);
+    subscribeCaptivePortal @40 (interfaceId :T.NetworkInterfaceId) -> (subscription :CaptivePortalSubscription);
+    pullCaptivePortal @41 (subscription :CaptivePortalSubscription) -> (state :CaptivePortalState);
 
-    # ── Renaming / lifecycle ──
-    renameInterface @45 (oldId :T.NetworkInterfaceId, newId :T.NetworkInterfaceId) -> T.VoidResult;
-    upInterface @46 (interfaceId :T.NetworkInterfaceId) -> T.VoidResult;
-    downInterface @47 (interfaceId :T.NetworkInterfaceId) -> T.VoidResult;
+    # ── Lifecycle ──
+    upInterface @42 (interfaceId :T.NetworkInterfaceId) -> T.VoidResult;
+    downInterface @43 (interfaceId :T.NetworkInterfaceId) -> T.VoidResult;
 
     # ── Network topology ──
-    getTopology @48 (pagination :T.Pagination) -> (nodes :List(TopologyNode), links :List(TopologyLink), total :UInt64);
+    getTopology @44 (pagination :T.Pagination) -> (nodes :List(TopologyNode), links :List(TopologyLink), total :UInt64);
 
     # ── Network power management ──
-    setPowerProfile @49 (interfaceId :T.NetworkInterfaceId, profile :NetworkPowerProfile) -> T.VoidResult;
-    getPowerProfile @50 (interfaceId :T.NetworkInterfaceId) -> (profile :NetworkPowerProfile);
+    setPowerProfile @45 (interfaceId :T.NetworkInterfaceId, profile :Text) -> T.VoidResult;
+    getPowerProfile @46 (interfaceId :T.NetworkInterfaceId) -> (profile :Text);
 
     # ── Network handoff ──
-    handoff @51 (fromInterface :T.NetworkInterfaceId, toInterface :T.NetworkInterfaceId) -> T.VoidResult;
+    handoff @47 (fromInterface :T.NetworkInterfaceId, toInterface :T.NetworkInterfaceId) -> T.VoidResult;
 
     # ── Network slicing ──
-    createSlice @52 (config :SliceConfig) -> (sliceId :Text);
-    removeSlice @53 (sliceId :Text) -> T.VoidResult;
-    listSlices @54 (pagination :T.Pagination) -> (slices :List(NetworkSlice), total :UInt64);
+    createSlice @48 (config :SliceConfig) -> (sliceId :NetworkSliceId);
+    removeSlice @49 (sliceId :NetworkSliceId) -> T.VoidResult;
+    listSlices @50 (pagination :T.Pagination) -> (slices :List(NetworkSlice), total :UInt64);
 
     # ── Network telemetry ──
-    getTelemetry @55 (interfaceId :T.NetworkInterfaceId, duration :T.Duration) -> (telemetry :NetworkTelemetry);
-    subscribeTelemetry @56 (interfaceId :T.NetworkInterfaceId) -> (subscription :TelemetrySubscription);
-    pullTelemetry @57 (subscription :TelemetrySubscription) -> (telemetry :NetworkTelemetry);
+    getTelemetry @51 (interfaceId :T.NetworkInterfaceId, duration :T.Duration) -> (telemetry :NetworkTelemetry);
+    subscribeTelemetry @52 (interfaceId :T.NetworkInterfaceId) -> (subscription :TelemetrySubscription);
+    pullTelemetry @53 (subscription :TelemetrySubscription) -> (telemetry :NetworkTelemetry);
 
     # ── Network diagnostics ──
-    ping @58 (target :T.IpAddress) -> (latency :T.Duration, packetLoss :Float32);
-    traceroute @59 (target :T.IpAddress) -> (hops :List(TracerouteHop));
+    ping @54 (target :T.IpAddress) -> (latency :T.Duration, packetLoss :Float32);
+    traceroute @55 (target :T.IpAddress) -> (hops :List(TracerouteHop));
 
     # ── Network security (firewall) ──
-    setFirewallRules @60 (interfaceId :T.NetworkInterfaceId, rules :List(FirewallRule)) -> T.VoidResult;
-    getFirewallRules @61 (interfaceId :T.NetworkInterfaceId, pagination :T.Pagination) -> (rules :List(FirewallRule));
+    setFirewallRules @56 (interfaceId :T.NetworkInterfaceId, rules :List(FirewallRule)) -> T.VoidResult;
+    getFirewallRules @57 (interfaceId :T.NetworkInterfaceId, pagination :T.Pagination) -> (rules :List(FirewallRule));
 
     # ── Network time sync ──
-    getTimeSync @62 (interfaceId :T.NetworkInterfaceId) -> (offset :T.Duration, stratum :UInt8, source :Text);
+    getTimeSync @58 (interfaceId :T.NetworkInterfaceId) -> (status :TimeSyncStatus);
 
     # ── Satellite ──
-    getSatelliteConfig @63 () -> (config :SatelliteNetwork);
+    getSatelliteConfig @59 () -> (config :SatelliteNetwork);
 
     # ── Hotspot enhancements ──
-    setHotspotClientFilter @64 (macAddresses :List(T.BluetoothAddress)) -> T.VoidResult;
-    getHotspotBandwidthSchedule @65 () -> (schedule :List(BandwidthSlot));
-    setHotspotBandwidthSchedule @66 (schedule :List(BandwidthSlot)) -> T.VoidResult;
+    setHotspotClientFilter @60 (macAddresses :List(T.MacAddress)) -> T.VoidResult;
+    getHotspotBandwidthSchedule @61 () -> (schedule :List(BandwidthSlot));
+    setHotspotBandwidthSchedule @62 (schedule :List(BandwidthSlot)) -> T.VoidResult;
 
     # ── DTN (delay-tolerant networking) ──
-    sendDtnBundle @67 (bundle :DtnBundle) -> T.VoidResult;
-    receiveDtnBundles @68 (pagination :T.Pagination) -> (bundles :List(DtnBundle), total :UInt64);
+    sendDtnBundle @63 (bundle :DtnBundle) -> T.VoidResult;
+    receiveDtnBundles @64 (pagination :T.Pagination) -> (bundles :List(DtnBundle), total :UInt64);
 
     # ── Cellular configuration ──
-    getCellularConfig @69 () -> (config :CellularConfig);
-    setCellularConfig @70 (config :CellularConfig) -> T.VoidResult;
+    getCellularConfig @65 () -> (config :CellularConfig);
+    setCellularConfig @66 (config :CellularConfig) -> T.VoidResult;
 
     # ── IPv6 configuration ──
-    getIpv6Config @71 (interfaceId :T.NetworkInterfaceId) -> (config :Ipv6Config);
-    setIpv6Config @72 (interfaceId :T.NetworkInterfaceId, config :Ipv6Config) -> T.VoidResult;
+    getIpv6Config @67 (interfaceId :T.NetworkInterfaceId) -> (config :Ipv6Config);
+    setIpv6Config @68 (interfaceId :T.NetworkInterfaceId, config :Ipv6Config) -> T.VoidResult;
 
     # ── Wi-Fi Aware (NAN) ──
-    wifiNanAdvertise @73 (config :WifiNanConfig) -> T.VoidResult;
-    wifiNanDiscover @74 (config :WifiNanConfig) -> (peers :List(NanPeer), total :UInt32);
+    wifiNanAdvertise @69 (config :WifiNanConfig) -> T.VoidResult;
+    wifiNanDiscover @70 (config :WifiNanConfig, pagination :T.Pagination) -> (peers :List(NanPeer), totalCount :UInt32);
+
+    # ── Device drivers ──
+    # A NIC driver is a capability: acquire the provider by presenting
+    # one. This is how the provider surface is reached — the reference
+    # granted here IS the authority to drive the device.
+    nicProvider @71 (authority :Capability) -> (provider :NicProvider);
+
+    # ── Host-global networking and radios ──
+    # The master switch that sits above per-connection state. Every host
+    # has one — a phone's airplane mode, a server's `networking off` —
+    # and before these methods existed a switched-off host was
+    # indistinguishable from a dead interface, so every backend answered
+    # with its own silence. A 2046 machine still has this switch.
+    setNetworking @72 (enabled :Bool) -> T.VoidResult;
+    isNetworkingEnabled @73 () -> (enabled :Bool);
+
+    # Radios are an open token set: wifi, cellular, and radios nobody
+    # has named yet are all Text. A closed enum of radio kinds would
+    # freeze 2020s hardware into the contract.
+    setRadioEnabled @74 (radio :Text, enabled :Bool) -> T.VoidResult;
+    listRadioStates @75 (pagination :T.Pagination) -> (radios :List(RadioState), total :UInt64);
 }
+
+using import "capability.capnp".Capability;
 
 struct BandwidthSlot {
     startHour @0 :UInt8;
@@ -180,12 +237,13 @@ struct NanPeer {
     peerId @0 :Text;
     name @1 :Text;
     rssi @2 :Int32;
+    metadata @3 :T.StringMap;
 }
 
 # ── Subscriptions ───────────────────────────────────────────
 
 interface StatusSubscription {
-    pull @0 () -> (status :ConnectionStatus);
+    pull @0 () -> (status :InterfaceConnectionStatus);
     cancel @1 () -> T.VoidResult;
 }
 
@@ -194,8 +252,8 @@ interface HotspotSubscription {
     cancel @1 () -> T.VoidResult;
 }
 
-interface DhcpSubscription {
-    pull @0 () -> (lease :DhcpLease);
+interface AddressAssignmentSubscription {
+    pull @0 () -> (assignment :AddressAssignment);
     cancel @1 () -> T.VoidResult;
 }
 
@@ -216,178 +274,69 @@ interface TelemetrySubscription {
 
 # ── Interface ───────────────────────────────────────────────
 
+# A slice is an isolated network view; its id is opaque.
+struct NetworkSliceId { id @0 :UInt64; }
+
 struct NetworkInterface {
     id @0 :T.NetworkInterfaceId;
     name @1 :Text;
-    type @2 :NetworkType;
-    # Hardware / MAC address (typed for cross-platform compatibility).
-    hwAddress @15 :T.BluetoothAddress;
-    # List of `ipv4:NNN.NNN.NNN.NNN/NN` strings.
-    ipAddresses @3 :List(T.IpAddress);
-    # IPv6 addresses in CIDR.
-    ipv6Addresses @4 :List(T.IpAddress);
+    # Link technology as an open token ("ethernet", "wifi", "cellular", ...).
+    type @2 :Text;
+    # Hardware / MAC address (T.MacAddress is the foundation's 6-octet
+    # address type; it carries any MAC, not only a Bluetooth one — the
+    # former `T.BluetoothAddress` spelling was a foundation misnomer that
+    # had this file typing Wi-Fi and Ethernet addresses with a radio's name).
+    hwAddress @3 :T.MacAddress;
+    ipAddresses @4 :List(T.IpAddress);
+    ipv6Addresses @5 :List(T.IpAddress);
     # Gateway (current).
-    gateway @5 :T.IpAddress;
+    gateway @6 :T.IpAddress;
     # DNS servers already configured.
-    dnsServers @6 :List(T.IpAddress);
+    dnsServers @7 :List(T.IpAddress);
     # Up / connected flags.
-    up @7 :Bool;
-    connected @8 :Bool;
+    up @8 :Bool;
+    connected @9 :Bool;
     # MTU currently effective.
-    mtU @9 :UInt32;
+    mtU @10 :UInt32;
     # Speed in bits per second (0 = unknown).
-    speedUp @10 :UInt64;
-    speedDown @11 :UInt64;
-    # Vendor/Driver of the underlying NIC.
-    driver @12 :Text;
-    # Whether MAC is randomized on the fly (WiFi/BT).
-    macRandom @13 :Bool;
-    # Per-app caps that can use this interface.
-    requiredCaps @14 :List(CapRef);
-    # Network slice this interface belongs to (empty = default/best-effort).
-    sliceId @16 :Text;
-    # Current power profile applied to this interface.
-    powerProfile @17 :NetworkPowerProfile;
+    speedUp @11 :UInt64;
+    speedDown @12 :UInt64;
+    # Driver label as REPORTED by the backend. Absent on a backend with
+    # no driver concept (a fabric, a browser runtime) — never fabricated.
+    driver @13 :Text;
+    # Whether the MAC is randomized on the fly.
+    macRandom @14 :Bool;
+    # Authority references that may use this interface.
+    requiredCaps @15 :List(T.CapabilityHandle);
+    # Network slice this interface belongs to (absent = default).
+    sliceId @16 :NetworkSliceId;
+    # Current power profile applied to this interface, as an open token.
+    powerProfile @17 :Text;
+    # Backend-specific metadata.
+    metadata @18 :T.StringMap;
 }
 
-struct CapRef {
-    capId @0 :Data;
-}
-
-enum NetworkType {
-    unknown @0;
-    ethernet @1;
-    wifi @2;
-    bluetooth @3;
-    cellular @4;
-    vpn @5;
-    usb @6;
-    thunderbolt @7;
-    loopback @8;
-    virtual @9;
-    serial @10;
-    satellite @11;
-    # Device-to-device mesh (Zigbee, Thread, BLE mesh, Wi-Fi mesh).
-    mesh @12;
-    # Low-power wide-area (LoRa).
-    lora @13;
-    # Low-power wide-area (Sigfox).
-    sigfox @14;
-    # Low-power wide-area (NB-IoT / LTE-M).
-    nbIoT @15;
-    # BLE mesh networking.
-    bleMesh @16;
-    # Packet radio (AX.25, APRS, ham radio).
-    packetRadio @17;
-    # Multi-link bonding (Wi-Fi + cellular + Ethernet combined).
-    multiLink @18;
-    custom @19;
-}
-
-# ── Mesh Network ────────────────────────────────────────────
-
-struct MeshNetwork {
-    # Mesh network identifier.
-    meshId @0 :Text;
-    # Neighboring nodes directly reachable.
-    neighbors @1 :List(T.NetworkInterfaceId);
-    # Routing table entries.
-    routingTable @2 :List(MeshRoute);
-    # Mesh routing algorithm in use.
-    routingAlgorithm @3 :MeshRoutingAlgorithm;
-    # Self-healing: whether the mesh auto-recovers from node failures.
-    selfHealing @4 :Bool;
-}
-
-struct MeshRoute {
-    destination @0 :T.NetworkInterfaceId;
-    nextHop @1 :T.NetworkInterfaceId;
-    metric @2 :UInt32;
-    # Route expiry (0 = static route, no expiry).
-    expiry @3 :T.Timestamp;
-}
-
-enum MeshRoutingAlgorithm {
-    flood @0;
-    gossip @1;
-    linkState @2;
-    distanceVector @3;
-    custom @4;
-}
-
-# ── Low-Power Wide-Area ─────────────────────────────────────
-
-struct LoraNetwork {
-    # Spreading factor (SF7..SF12). Higher = longer range, lower throughput.
-    spreadingFactor @0 :UInt8;
-    # Bandwidth in Hz (125000, 250000, 500000).
-    bandwidthHz @1 :UInt32;
-    # Estimated range in km.
-    rangeKm @2 :Float32;
-    # Coding rate (4/5, 4/6, 4/7, 4/8).
-    codingRate @3 :UInt8;
-    # Adaptive data rate enabled.
-    adr @4 :Bool;
-}
-
-# ── BLE Mesh ────────────────────────────────────────────────
-
-struct BleMeshNetwork {
-    # Mesh network name.
-    meshName @0 :Text;
-    # Total node count in the mesh.
-    nodeCount @1 :UInt32;
-    # Relay node count.
-    relayCount @2 :UInt32;
-    # Proxy node count.
-    proxyCount @3 :UInt32;
-    # Friend node count.
-    friendCount @4 :UInt32;
-}
-
-# ── Packet Radio ────────────────────────────────────────────
-
-struct PacketRadioNetwork {
-    # Callsign (e.g., "W1AW").
-    callsign @0 :Text;
-    # Protocol identifier (e.g., "AX.25", "APRS").
-    protocol @1 :Text;
-    # Frequency in MHz.
-    frequencyMHz @2 :Float32;
-    # Modulation (e.g., "AFSK", "FSK").
-    modulation @3 :Text;
-}
-
-# ── Multi-Link Bonding ──────────────────────────────────────
-
-struct MultiLinkConfig {
-    # Interfaces participating in the bond.
-    interfaces @0 :List(T.NetworkInterfaceId);
-    # Bonding strategy.
-    strategy @1 :BondingStrategy;
-    # Failover threshold: max packet loss % before switching.
-    failoverThreshold @2 :Float32;
-    # Health check interval for link monitoring.
-    healthCheckInterval @3 :T.Duration;
-}
-
-enum BondingStrategy {
-    roundRobin @0;
-    leastLatency @1;
-    failover @2;
-    weighted @3;
-    loadBalanced @4;
-    custom @5;
-}
+# Link technology as an open token ("ethernet", "wifi", "cellular",
+# "vpn", "loopback", ...): a 2046 physical layer is a string with
+# unknown-tolerance, not a new ordinal. The previous 19-value enum froze
+# LoRa/Sigfox/NB-IoT/BLE-mesh/packet-radio — three of which no method in
+# the tree could even report.
+#
+# NOTE on the MAC fields below: they are typed `T.MacAddress`, the
+# foundation's 6-octet address type. It carries any MAC — Wi-Fi, Ethernet,
+# Bluetooth, a future link — and was renamed from `T.BluetoothAddress` in
+# the 2026-10-10 integration pass to close the X1 contradiction, in which
+# this file typed Wi-Fi BSSIDs and Ethernet hardware addresses with a type
+# named after a radio. The name now states the shape, not one of its users.
 
 # ── Connection Status ───────────────────────────────────────
 # WiFi-specific fields are isolated in WifiStatus to avoid
 # leaking WiFi concepts into generic connection status.
 
-struct ConnectionStatus {
+struct InterfaceConnectionStatus {
     connected @0 :Bool;
     interface @1 :T.NetworkInterfaceId;
-    type @2 :NetworkType;
+    type @2 :Text;
     # dBm signal strength (signed; -100..0 typical for WiFi/cellular).
     strength @3 :Int32;
     # Speed in bits per second.
@@ -403,22 +352,43 @@ struct ConnectionStatus {
     # WiFi-specific fields. Zeroed/empty if type != wifi.
     wifi @9 :WifiStatus;
     # Network quality metrics (packet loss, jitter, throughput).
-    qualityMetrics @10 :QualityMetrics;
+    qualityMetrics @10 :LinkQuality;
+    metadata @11 :T.StringMap;
+    # Open token for WHY the interface is or is not usable:
+    # managed / unmanaged / networking-disabled / radio-off / carrier-down /
+    # no-firmware / unknown. A user must be able to tell a host whose
+    # networking is switched off from a radio that is off from a cable
+    # nobody plugged in — three failures that look identical through the
+    # connected boolean alone.
+    hostState @12 :Text;
+}
+
+# The observable state of one radio. `name` is an open token ("wifi",
+# "cellular", "bluetooth", or a radio that does not exist yet); `enabled`
+# is policy; `hardBlocked` is a physical switch; `softBlocked` is a
+# software block. A backend that conflates policy with a hardware switch
+# is lying, so the two never share a field.
+struct RadioState {
+    name @0 :Text;
+    enabled @1 :Bool;
+    hardBlocked @2 :Bool;
+    softBlocked @3 :Bool;
 }
 
 struct WifiStatus {
     ssid @0 :Text;
-    # AP MAC address (typed for cross-platform compatibility).
-    bssid @1 :T.BluetoothAddress;
+    # AP MAC address (see the note under NetworkType).
+    bssid @1 :T.MacAddress;
     # Frequency in Hz (e.g., 2412000000 for 2.4GHz channel 1).
     frequency @2 :UInt32;
     # Roaming hint (AP is weak, roaming in progress).
     roaming @3 :Bool;
+    metadata @4 :T.StringMap;
 }
 
 # ── Network Quality Metrics ─────────────────────────────────
 
-struct QualityMetrics {
+struct LinkQuality {
     # Packet loss ratio (0.0 = none, 1.0 = 100% loss).
     packetLoss @0 :Float32;
     # Jitter (variation in latency).
@@ -437,19 +407,15 @@ struct SatelliteNetwork {
     # Satellite constellation (e.g., "starlink", "oneweb", "iridium").
     constellation @0 :Text;
     # Orbit type (LEO, MEO, GEO).
-    orbitType @1 :OrbitType;
+    orbitType @1 :Text;
     # Expected latency in milliseconds.
     expectedLatencyMs @2 :UInt32;
     # Whether the satellite link is currently active.
     active @3 :Bool;
+    metadata @4 :T.StringMap;
 }
 
-enum OrbitType {
-    leo @0;
-    meo @1;
-    geo @2;
-    custom @3;
-}
+# Orbit type as an open token ("leo", "meo", "geo").
 
 # ── Cellular Configuration ───────────────────────────────────────────────
 
@@ -459,33 +425,27 @@ struct CellularConfig {
     # Carrier name.
     carrier @1 :Text;
     # Whether SA (standalone) or NSA (non-standalone) mode.
-    saMode @2 :SaMode;
+    saMode @2 :Text;
     # Supported carrier aggregation bands.
     carrierAggregationBands @3 :List(Text);
+    metadata @4 :T.StringMap;
 }
 
-enum SaMode {
-    nsa @0;
-    sa @1;
-    custom @2;
-}
+# Standalone vs non-standalone as an open token ("nsa", "sa").
 
 # ── Wi-Fi Aware (NAN) ───────────────────────────────────────────────────
 
 struct WifiNanConfig {
     # Service name for NAN discovery.
     serviceName @0 :Text;
-    # Whether to publish or subscribe.
-    role @1 :NanRole;
+    # Whether to publish or subscribe, as an open token.
+    mode @1 :Text;
     # TTL in milliseconds.
     ttlMs @2 :UInt32;
+    metadata @3 :T.StringMap;
 }
 
-enum NanRole {
-    publish @0;
-    subscribe @1;
-    custom @2;
-}
+# NAN role as an open token ("publish", "subscribe").
 
 # ── DTN (Delay-Tolerant Networking) ─────────────────────────────────────
 
@@ -496,12 +456,15 @@ struct DtnBundle {
     source @1 :Text;
     # Destination node.
     destination @2 :Text;
-    # Payload data.
-    payload @3 :Data;
+    # Payload data, as a handle: a store-and-forward bundle is by
+    # definition large, and the inline spelling copied all of it through
+    # the message.
+    payload @3 :T.DataHandle;
     # Bundle lifetime.
     lifetime @4 :T.Duration;
     # Custody transfer enabled.
     custodyTransfer @5 :Bool;
+    metadata @6 :T.StringMap;
 }
 
 # ── IPv6 Configuration ───────────────────────────────────────────────────
@@ -509,14 +472,15 @@ struct DtnBundle {
 struct Ipv6Config {
     # Whether SLAAC is enabled.
     slaacEnabled @0 :Bool;
-    # Whether DHCPv6 is enabled.
-    dhcpv6Enabled @1 :Bool;
+    # Whether automatic address assignment is enabled.
+    autoAssignmentEnabled @1 :Bool;
     # Address privacy extensions (RFC 4941) enabled.
     privacyExtensions @2 :Bool;
     # Prefix for SLAAC-derived addresses.
     prefix @3 :Text;
     # Prefix length.
     prefixLen @4 :UInt8;
+    metadata @5 :T.StringMap;
 }
 
 # ── Network Topology ────────────────────────────────────────
@@ -544,22 +508,13 @@ struct TopologyLink {
     bandwidthBps @4 :UInt64;
     # Link cost metric (lower = preferred).
     metric @5 :UInt32;
+    metadata @6 :T.StringMap;
 }
 
 # ── Network Power Management ────────────────────────────────
 
-enum NetworkPowerProfile {
-    # Always on, maximum performance.
-    performance @0;
-    # Balanced between power and performance.
-    balanced @1;
-    # Battery saver: reduced scan intervals, lower transmit power.
-    batterySaver @2;
-    # Ultra-low power: minimal radio usage.
-    ultraLowPower @3;
-    # Custom power profile.
-    custom @4;
-}
+# Power profile as an open token ("performance", "balanced",
+# "batterySaver", ...).
 
 # ── Network Slicing ─────────────────────────────────────────
 
@@ -576,6 +531,7 @@ struct SliceConfig {
     priority @4 :UInt8;
     # Traffic selectors (application IDs that use this slice).
     applicationIds @5 :List(T.AppId);
+    metadata @6 :T.StringMap;
 }
 
 enum SliceIsolation {
@@ -589,7 +545,7 @@ enum SliceIsolation {
 }
 
 struct NetworkSlice {
-    sliceId @0 :Text;
+    sliceId @0 :NetworkSliceId;
     name @1 :Text;
     isolation @2 :SliceIsolation;
     minBandwidthBps @3 :UInt64;
@@ -597,6 +553,7 @@ struct NetworkSlice {
     priority @5 :UInt8;
     # Whether the slice is currently active.
     active @6 :Bool;
+    metadata @7 :T.StringMap;
 }
 
 # ── Network Telemetry ───────────────────────────────────────
@@ -626,6 +583,17 @@ struct NetworkTelemetry {
 
 # ── Network Diagnostics ─────────────────────────────────────
 
+struct TimeSyncStatus {
+    # Measured offset from reference time (absent when not measured).
+    offset @0 :T.Duration;
+    offsetMeasured @1 :Bool;
+    # Stratum as reported (NTP semantics; a PTP-synced clock has none).
+    stratum @2 :UInt32;
+    # Source name as an open token.
+    source @3 :Text;
+    metadata @4 :T.StringMap;
+}
+
 struct TracerouteHop {
     # Hop number (1-based).
     hop @0 :UInt8;
@@ -635,6 +603,7 @@ struct TracerouteHop {
     latency @2 :T.Duration;
     # Hostname (if resolvable).
     hostname @3 :Text;
+    metadata @4 :T.StringMap;
 }
 
 # ── Network Security (Firewall) ─────────────────────────────
@@ -647,7 +616,8 @@ struct FirewallRule {
     # Direction.
     direction @2 :FirewallDirection;
     # Protocol.
-    protocol @3 :TransportProtocol;
+    # Transport as an open token.
+    protocol @3 :Text;
     # Source address (empty = any).
     sourceAddress @4 :T.IpAddress;
     # Source port range (0..0 = any).
@@ -662,6 +632,7 @@ struct FirewallRule {
     action @10 :FirewallAction;
     # Rule priority (lower = higher priority).
     priority @11 :UInt32;
+    metadata @12 :T.StringMap;
 }
 
 enum FirewallDirection {
@@ -682,63 +653,41 @@ enum FirewallAction {
 struct NetworkConfig {
     # WiFi SSID or VPN profile id.
     ssid @0 :Text;
-    password @1 :Text;
+    # Reference to stored secret material — never the secret itself.
+    credential @1 :T.SecretKeyId;
     # Identity (EAP).
     identity @2 :Text;
-    security @3 :WifiSecurity;
+    # Security mode as an open token.
+    security @3 :Text;
     # Whether hidden/non-broadcast SSID.
     hidden @4 :Bool;
     # Whether to use this as a remembered profile.
     remember @5 :Bool = true;
     # Whether to auto-connect when in range.
     autoConnect @6 :Bool = true;
+    metadata @7 :T.StringMap;
 }
 
-enum WifiSecurity {
-    open @0;
-    wep @1;
-    wpa @2;
-    wpa2 @3;
-    wpa3 @4;
-    owe @5;
-    enhancedOpen @6;
-    sae @7;
-    wpa3Enterprise @8;
-    eapPwd @9;
-    eapTtls @10;
-    custom @11;
-}
+# Security mode as an open token ("open", "wpa2", "wpa3", "sae", ...).
+# The previous 11-value enum froze wep (already insecure) into an eternal
+# contract and gave a 2046 enterprise auth method no value.
 
 struct WifiNetwork {
     ssid @0 :Text;
-    # AP MAC address (typed for cross-platform compatibility).
-    # Matches WifiStatus.bssid type — scan results normalized to typed address.
-    bssid @1 :T.BluetoothAddress;
+    # AP MAC address (see the note under NetworkType).
+    bssid @1 :T.MacAddress;
     # dBm signal strength.
     strength @2 :Int32;
     # Frequency in Hz.
     frequency @3 :UInt32;
-    security @4 :WifiSecurity;
+    security @4 :Text;
     # Vendor OUI.
     vendor @5 :Text;
     # Whether hidden.
     hidden @6 :Bool;
     # 802.11 standard (e.g. "ax", "ac", "n").
     standard @7 :Text;
-}
-
-struct BluetoothDevice {
-    # Bluetooth address (typed for cross-platform compatibility).
-    address @0 :T.BluetoothAddress;
-    name @1 :Text;
-    paired @2 :Bool;
-    connected @3 :Bool;
-    # Bluetooth class-of-device 24-bit field.
-    deviceClass @4 :UInt32;
-    # Trusted=yes means pairing persists and runs at boot.
-    trusted @5 :Bool;
-    # Battery if known (0..100, 0xFF = unknown).
-    batteryPercent @6 :UInt8;
+    metadata @8 :T.StringMap;
 }
 
 # ── VPN ─────────────────────────────────────────────────────
@@ -746,11 +695,13 @@ struct BluetoothDevice {
 struct VpnProfile {
     id @0 :T.VpnProfileId;
     name @1 :Text;
-    kind @2 :VpnKind;
+    # Protocol as an open token.
+    kind @2 :Text;
     server @3 :T.IpAddress;
     port @4 :T.Port;
     # Username + credential-handled-by-auth, not in spec for security.
-    authMethod @5 :VpnAuthMethod;
+    # Authentication method as an open token.
+    authMethod @5 :Text;
     # Split-tunnel: which subnets go through the VPN.
     includedSubnets @6 :List(Subnet);
     excludedSubnets @7 :List(Subnet);
@@ -760,31 +711,18 @@ struct VpnProfile {
     autoconnect @9 :Bool;
     # Friendly type name (e.g., "WireGuard").
     driverName @10 :Text;
+    metadata @11 :T.StringMap;
 }
 
-enum VpnKind {
-    wireguard @0;
-    openvpn @1;
-    ikev2 @2;
-    ipsec @3;
-    l2tp @4;
-    pptp @5;
-    ss @6;
-    custom @7;
-}
+# VPN protocol as an open token ("wireguard", "openvpn", ...): six
+# product names, two of them already deprecated, were frozen here.
 
-enum VpnAuthMethod {
-    psk @0;
-    certificate @1;
-    oauth2 @2;
-    usernamePassword @3;
-    none @4;
-    custom @5;
-}
+# Authentication method as an open token ("psk", "certificate", "oauth2", ...).
 
 struct Subnet {
     address @0 :T.IpAddress;
     prefixLen @1 :UInt8;
+    metadata @2 :T.StringMap;
 }
 
 struct VpnConnection {
@@ -811,8 +749,9 @@ enum VpnState {
 # ── Hotspot ─────────────────────────────────────────────────
 
 struct HotspotConfig {
-    band @0 :WifiBand;
-    security @1 :WifiSecurity;
+    # Band as an open token.
+    band @0 :Text;
+    security @1 :Text;
     passphrase @2 :Text;
     # Whether hotspot is visible.
     hidden @3 :Bool;
@@ -821,46 +760,59 @@ struct HotspotConfig {
     clientLimitKbps @5 :UInt32;
     # Client isolation (AP mode).
     clientIsolation @6 :Bool;
+    metadata @7 :T.StringMap;
 }
 
-enum WifiBand {
-    band24GHz @0;   # was: band2_4GHz
-    band5GHz @1;
-    band6GHz @2;
-    dualBand @3;
-    custom @4;
-}
+# Band as an open token ("2.4GHz", "5GHz", "6GHz", ...): spectrum
+# allocation is political, not mathematical — 6 GHz is a 2020s regulator
+# decision, not a constant of nature.
 
 struct HotspotStatus {
     active @0 :Bool;
-    band @1 :WifiBand;
+    band @1 :Text;
     ssid @2 :Text;
     connectedClients @3 :UInt32;
     bytesIn @4 :UInt64;
     bytesOut @5 :UInt64;
+    metadata @6 :T.StringMap;
 }
 
 # ── DHCP ────────────────────────────────────────────────────
 
-struct DhcpOptions {
+struct AddressAssignmentOptions {
+    # Requested values as open tokens (what the caller wants assigned).
     requested @0 :List(Text);
+    # Caller-declared overrides.
     overrides @1 :T.StringMap;
 }
 
-struct DhcpLease {
+struct AddressAssignmentResult {
+    union {
+        assignment @0 :AddressAssignment;
+        error @1 :T.Error;
+        unknown @2 :T.UnknownEvent;
+    }
+}
+
+# What was assigned, by whom, and until when — the honest shape whichever
+# mechanism produced it.
+struct AddressAssignment {
     interface @0 :T.NetworkInterfaceId;
-    family @1 :AddressFamily;
+    # Address family as an open token ("ipv4", "ipv6").
+    family @1 :Text;
     address @2 :T.IpAddress;
     prefixLen @3 :UInt8;
     gateway @4 :T.IpAddress;
     dnsServers @5 :List(T.IpAddress);
     dnsSearch @6 :List(Text);
+    # The assigning server, if there was one.
     server @7 :T.IpAddress;
     issuedAt @8 :T.Timestamp;
     expiresAt @9 :T.Timestamp;
     renewedCount @10 :UInt32;
-    # DHCP server class-id.
-    vendorClass @11 :Text;
+    # Assignment mechanism as an open token ("dhcp", "slaac", "static").
+    mechanism @11 :Text;
+    metadata @12 :T.StringMap;
 }
 
 enum AddressFamily {
@@ -881,6 +833,7 @@ struct DnsServer {
     # Authentication method (e.g., TSIG key name, mTLS client cert label).
     # Empty if unauthenticated.
     auth @5 :Text;
+    metadata @6 :T.StringMap;
 }
 
 # ── QoS ─────────────────────────────────────────────────────
@@ -896,6 +849,7 @@ struct QosRule {
     ceilingKbps @3 :UInt32;
     # Latency target.
     latencyTarget @4 :T.Duration;
+    metadata @5 :T.StringMap;
 }
 
 struct QosMatch {
@@ -903,18 +857,14 @@ struct QosMatch {
     applicationId @0 :T.AppId;
     portStart @1 :UInt16;
     portEnd @2 :UInt16;
-    protocol @3 :TransportProtocol;
+    protocol @3 :Text;
+    metadata @4 :T.StringMap;
 }
 
-enum TransportProtocol {
-    tcp @0;
-    udp @1;
-    icmp @2;
-    sctp @3;
-    quic @4;
-    any @5;
-    custom @6;
-}
+# Transport as an open token ("tcp", "udp", "icmp", "sctp", "quic",
+# "any", ...). A firewall rule that cannot name a future transport
+# silently excludes it from security policy — the exact failure a closed
+# enum produces here.
 
 # ── Counters ────────────────────────────────────────────────
 
@@ -941,6 +891,7 @@ struct CaptivePortalState {
     network @2 :Text;
     # When the portal check was performed.
     checkedAt @3 :T.Timestamp;
+    metadata @4 :T.StringMap;
 }
 
 enum CaptivePortalStage {
@@ -979,8 +930,9 @@ interface NicProvider {
 }
 
 struct NicCapabilities {
-    # Link speeds in bit/s the device negotiates (max-visible).
-    linkSpeedsBps @0 :List(UInt64);
+    # Maximum negotiated link speed in bit/s. The full set of speeds a
+    # device can negotiate is backend detail, reported in `extras`.
+    maxLinkSpeedBps @0 :UInt64;
     # Supported hardware offloads (TSO, checksum, RSS, ...).
     offloads @1 :List(Text);
     # Whether the device is capable of multipath (LACP, MLAG, ...).
@@ -997,16 +949,20 @@ struct NicCapabilities {
 }
 
 struct NicFrameDesc {
-    # Backend-specific slot/handle. Buffer is identity-anchored on the
-    # provider side; this is a ring slot identifier, not a buffer
-    # handle. Use buffer.capnp to share the underlying memory.
+    # Backend-specific slot identifier within the provider's ring.
     bufferSlot @0 :UInt32;
+    # The shared-memory buffer the frame lives in. THE zero-copy path:
+    # the frame path is the highest-volume data path in the protocol, and
+    # without this identity every backend invented its own
+    # slot-to-memory agreement out of band.
+    buffer @1 :T.BufferId;
     # Length in bytes (the driver honors this, not necessarily slot size).
-    length @1 :UInt32;
-    # Offset within the slot where frame data starts.
-    offset @2 :UInt32;
-    # Checksum/length validation reported by hardware if known.
-    flags @3 :UInt32;
+    length @2 :UInt32;
+    # Offset within the buffer where frame data starts.
+    offset @3 :UInt32;
+    # Checksum/length validation reported by hardware, as open tokens.
+    flags @4 :List(Text);
+    metadata @5 :T.StringMap;
 }
 
 struct NicCounters {
@@ -1020,9 +976,11 @@ struct NicCounters {
     txDropped @7 :UInt64;
     # Driver-defined extras.
     extras @8 :List(NicCounterEntry);
+    metadata @9 :T.StringMap;
 }
 
 struct NicCounterEntry {
     name @0 :Text;
     value @1 :UInt64;
+    metadata @2 :T.StringMap;
 }

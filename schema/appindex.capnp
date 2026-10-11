@@ -1,34 +1,99 @@
 @0xa1b2c3d4e5f6001a;
 
-using T = import "types.capnp";
+# ═══════════════════════════════════════════════════════════════════════
+# AppIndex - application discovery, search, launch, and tracking.
+#
+# WHAT THIS IS
+#   The catalog of all known applications: list, search, launch, pin, track,
+#   and report INSTALL state. This schema owns catalog metadata; lifecycle
+#   management lives in app.capnp; bundle self-description lives in
+#   manifest.capnp.
+#
+# THE ONE APP TAXONOMY
+#   `AppCategory` and `AppSource` are now OPEN TOKENS, published here as
+#   conformance constants and imported by app.capnp and shell.capnp. There
+#   were three rival category taxonomies (this file, app.capnp, and shell's
+#   `ApplicationCategory`), so an app's category had to be mapped at every
+#   surface boundary and a category added in any later year had no ordinal
+#   anywhere. One home, one spelling, and a future category is a string.
+#
+# AN APP FORMAT THAT DOES NOT EXIST YET
+#   `AppInfo.manifestName` points at the bundle's `Manifest`, which is the
+#   self-description that already covers "apps, services, devices, plug-ins,
+#   snapshots, payload bundles". Format knowledge never enters this contract:
+#   a new app format is describable by adding a Manifest, with no change here.
+#   `listCapabilities` reports the manifest's declared requirements, so an
+#   index can show what an app will ask for without a permission-string
+#   vocabulary of its own.
+#
+# TWO LIFECYCLES, DISAMBIGUATED
+#   `AppState` (here) is INSTALL state. `AppLifecycle` (app.capnp) is RUNTIME
+#   state. The two never overlap and never disagree, and a launcher that wants
+#   both subscribes to both — it does not reconcile them. Previously both
+#   files defined both kinds of value.
+#
+# THE STORE DOMAIN IS GONE
+#   Ratings, moderation, recommendations, reason codes and search ranking
+#   weights were a distribution service's internals inside the local index.
+#   Moderation policy is store governance — a local backend would have
+#   implemented five different policies behind field names that promised
+#   contract semantics — and `setSearchRankingWeights` was a global mutable
+#   shared resource with no stated authority. `compareVersions` was pure
+#   arithmetic exposed as IPC, with a prerelease-ordering fork in it. All of
+#   it is deleted; the index is now list/search/launch/pin/track.
+#
+# WHAT WAS KEPT
+#   The core design: paginated everything, a typed launch-args union, a
+#   subscription with filters and coalescing, and `LaunchResult` — the error
+#   model the rest of the batch copies.
+# ═══════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════
-# AppIndex - application discovery, search, launch, and tracking
-#
-# The app index is the catalog of all known applications. It supports
-# discovery (list, search), launch (with typed args), pinned/recent
-# tracking, and installation state. This schema owns metadata queries;
-# lifecycle management lives in app.capnp.
-#
-# All IDs are typed. All lists are paginated. All mutations return
-# T.VoidResult. Icons carry MIME type. Categories are typed enums.
-#
-# Audit-7 enhancements (zero-cost, info-density):
-#   - LaunchArgs: typed launch arguments replacing bare List(Text)
-#   - AppIndexSubscription filter: only these app IDs/state changes
-#   - AppPermissions: permission listing in index
-#   - AppSearchFilter: enriched search with category/source/version range
-#   - AppIndexStats: aggregate statistics for the index
-#   - LaunchResult enriched with instanceId
-# ═══════════════════════════════════════════════════════════════════════
+using T = import "types.capnp";
+using M = import "manifest.capnp";
+
+# An app-instance reference. A union rather than a `UInt32` with a sentinel:
+# instance 0 and "not an instance app" were indistinguishable, and an ID
+# allocator that starts at 0 produces two meanings for one number.
+struct AppInstanceRef {
+    union {
+        none     @0 :Void;
+        instance @1 :UInt32;
+        unknown  @2 :Void;
+    }
+}
+
+# A file/resource reference. This is the canonical definition; app.capnp and
+# shell.capnp import it instead of carrying identical twins.
+struct FileRef {
+    union {
+        path    @0 :T.FilePath;
+        uri     @1 :T.Uri;
+        fileId  @2 :T.FileId;
+        custom  @3 :T.StringMap;
+        unknown @4 :Void;
+    }
+}
+
+# An app icon. `data` is a buffer reference: a launcher grid over 500 apps
+# used to copy every icon into one message.
+struct AppIcon {
+    data     @0 :T.DataHandle;
+    mimeType @1 :T.MimeType;
+    width    @2 :UInt32;
+    height   @3 :UInt32;
+    metadata @4 :T.StringMap;
+}
 
 interface AppIndexService {
     # List all apps matching a filter, paginated.
     listApps @0 (filter :AppFilter, pagination :T.Pagination)
-             -> (apps :List(AppInfo), totalCount :UInt32);
+             -> (apps :List(AppInfo), total :UInt64);
 
-    # Get a single app by ID.
-    getApp @1 (appId :T.AppId) -> (app :AppInfo);
+    # Get a single app by ID. An id from a stale subscription or a race with
+    # uninstall used to return a zero `AppInfo` (name "", state
+    # `notInstalled` — which collides with a REAL state value), so the
+    # launcher showed a phantom entry.
+    getApp @1 (appId :T.AppId) -> (result :AppInfoResult);
 
     # Launch an app with optional arguments.
     launch @2 (appId :T.AppId, args :LaunchArgs) -> (result :LaunchResult);
@@ -37,7 +102,7 @@ interface AppIndexService {
     launchUrl @3 (url :T.Uri) -> (result :LaunchResult);
 
     # Get pinned apps.
-    getPinned @4 (pagination :T.Pagination) -> (apps :List(AppInfo), totalCount :UInt32);
+    getPinned @4 (pagination :T.Pagination) -> (apps :List(AppInfo), total :UInt64);
 
     # Pin an app.
     pinApp @5 (appId :T.AppId) -> T.VoidResult;
@@ -47,87 +112,69 @@ interface AppIndexService {
 
     # Search apps by query, with relevance ranking.
     searchApps @7 (query :Text, filter :AppSearchFilter, pagination :T.Pagination)
-               -> (results :List(AppSearchResult), totalCount :UInt32);
+               -> (results :List(AppSearchResult), total :UInt64);
 
     # Get recent apps (ordered by last-used, most recent first).
-    getRecentApps @8 (pagination :T.Pagination) -> (apps :List(AppInfo), totalCount :UInt32);
+    getRecentApps @8 (pagination :T.Pagination)
+                  -> (apps :List(AppInfo), total :UInt64);
 
     # Clear recent apps history.
     clearRecentApps @9 () -> T.VoidResult;
 
     # Subscribe to app index changes (installed, updated, uninstalled).
-    subscribe @10 (filter :AppIndexSubscriptionFilter) -> (subscription :AppIndexSubscription);
-    pull @11 (subscription :AppIndexSubscription) -> (events :List(AppIndexEvent));
+    subscribe @10 (filter :AppIndexSubscriptionFilter)
+               -> (subscription :AppIndexSubscription);
+    pull @11 (maxEvents :UInt32) -> (events :List(AppIndexEvent));
     cancel @12 (subscription :AppIndexSubscription) -> T.VoidResult;
 
-    # Audit-7: get aggregate statistics for the index.
+    # Get aggregate statistics for the index.
     getStats @13 () -> (stats :AppIndexStats);
 
-    # Audit-7: list permissions for an app from the index.
-    listPermissions @14 (appId :T.AppId, pagination :T.Pagination)
-                    -> (permissions :List(AppIndexPermission), totalCount :UInt32);
+    # The capabilities this app declares, as the manifest states them. No
+    # permission-string vocabulary of our own.
+    listCapabilities @14 (appId :T.AppId, pagination :T.Pagination)
+                     -> (requirements :List(M.CapabilityRequirement), total :UInt64);
 
-    # Audit-7: get apps that depend on a given app/package.
+    # Get apps that depend on a given package.
     getDependents @15 (packageId :T.PackageId, pagination :T.Pagination)
-                  -> (apps :List(AppInfo), totalCount :UInt32);
+                  -> (apps :List(AppInfo), total :UInt64);
 
-    # Audit-7: batch get multiple apps by ID.
-    batchGet @16 (appIds :List(T.AppId)) -> (apps :List(AppInfo));
-
-    # Audit-8: get app recommendations (false positive: app_recommendation.capnp belongs here).
-    getRecommendations @17 (appId :T.AppId, pagination :T.Pagination)
-                       -> (apps :List(AppInfo), totalCount :UInt32);
-
-    # Audit-8: submit an app rating.
-    submitRating @18 (appId :T.AppId, rating :Float32, review :Text) -> T.VoidResult;
-
-    # Audit-8: compare two versions (is v2.0 > v1.9?).
-    compareVersions @19 (versionA :T.Version, versionB :T.Version) -> (result :VersionComparison);
-
-    # Audit-9: get recommendation explanation (why an app was recommended).
-    getRecommendationReason @20 (appId :T.AppId, recommendedAppId :T.AppId) -> (reason :RecommendationReason);
-
-    # Audit-10: set search ranking weights for custom relevance tuning.
-    setSearchRankingWeights @21 (weights :SearchRankingWeights) -> T.VoidResult;
-
-    # Audit-10: get current search ranking weights.
-    getSearchRankingWeights @22 () -> (weights :SearchRankingWeights);
-
-    # Audit-10: moderate a submitted rating (approve, reject, flag).
-    moderateRating @23 (ratingId :Text, decision :RatingModerationDecision, reason :Text) -> T.VoidResult;
-
-    # Audit-10: list ratings pending moderation.
-    listPendingRatings @24 (pagination :T.Pagination) -> (ratings :List(AppRating), totalCount :UInt32);
+    # Batch get multiple apps by ID. Bounded IN as well as out: batching
+    # without pagination only moves the unboundedness.
+    batchGet @16 (appIds :List(T.AppId), pagination :T.Pagination)
+             -> (apps :List(AppInfo), total :UInt64);
 }
 
-# Audit-9: explanation for why an app was recommended.
-struct RecommendationReason {
-    # The app being recommended.
+# ── Results ───────────────────────────────────────────────────
+
+struct AppInfoResult {
+    union {
+        app     @0 :AppInfo;
+        error   @1 :T.Error;
+        unknown @2 :Void;
+    }
+}
+
+struct LaunchResult {
+    union {
+        success @0 :LaunchSuccess;
+        error @1 :T.Error;
+        unknown @2 :Void;
+    }
+}
+
+struct LaunchSuccess {
     appId @0 :T.AppId;
-    # Reason category.
-    category @1 :RecommendationCategory;
-    # Human-readable explanation.
-    explanation @2 :Text;
-    # Related app or feature that triggered this recommendation.
-    trigger @3 :Text;
+    # Compatibility detail: which process was started. Not an authority and
+    # not an identity — a launch is not a capability handover, and the
+    # launched app is addressed through its service contracts.
+    pid @1 :T.ProcessId;
+    timestamp @2 :T.Timestamp;
+    instance @3 :AppInstanceRef;
 }
 
-enum RecommendationCategory {
-    similarUsage @0;         # Used by people who use a similar app
-    installedTogether @1;   # Often installed alongside another app
-    popular @2;             # Popular in user's region or demographic
-    trending @3;            # Trending or new app
-    categoryMatch @4;       # Matches user's category preferences
-    similarFunctionality @5; # Similar function to an app the user uses
-    developerReputation @6; # From a trusted developer
-    editorial @7;            # Editor's choice or staff pick
-    custom @8;
-}
+# ── Launch Args (typed) ──────────────────────────────────────
 
-# ── Launch Args (typed) ──────────────────────────────────────────────
-# Audit-7 addition: typed launch arguments replacing bare List(Text).
-# Enables structured arguments (files, URIs, key-value pairs) without
-# requiring apps to parse text.
 struct LaunchArgs {
     union {
         # Simple text arguments (most common).
@@ -138,7 +185,8 @@ struct LaunchArgs {
         uriArgs @2 :List(T.Uri);
         # Key-value arguments (for structured invocations).
         kvArgs @3 :List(LaunchArg);
-        custom @4 :Data;
+        custom @4 :T.StringMap;
+        unknown @5 :Void;
     }
 }
 
@@ -154,60 +202,42 @@ struct LaunchArgValue {
         boolean @2 :Bool;
         file @3 :FileRef;
         uri @4 :T.Uri;
-        custom @5 :Data;
+        custom @5 :T.StringMap;
+        unknown @6 :Void;
     }
 }
 
-struct FileRef {
-    union {
-        path @0 :Text;
-        uri @1 :Text;
-        fileId @2 :T.FileId;
-        custom @3 :Data;
-    }
-}
-
-# ── Launch Result ─────────────────────────────────────────────────────
-
-struct LaunchResult {
-    union {
-        success @0 :LaunchSuccess;
-        error @1 :T.Error;
-    }
-}
-
-struct LaunchSuccess {
-    appId @0 :T.AppId;
-    pid @1 :T.ProcessId;
-    timestamp @2 :T.Timestamp;
-    # Audit-7: instance ID for multi-instance apps.
-    instanceId @3 :UInt32;
-}
-
-# ── Search Result ─────────────────────────────────────────────────────
+# ── Search Result ─────────────────────────────────────────────
 
 struct AppSearchResult {
     app @0 :AppInfo;
     relevance @1 :Float32;
-    matchField @2 :Text;
-    # Audit-7: match highlights (character ranges in the name/description).
-    highlights @3 :List(TextRange);
+    # A highlight is attributed to the field it came from. Previously the
+    # field was a sibling `matchField :Text` beside a bare
+    # `List(TextRange)`, so a client receiving three ranges had to guess
+    # which field each referred to — one missed field turned highlights into
+    # garbage.
+    highlights @2 :List(Match);
 }
 
-# Audit-7 addition: character range for search highlight display.
-struct TextRange {
+struct Match {
+    field @0 :Text;
+    range @1 :TextSpan;
+    metadata @2 :T.StringMap;
+}
+
+struct TextSpan {
     start @0 :UInt32;
     end @1 :UInt32;
 }
 
-# ── App Search Filter ─────────────────────────────────────────────────
-# Audit-7 addition: enriched search with category, source, version range.
-# Replaces bare query text with structured filter.
+# ── App Search Filter ─────────────────────────────────────────
+
 struct AppSearchFilter {
-    # Restrict to these categories.
-    categories @0 :List(AppCategory);
-    # Restrict to these sources.
-    sources @1 :List(AppSource);
+    # Restrict to these categories (open tokens).
+    categories @0 :List(Text);
+    # Restrict to these sources (open tokens).
+    sources @1 :List(Text);
     # Minimum version requirement.
     minVersion @2 :T.Version;
     # Maximum version ceiling.
@@ -218,161 +248,89 @@ struct AppSearchFilter {
     nameContains @5 :Text;
 }
 
-# ── Filter ────────────────────────────────────────────────────────────
+# ── Filter ────────────────────────────────────────────────────
 
 struct AppFilter {
     name @0 :Text;
-    category @1 :AppCategory;
-    installed @2 :T.BoolFilter;
-    source @3 :AppSource;
-    # Audit-7 additions:
-    # Restrict to specific app IDs.
-    appIds @4 :List(T.AppId);
-    # Minimum version.
-    minVersion @5 :T.Version;
-    # Maximum version.
-    maxVersion @6 :T.Version;
-    # Only apps in a specific state.
-    state @7 :AppState;
+    # Open tokens — see the conformance constants at the end of this file.
+    category @1 :Text;
+    categories @2 :List(Text);
+    installed @3 :T.BoolFilter;
+    source @4 :Text;
+    appIds @5 :List(T.AppId);
+    minVersion @6 :T.Version;
+    maxVersion @7 :T.Version;
+    # Install state only. Runtime lifecycle is app.capnp's `AppLifecycle`.
+    state @8 :AppState;
 }
 
-# ── App Info ──────────────────────────────────────────────────────────
+# ── App Info ──────────────────────────────────────────────────
 
 struct AppInfo {
     id @0 :T.AppId;
     packageId @1 :T.PackageId;
-    name @2 :Text;
-    description @3 :Text;
-    version @4 :T.Version;
-    icon @5 :AppIcon;
-    categories @6 :List(AppCategory);
-    source @7 :AppSource;
-    state @8 :AppState;
-    pinned @9 :Bool;
-    developer @10 :Text;
-    license @11 :Text;
-    sizeBytes @12 :UInt64;
-    installDate @13 :T.Timestamp;
-    lastUsed @14 :T.Timestamp;
-    minVersion @15 :T.Version;
-    # Audit-7 additions:
-    # Launch mode (single-instance, multi-instance, single-task).
-    launchMode @16 :AppLaunchMode;
-    # Whether the app supports messaging.
-    supportsMessaging @17 :Bool;
-    # Number of required permissions.
-    permissionCount @18 :UInt32;
-    # Rating (0.0 - 5.0).
-    rating @19 :Float32;
-    # Number of downloads/installs.
-    installCount @20 :UInt64;
+    # The bundle's self-description. Format knowledge lives there, never here.
+    manifestName @2 :T.ManifestName;
+    name @3 :Text;
+    description @4 :Text;
+    version @5 :T.Version;
+    icon @6 :AppIcon;
+    # Open tokens — the one app taxonomy.
+    categories @7 :List(Text);
+    source @8 :Text;
+    # Install state. Runtime lifecycle is app.capnp's `AppLifecycle`.
+    state @9 :AppState;
+    pinned @10 :Bool;
+    developer @11 :Text;
+    license @12 :Text;
+    sizeBytes @13 :UInt64;
+    installDate @14 :T.Timestamp;
+    lastUsed @15 :T.Timestamp;
+    minVersion @16 :T.Version;
 }
 
-struct AppIcon {
-    data @0 :Data;
-    mimeType @1 :Text;
-    width @2 :UInt32;
-    height @3 :UInt32;
-}
-
+# INSTALL state only. A launcher that shows "running" reads app.capnp.
 enum AppState {
-    notInstalled @0;
-    installing @1;
-    installed @2;
-    launching @3;
-    running @4;
-    suspended @5;
-    stopping @6;
-    stopped @7;
-    errored @8;
-    updating @9;
-    custom @10;
+    # Absent means the backend decides; it must never mean a
+    # specific paradigm value.
+    any @0;
+    notInstalled @1;
+    installing @2;
+    installed @3;
+    updating @4;
+    uninstalling @5;
+    errored @6;
+    custom @7;
 }
 
-# Audit-7: launch mode for multi-instance behavior.
-enum AppLaunchMode {
-    singleInstance @0;
-    multiInstance @1;
-    singleTask @2;
-    singleTop @3;
-    custom @4;
-}
+# ── App Index Stats ───────────────────────────────────────────
 
-enum AppCategory {
-    system @0;
-    productivity @1;
-    games @2;
-    media @3;
-    development @4;
-    utilities @5;
-    accessibility @6;
-    communication @7;
-    education @8;
-    health @9;
-    finance @10;
-    social @11;
-    custom @12;
-}
-
-enum AppSource {
-    builtin @0;
-    store @1;
-    sideloaded @2;
-    web @3;
-    repository @4;
-    unknown @5;
-    custom @6;
-}
-
-# ── App Index Permission ──────────────────────────────────────────────
-# Audit-7 addition: permission listing in the index. Users can see
-# what permissions an app requires before installing.
-struct AppIndexPermission {
-    permission @0 :Text;
-    name @1 :Text;
-    description @2 :Text;
-    # Whether the permission is required (app won't work without it).
-    required @3 :Bool;
-    # Risk level of the permission.
-    risk @4 :PermissionRisk;
-}
-
-enum PermissionRisk {
-    safe @0;        # No user data accessed
-    normal @1;      # Non-sensitive data accessed
-    dangerous @2;   # Sensitive data accessed (camera, microphone, location)
-    custom @3;
-}
-
-# ── App Index Stats ───────────────────────────────────────────────────
-# Audit-7 addition: aggregate statistics for the index. Useful for
-# dashboards, analytics, and system health monitoring.
 struct AppIndexStats {
     totalApps @0 :UInt32;
     installedApps @1 :UInt32;
-    runningApps @2 :UInt32;
-    suspendedApps @3 :UInt32;
-    # Breakdown by source.
-    builtinCount @4 :UInt32;
-    storeCount @5 :UInt32;
-    sideloadedCount @6 :UInt32;
-    webCount @7 :UInt32;
-    # Breakdown by category (top 5).
-    topCategories @8 :List(CategoryCount);
+    # Breakdown by source (open tokens).
+    sourceCounts @2 :List(SourceCount);
+    # Breakdown by category (open tokens).
+    categoryCounts @3 :List(CategoryCount);
     # Total storage used by installed apps.
-    totalStorageBytes @9 :UInt64;
+    totalStorageBytes @4 :UInt64;
     # Timestamp of this snapshot.
-    capturedAt @10 :T.Timestamp;
+    capturedAt @5 :T.Timestamp;
 }
 
 struct CategoryCount {
-    category @0 :AppCategory;
+    category @0 :Text;
     count @1 :UInt32;
 }
 
-# ── Subscription Filter ──────────────────────────────────────────────
-# Audit-7 addition: filter for app index subscriptions. Consumers can
-# subscribe to only specific app IDs or state changes to reduce noise.
+struct SourceCount {
+    source @0 :Text;
+    count @1 :UInt32;
+    metadata @2 :T.StringMap;
+}
+
+# ── Subscription Filter ──────────────────────────────────────
+
 struct AppIndexSubscriptionFilter {
     # Only events for these app IDs (empty = all apps).
     appIds @0 :List(T.AppId);
@@ -380,8 +338,9 @@ struct AppIndexSubscriptionFilter {
     eventTypes @1 :List(AppIndexEventType);
     # Only events since this timestamp.
     since @2 :T.Timestamp;
-    # Audit-9: coalesce rapid state changes within this window (ms).
-    # Events for the same app within the window are batched together.
+    # Coalesce rapid state changes within this window (ms). Events for the
+    # same app within the window are batched together — the anti-thrash
+    # pattern, kept and cited as the model.
     coalesceWindowMs @3 :UInt32;
 }
 
@@ -393,10 +352,10 @@ enum AppIndexEventType {
     custom @4;
 }
 
-# ── Events ────────────────────────────────────────────────────────────
+# ── Events ────────────────────────────────────────────────────
 
 interface AppIndexSubscription {
-    pull @0 () -> (events :List(AppIndexEvent));
+    pull @0 (maxEvents :UInt32) -> (events :List(AppIndexEvent));
     cancel @1 () -> T.VoidResult;
 }
 
@@ -406,7 +365,7 @@ struct AppIndexEvent {
         updated @1 :AppIndexUpdateEvent;
         uninstalled @2 :AppIndexUninstallEvent;
         stateChanged @3 :AppIndexStateEvent;
-        custom @4 :Data;
+        unknown @4 :T.UnknownEvent;
     }
 }
 
@@ -436,50 +395,30 @@ struct AppIndexStateEvent {
     timestamp @3 :T.Timestamp;
 }
 
-# Audit-8 addition: version comparison result.
-struct VersionComparison {
-    # -1 if A < B, 0 if A == B, 1 if A > B.
-    result @0 :Int8;
-    # Whether the comparison is valid (e.g., not malformed versions).
-    valid @1 :Bool;
-}
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# The one app taxonomy. Published so today's tools have a discoverable
+# spelling; an unrecognised value MUST be ignored, never rejected. They are
+# Text and deliberately NOT enums: an enum here would be an eternal
+# commitment to today's list of app genres and distribution channels.
+# ══════════════════════════════════════════════════════════════════════
 
-# Audit-10: search ranking weights for custom relevance tuning.
-struct SearchRankingWeights {
-    # Weight for keyword match (0.0-1.0).
-    keywordMatch @0 :Float32;
-    # Weight for recency (0.0-1.0).
-    recency @1 :Float32;
-    # Weight for popularity (0.0-1.0).
-    popularity @2 :Float32;
-    # Weight for user rating (0.0-1.0).
-    rating @3 :Float32;
-    # Weight for category match (0.0-1.0).
-    categoryMatch @4 :Float32;
-}
+const categorySystem        :Text = "system";
+const categoryProductivity  :Text = "productivity";
+const categoryGames         :Text = "games";
+const categoryMedia         :Text = "media";
+const categoryDevelopment   :Text = "development";
+const categoryUtilities     :Text = "utilities";
+const categoryAccessibility :Text = "accessibility";
+const categoryCommunication :Text = "communication";
+const categoryEducation     :Text = "education";
+const categoryHealth        :Text = "health";
+const categoryFinance       :Text = "finance";
+const categorySocial        :Text = "social";
 
-# Audit-10: rating moderation decision.
-enum RatingModerationDecision {
-    approve @0;
-    reject @1;
-    flag @2;
-    custom @3;
-}
-
-# Audit-10: app rating with moderation state.
-struct AppRating {
-    id @0 :Text;
-    appId @1 :T.AppId;
-    rating @2 :Float32;
-    review @3 :Text;
-    submittedAt @4 :T.Timestamp;
-    moderationState @5 :RatingModerationState;
-}
-
-enum RatingModerationState {
-    pending @0;
-    approved @1;
-    rejected @2;
-    flagged @3;
-    custom @4;
-}
+const sourceBuiltin   :Text = "builtin";
+const sourceStore     :Text = "store";
+const sourceSideloaded :Text = "sideloaded";
+const sourceWeb       :Text = "web";
+const sourceRepository :Text = "repository";

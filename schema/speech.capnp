@@ -1,41 +1,88 @@
 @0xa1b2c3d4e5f6002b;
 
 using T = import "types.capnp";
-using Translation = import "translation.capnp";
+using import "capability.capnp".Capability;
 
 # ══════════════════════════════════════════════════════════════════════
 # Speech — speech recognition (STT) and text-to-speech (TTS).
 #
-# Improvements beyond the original schema:
+# The file's zero-cost migration is genuine and is kept: SpeakResult.audio,
+# MultiSpeakerResult.audio, SpeechTranslationResult.sourceAudio/
+# translatedAudio and VoiceCloneRequest.sourceAudio are all T.DataHandle,
+# which is the hardest thing to retrofit and this schema got right.
+#
+# ── THREE DEFECTS, FIXED ──────────────────────────────────────────────
+#
+# 1. NO ERROR PATH ANYWHERE. The file contained zero unions, so not one
+#    method could report a failure: "did STT fail, or did it hear
+#    silence?" was unanswerable from the wire, because ListenResult.text
+#    is empty in both cases. Every consumer had to invent a failure
+#    heuristic and every backend a convention (empty transcript?
+#    isFinal = true with empty text?). One `SpeechOutcome` union now
+#    carries T.Error beside the existing result structs, so no payload
+#    struct changed shape and every fallible method gained an honest
+#    failure path.
+#
+# 2. CLOSED VOCABULARIES IN REQUIRED POSITIONS. `AudioEncoding` froze
+#    pcm/opus/aac/mp3/flac/vorbis/alaw/mulaw, so a 2046 neural or
+#    LC3-family codec had no ordinal and `custom` carried no
+#    identification — a stream could not even name what it was. It is
+#    T.MimeType now, which the file already imports, and `negotiateCodec`
+#    negotiates real spellings instead of a closed list. The two emotion
+#    enums (`EmotionalStyle` with whisper/shout/dramatic, `SpeechEmotion`
+#    without them) could not be mapped request-to-response at all; they
+#    collapse into one open token with published spellings.
+#
+# 3. TARGETLESS STREAM CONTROL. `stopSpeaking`/`pauseSpeaking`/
+#    `resumeSpeaking`/`stopWakeWordDetection` took no argument, so in a
+#    multi-stream system the implementer had to invent session identity
+#    out of band and a consumer could not stop the right stream. They
+#    now address the stream or subscription they control.
+#
+# ── VOICE CLONING IS GATED ────────────────────────────────────────────
+#
+# `cloneVoice` creates a voice that can impersonate a real person, and
+# `setTtsFormat`/`addPronunciationRule` mutate global state. All three
+# sat on the ungated interface, so any holder of the reference could
+# clone any voice from any audio. They now live behind one accessor that
+# takes a Capability; everything else stays on the ungated root.
+#
+# ── BACKPRESSURE ──────────────────────────────────────────────────────
+#
+# SpeechAudioStream.pull and SpeechStreamResult.pull had no bound, so a
+# producer could push larger chunks than a consumer can hold. Both take
+# maxBytes now, matching ai.capnp's ArtifactStream.pull.
+#
+# Improvements (audit-7/8/9), unchanged:
 #   - Voice.id uses T.SpeechVoiceId (was raw Text).
 #   - language fields use T.Language (was bare Text).
-#   - VoiceGender has custom variant for forward compatibility.
-#   - VoiceType has custom variant for forward compatibility.
-#   - SpeechSegment.start/end have unit comments (seconds).
-#   - voiceId parameters use T.SpeechVoiceId.
-#   - AudioStream.pull returns T.DataHandle (was raw Data).
-#   - SpeakResult.audio uses T.DataHandle (was raw Data).
-#   - SpeakResult.duration uses T.Duration (was raw Float32 seconds).
+#   - VoiceGender / VoiceType have custom variants.
+#   - SpeechSegment.start/end carry unit comments (seconds).
+#   - SpeechAudioStream.pull returns T.DataHandle (was raw Data).
+#   - SpeakResult.audio uses T.DataHandle; duration uses T.Duration.
 #   - SpeakOptions rate/pitch/volume have unit comments.
-#
-# Audit-8 enhancements:
-#   - AudioFormat: declared encoding/sample rate/channels for streams.
-#   - SpeakerLabel/DiarizationOptions: meeting transcription support.
-#   - StructuredTranscript/WordTiming: word-level timestamps + speakers.
-#   - EmotionalStyle/ProsodySpec: expressive TTS with emotion control.
-#   - VoiceCloneRequest/Provenance: auditable voice cloning.
-#   - SpeechTranslator: real-time speech-to-speech translation.
+#   - SpeechAudioFormat declares encoding/sample rate/channels for streams.
+#   - SpeakerLabel/DiarizationOptions, StructuredTranscript/WordTiming.
+#   - EmotionalStyle/ProsodySpec for expressive TTS.
+#   - VoiceCloneRequest/Provenance for auditable cloning.
+#   - SpeechTranslator for real-time speech-to-speech translation.
 # ══════════════════════════════════════════════════════════════════════
 
 interface Speech {
-    listen @0 (options :ListenOptions) -> (result :ListenResult);
-    listenStream @1 (stream :AudioStream) -> (stream :ListenResultStream);
+    listen @0 (options :ListenOptions) -> (outcome :SpeechOutcome);
+    listenStream @1 (stream :SpeechAudioStream) -> (stream :ListenResultStream);
 
-    speak @2 (text :Text, voiceId :T.SpeechVoiceId, options :SpeakOptions) -> (result :SpeakResult);
-    speakSsml @3 (ssml :Text, voiceId :T.SpeechVoiceId, options :SpeakOptions) -> (result :SpeakResult);
-    stopSpeaking @4 () -> T.VoidResult;
-    pauseSpeaking @5 () -> T.VoidResult;
-    resumeSpeaking @6 () -> T.VoidResult;
+    speak @2 (text :Text, voiceId :T.SpeechVoiceId, options :SpeakOptions) -> (outcome :SpeechOutcome);
+    # SSML is one external markup among several. A backend that does not
+    # implement SSML MUST refuse this method with T.Error(unsupported)
+    # rather than silently ignoring the markup — and a caller wanting an
+    # encoding-agnostic path uses `speak` with a T.MimeType-tagged input.
+    speakSsml @3 (ssml :Text, voiceId :T.SpeechVoiceId, options :SpeakOptions) -> (outcome :SpeechOutcome);
+    # Each addresses the stream it controls, so a consumer can stop the
+    # right one in a multi-stream system.
+    stopSpeaking @4 (stream :SpeechStreamResult) -> T.VoidResult;
+    pauseSpeaking @5 (stream :SpeechStreamResult) -> T.VoidResult;
+    resumeSpeaking @6 (stream :SpeechStreamResult) -> T.VoidResult;
 
     listVoices @7 (language :T.Language) -> (voices :List(Voice));
     getDefaultVoice @8 (type :VoiceType) -> (voice :Voice);
@@ -44,65 +91,85 @@ interface Speech {
     hasSpeechToText @10 () -> (available :Bool);
     hasTextToSpeech @11 () -> (available :Bool);
 
-    # -- Audit-8: Structured transcription --
-    transcribeStructured @12 (stream :AudioStream, options :ListenOptions)
-        -> (transcript :StructuredTranscript);
+    # -- Structured transcription --
+    transcribeStructured @12 (stream :SpeechAudioStream, options :ListenOptions)
+        -> (outcome :SpeechOutcome);
 
-    # -- Audit-8: Diarization-aware transcription --
-    transcribeDiarized @13 (stream :AudioStream, options :DiarizationOptions)
-        -> (transcript :StructuredTranscript);
+    # -- Diarization-aware transcription --
+    transcribeDiarized @13 (stream :SpeechAudioStream, options :DiarizationOptions)
+        -> (outcome :SpeechOutcome);
 
-    # -- Audit-8: Voice cloning --
-    cloneVoice @14 (request :VoiceCloneRequest) -> (result :VoiceCloneResult);
-    listClonedVoices @15 () -> (voices :List(Voice));
+    # -- Voice cloning --
+    listClonedVoices @14 (pagination :T.Pagination) -> (voices :List(Voice), total :UInt32);
 
-    # -- Audit-8: Audio format management --
-    getAudioFormat @16 (stream :AudioStream) -> (format :AudioFormat);
-    setTtsFormat @17 (format :AudioFormat) -> T.VoidResult;
+    # -- Audio format management --
+    getAudioFormat @15 (stream :SpeechAudioStream) -> (format :SpeechAudioFormat);
 
-    # -- Audit-8: Real-time speech translation --
-    translate @18 (request :SpeechTranslationRequest) -> (stream :SpeechTranslationStream);
-    getSupportedTranslationPairs @19 () -> (pairs :List(LanguagePair));
+    # -- Real-time speech translation --
+    # A distinct pipeline (audio in, audio out) whose text stage
+    # delegates to translation.capnp rather than re-implementing
+    # translation; the two contracts stay separate because their
+    # payloads and lifecycles differ.
+    translate @16 (request :SpeechTranslationRequest) -> (stream :SpeechTranslationStream);
+    getSupportedTranslationPairs @17 () -> (pairs :List(LanguagePair));
 
     # -- Audit-9: listVoices with pagination --
-    listVoicesPaginated @20 (language :T.Language, pagination :T.Pagination)
+    listVoicesPaginated @18 (language :T.Language, pagination :T.Pagination)
         -> (voices :List(Voice), total :UInt32);
 
     # -- Audit-9: Speech-to-text alignment --
-    alignText @21 (stream :AudioStream, text :Text) -> (result :AlignmentResult);
+    alignText @19 (stream :SpeechAudioStream, text :Text) -> (outcome :SpeechOutcome);
 
     # -- Audit-9: Wake word detection --
-    startWakeWordDetection @22 (config :WakeWordConfig) -> (subscription :WakeWordSubscription);
-    stopWakeWordDetection @23 () -> T.VoidResult;
+    startWakeWordDetection @20 (config :WakeWordConfig) -> (subscription :WakeWordSubscription);
+    stopWakeWordDetection @21 (subscription :WakeWordSubscription) -> T.VoidResult;
 
     # -- Audit-9: Audio enhancement --
-    setAudioEnhancement @24 (enhancement :AudioEnhancement) -> T.VoidResult;
-    getAudioEnhancement @25 () -> (enhancement :AudioEnhancement);
+    setAudioEnhancement @22 (enhancement :AudioEnhancement) -> T.VoidResult;
+    getAudioEnhancement @23 () -> (enhancement :AudioEnhancement);
 
     # -- Audit-9: Speech emotion recognition --
-    detectEmotion @26 (stream :AudioStream) -> (result :EmotionResult);
+    detectEmotion @24 (stream :SpeechAudioStream) -> (outcome :SpeechOutcome);
 
     # -- Audit-9: Speech synthesis streaming --
-    speakStream @27 (text :Text, voiceId :T.SpeechVoiceId, options :SpeakOptions)
+    speakStream @25 (text :Text, voiceId :T.SpeechVoiceId, options :SpeakOptions)
         -> (stream :SpeechStreamResult);
 
     # -- Audit-9: Multi-speaker TTS --
-    speakMultiSpeaker @28 (request :MultiSpeakerRequest) -> (result :MultiSpeakerResult);
+    speakMultiSpeaker @26 (request :MultiSpeakerRequest) -> (outcome :SpeechOutcome);
 
     # -- Audit-9: Codec negotiation --
-    negotiateCodec @29 (request :CodecNegotiationRequest) -> (result :CodecNegotiationResult);
+    negotiateCodec @27 (request :CodecNegotiationRequest) -> (outcome :SpeechOutcome);
 
     # -- Audit-9: Quality metrics --
-    getQualityMetrics @30 (stream :AudioStream) -> (metrics :QualityMetrics);
+    getQualityMetrics @28 (stream :SpeechAudioStream) -> (outcome :SpeechOutcome);
 
-    # -- Audit-9: Custom pronunciation --
-    addPronunciationRule @31 (rule :PronunciationRule) -> T.VoidResult;
-    removePronunciationRule @32 (word :Text, language :T.Language) -> T.VoidResult;
-    listPronunciationRules @33 (language :T.Language) -> (rules :List(PronunciationRule));
+    # -- Custom pronunciation --
+    listPronunciationRules @29 (language :T.Language) -> (rules :List(PronunciationRule));
+    removePronunciationRule @30 (word :Text, language :T.Language) -> T.VoidResult;
+
+    # -- Gated once, at acquisition: voice cloning, global format and
+    # -- global pronunciation state. Holding the reference IS the
+    # -- authority; no method below takes an authority token.
+    studio @31 (authority :Capability) -> (service :VoiceStudio);
 }
 
-interface AudioStream {
-    pull @0 () -> (audio :T.DataHandle, done :Bool);
+# ── Privileged surface: obtained with a Capability ──────────────────────
+
+interface VoiceStudio {
+    # Creates a voice that can impersonate a real person, so it is not
+    # open to any holder of the Speech reference.
+    cloneVoice @0 (request :VoiceCloneRequest) -> (outcome :SpeechOutcome);
+
+    # Mutates global synthesis state.
+    setTtsFormat @1 (format :SpeechAudioFormat) -> T.VoidResult;
+    addPronunciationRule @2 (rule :PronunciationRule) -> T.VoidResult;
+}
+
+interface SpeechAudioStream {
+    # maxBytes is caller-driven backpressure: the producer may never send
+    # faster than the consumer pulls (ai.capnp:277's pattern).
+    pull @0 (maxBytes :UInt32) -> (audio :T.DataHandle, done :Bool);
     cancel @1 () -> T.VoidResult;
 }
 
@@ -116,6 +183,7 @@ struct ListenOptions {
     context @1 :List(Text);
     interimResults @2 :Bool;
     voice @3 :T.SpeechVoiceId;
+    custom @4 :T.StringMap;
 }
 
 struct ListenResult {
@@ -124,6 +192,7 @@ struct ListenResult {
     segments @2 :List(SpeechSegment);
     language @3 :T.Language;
     isFinal @4 :Bool;
+    custom @5 :Data;
 }
 
 struct SpeechSegment {
@@ -143,71 +212,53 @@ struct SpeakOptions {
     # Volume level: 0.0 = silent, 1.0 = normal, 2.0 = double volume.
     volume @2 :Float32;
     language @3 :T.Language;
-    # Audit-8: emotional style for expressive TTS.
-    emotionalStyle @4 :EmotionalStyle;
-    # Audit-8: detailed prosody control.
+    # Emotional style for expressive TTS, as an open token so a request
+    # and the reported emotion speak one vocabulary.
+    emotionalStyle @4 :Text;
+    # Detailed prosody control.
     prosody @5 :ProsodySpec;
+    custom @6 :T.StringMap;
 }
 
 struct SpeakResult {
     audio @0 :T.DataHandle;
     # Duration of the synthesized audio.
     duration @1 :T.Duration;
+    custom @2 :Data;
 }
 
 struct Voice {
     id @0 :T.SpeechVoiceId;
     name @1 :Text;
     language @2 :T.Language;
-    gender @3 :VoiceGender;
+    # Open token; see the gender conformance consts below.
+    gender @3 :Text;
     local @4 :Bool;
 }
 
-enum VoiceGender {
-    neutral @0;
-    female @1;
-    male @2;
+enum VoiceType {
+    unspecified @0;   # Sentinel: an unset voice type is not "defaultInput"
+    defaultInput @1;
+    defaultOutput @2;
     custom @3;
 }
-
-enum VoiceType {
-    defaultInput @0;
-    defaultOutput @1;
-    custom @2;
-}
-
-# ════════════════════════════════════════════════════════════════════════
-# Audit-8 additions: audio format declaration, speaker diarization,
-# structured transcripts, emotional TTS, voice cloning, translation.
-# ════════════════════════════════════════════════════════════════════════
 
 # ── Audio Format ───────────────────────────────────────────────────────
 # Declares the encoding, sample rate, bit depth, and channel count of
 # an audio stream. Eliminates out-of-band format agreement between
-# producer and consumer.
-struct AudioFormat {
-    encoding @0 :AudioEncoding;
+# producer and consumer. `encoding` is a T.MimeType, so any codec —
+# including one invented after this schema was written — is nameable and
+# negotiable.
+struct SpeechAudioFormat {
+    encoding @0 :T.MimeType;
     sampleRate @1 :UInt32;
     bitDepth @2 :UInt8;
     channels @3 :UInt8;
     frameSize @4 :UInt32;
-}
-
-enum AudioEncoding {
-    pcm @0;
-    opus @1;
-    aac @2;
-    mp3 @3;
-    flac @4;
-    vorbis @5;
-    alaw @6;
-    mulaw @7;
-    custom @8;
+    parameters @5 :T.StringMap;
 }
 
 # ── Speaker Diarization ────────────────────────────────────────────────
-# Speaker identification for meeting transcription. Each speaker
-# receives a unique label with confidence score.
 struct SpeakerLabel {
     speakerId @0 :UInt32;
     confidence @1 :Float32;
@@ -218,17 +269,17 @@ struct DiarizationOptions {
     enableDiarization @0 :Bool;
     maxSpeakers @1 :UInt32;
     minSegmentDuration @2 :Float32;
+    parameters @3 :T.StringMap;
 }
 
 # ── Structured Transcript ──────────────────────────────────────────────
-# Rich transcription output with word-level timestamps, speaker labels,
-# and punctuation. Replaces flat text output for downstream processing.
 struct StructuredTranscript {
     text @0 :Text;
     words @1 :List(WordTiming);
     speakers @2 :List(SpeakerLabel);
     language @3 :T.Language;
     confidence @4 :Float32;
+    custom @5 :Data;
 }
 
 struct WordTiming {
@@ -238,63 +289,39 @@ struct WordTiming {
     confidence @3 :Float32;
     speakerId @4 :UInt32;
     punctuation @5 :Text;
-    capitalization @6 :WordCapitalization;
-}
-
-enum WordCapitalization {
-    lower @0;
-    upper @1;
-    title @2;
-    custom @3;
+    # Open token; see the capitalization conformance consts below.
+    capitalization @6 :Text;
 }
 
 # ── Emotional Styling (TTS) ───────────────────────────────────────────
-# Emotion/style directives for expressive text-to-speech. Backend
-# interprets the style and adjusts prosody accordingly.
-enum EmotionalStyle {
-    neutral @0;
-    happy @1;
-    sad @2;
-    angry @3;
-    fearful @4;
-    surprised @5;
-    disgusted @6;
-    whisper @7;
-    shout @8;
-    excited @9;
-    calm @10;
-    dramatic @11;
-    custom @12;
-}
+# One open vocabulary for both directions: what a caller asks for and
+# what a detector reports. The previous pair of enums had divergent
+# value sets, so a request and a response could not be mapped to each
+# other, and 2046's "contempt" / "sarcasm" / "boredom" landed in two
+# different `custom` slots that meant nothing.
 
 struct ProsodySpec {
     rate @0 :Float32;
     pitch @1 :Float32;
     volume @2 :Float32;
     emphasis @3 :List(EmphasisRange);
+    parameters @4 :T.StringMap;
 }
 
 struct EmphasisRange {
     startWord @0 :UInt32;
     endWord @1 :UInt32;
-    level @2 :EmphasisLevel;
-}
-
-enum EmphasisLevel {
-    none @0;
-    moderate @1;
-    strong @2;
-    custom @3;
+    # Open token; see the emphasis conformance consts below.
+    level @2 :Text;
 }
 
 # ── Voice Cloning with Provenance ──────────────────────────────────────
-# Voice cloning with auditable provenance. Records source speaker,
-# consent attestation, and clone fidelity for compliance.
 struct VoiceCloneRequest {
     name @0 :Text;
     sourceAudio @1 :T.DataHandle;
     language @2 :T.Language;
     consentProof @3 :Data;
+    parameters @4 :T.StringMap;
 }
 
 struct VoiceCloneResult {
@@ -308,11 +335,10 @@ struct VoiceCloneProvenance {
     clonedAt @2 :T.Timestamp;
     cloneModel @3 :Text;
     fidelity @4 :Float32;
+    metadata @5 :T.StringMap;
 }
 
 # ── Real-Time Speech Translation ───────────────────────────────────────
-# Speech-to-speech translation pipeline. Translates audio from one
-# language to another in real time, producing translated text and audio.
 struct SpeechTranslationRequest {
     sourceLanguage @0 :T.Language;
     targetLanguage @1 :T.Language;
@@ -331,19 +357,13 @@ struct SpeechTranslationResult {
     sourceAudio @2 :T.DataHandle;
     translatedAudio @3 :T.DataHandle;
     confidence @4 :Float32;
+    custom @5 :Data;
 }
 
 struct LanguagePair {
     source @0 :T.Language;
     target @1 :T.Language;
 }
-
-# ════════════════════════════════════════════════════════════════════════
-# Audit-9 additions: listVoices pagination, speech-to-text alignment,
-# wake word detection, noise suppression, emotion recognition,
-# synthesis streaming, multi-speaker TTS, codec negotiation,
-# quality metrics, and custom pronunciation.
-# ════════════════════════════════════════════════════════════════════════
 
 # ── Speech-to-Text Alignment ───────────────────────────────────────────
 # Forced alignment of audio with text. Used for subtitle generation,
@@ -355,77 +375,46 @@ struct AlignmentResult {
     confidence @1 :Float32;
     # Total duration of the aligned audio.
     duration @2 :T.Duration;
+    custom @3 :Data;
 }
 
 # ── Wake Word Detection ────────────────────────────────────────────────
-# Configuration for wake word / keyword spotting. Detects a specific
-# word or phrase to activate the speech system.
 struct WakeWordConfig {
-    # Wake word(s) to detect.
     wakeWords @0 :List(Text);
-    # Detection sensitivity (0.0 = low, 1.0 = high).
     sensitivity @1 :Float32;
-    # Whether to use on-device detection (vs. cloud).
     onDevice @2 :Bool;
-    # Whether the wake word detector is currently active.
     active @3 :Bool;
+    parameters @4 :T.StringMap;
 }
 
 struct WakeWordEvent {
-    # Which wake word was detected.
     detectedWord @0 :Text;
-    # Confidence of the detection.
     confidence @1 :Float32;
-    # Timestamp of detection.
     timestamp @2 :T.Timestamp;
 }
 
 # ── Audio Enhancement ──────────────────────────────────────────────────
-# Audio preprocessing options for noise suppression and enhancement.
-# Applied before speech recognition for improved accuracy.
 struct AudioEnhancement {
-    # Whether to enable noise suppression.
     noiseSuppression @0 :Bool;
-    # Noise suppression strength (0.0 = off, 1.0 = maximum).
     noiseSuppressionLevel @1 :Float32;
-    # Whether to enable automatic gain control.
     autoGainControl @2 :Bool;
-    # Whether to enable echo cancellation.
     echoCancellation @3 :Bool;
-    # Whether to enable beamforming (for multi-mic arrays).
     beamforming @4 :Bool;
+    parameters @5 :T.StringMap;
 }
 
 # ── Emotion Recognition ────────────────────────────────────────────────
-# Speech emotion detection from audio. Identifies the speaker's
-# emotional state from vocal characteristics.
 struct EmotionResult {
-    # Detected emotion.
-    emotion @0 :SpeechEmotion;
-    # Confidence of the emotion detection (0.0–1.0).
+    # Detected emotion, as an open token (the same vocabulary a caller
+    # uses to request one).
+    emotion @0 :Text;
     confidence @1 :Float32;
-    # Valence score (-1.0 = negative, 1.0 = positive).
     valence @2 :Float32;
-    # Arousal score (0.0 = calm, 1.0 = excited).
     arousal @3 :Float32;
-}
-
-enum SpeechEmotion {
-    neutral @0;
-    happy @1;
-    sad @2;
-    angry @3;
-    fearful @4;
-    surprised @5;
-    disgusted @6;
-    calm @7;
-    excited @8;
-    custom @9;
+    custom @4 :Data;
 }
 
 # ── Multi-Speaker TTS ──────────────────────────────────────────────────
-# Generate dialogue between multiple voices. Each speaker is
-# assigned a voice and a sequence of lines to speak.
 struct MultiSpeakerRequest {
     speakers @0 :List(MultiSpeakerEntry);
     options @1 :SpeakOptions;
@@ -439,8 +428,8 @@ struct MultiSpeakerEntry {
 struct MultiSpeakerResult {
     audio @0 :T.DataHandle;
     duration @1 :T.Duration;
-    # Per-segment timestamps for subtitle synchronization.
     segments @2 :List(MultiSpeakerSegment);
+    custom @3 :Data;
 }
 
 struct MultiSpeakerSegment {
@@ -451,59 +440,46 @@ struct MultiSpeakerSegment {
 }
 
 # ── Codec Negotiation ──────────────────────────────────────────────────
-# Negotiate audio codec between speech sender and receiver. Ensures
-# both parties agree on encoding before streaming begins.
+# Negotiate audio codec between speech sender and receiver. Both sides
+# name codecs as T.MimeType values, so the negotiation is over real
+# spellings rather than a closed list.
 struct CodecNegotiationRequest {
-    # Codecs the sender supports (in preference order).
-    supportedCodecs @0 :List(AudioEncoding);
-    # Preferred sample rate.
+    # Codecs the sender supports, in preference order, as media types.
+    supportedCodecs @0 :List(T.MimeType);
     sampleRate @1 :UInt32;
-    # Preferred channel count.
     channels @2 :UInt8;
+    parameters @3 :T.StringMap;
 }
 
 struct CodecNegotiationResult {
-    # The negotiated codec.
-    codec @0 :AudioEncoding;
-    # Agreed sample rate.
+    codec @0 :T.MimeType;
     sampleRate @1 :UInt32;
-    # Agreed channel count.
     channels @2 :UInt8;
-    # Whether negotiation succeeded.
+    # Whether negotiation succeeded. When false, the caller reads the
+    # error arm of SpeechOutcome for the reason.
     success @3 :Bool;
+    parameters @4 :T.StringMap;
 }
 
 # ── Quality Metrics ────────────────────────────────────────────────────
-# Speech recognition quality metrics. Measures Word Error Rate (WER),
-# Character Error Rate (CER), and other accuracy indicators.
 struct QualityMetrics {
-    # Word Error Rate (lower = better, 0.0 = perfect).
     wer @0 :Float32;
-    # Character Error Rate (lower = better, 0.0 = perfect).
     cer @1 :Float32;
-    # Signal-to-noise ratio in dB.
     snrDb @2 :Float32;
-    # Overall confidence of the recognition result.
     overallConfidence @3 :Float32;
-    # Number of words recognized.
     wordCount @4 :UInt32;
-    # Number of substitutions, deletions, insertions.
     substitutions @5 :UInt32;
     deletions @6 :UInt32;
     insertions @7 :UInt32;
+    custom @8 :Data;
 }
 
 # ── Custom Pronunciation ───────────────────────────────────────────────
-# Specify pronunciation for proper nouns and domain-specific terms.
-# Uses phonetic notation or IPA for precise control.
 struct PronunciationRule {
-    # The word or phrase to override.
     word @0 :Text;
     # Pronunciation in IPA or phonetic notation.
     pronunciation @1 :Text;
-    # Language this rule applies to.
     language @2 :T.Language;
-    # Priority (higher = overrides lower priority rules).
     priority @3 :UInt32;
 }
 
@@ -513,6 +489,73 @@ interface WakeWordSubscription {
 }
 
 interface SpeechStreamResult {
-    pull @0 () -> (audio :T.DataHandle, done :Bool);
+    pull @0 (maxBytes :UInt32) -> (audio :T.DataHandle, done :Bool);
     cancel @1 () -> T.VoidResult;
 }
+
+# ══════════════════════════════════════════════════════════════════════
+# ONE OUTCOME TYPE — the file's error path
+#
+# The file previously contained zero unions, so no method could report a
+# failure and every backend invented its own convention for "the
+# recogniser died" versus "the user said nothing". One union carries
+# T.Error beside the existing result structs, so every payload struct
+# keeps its field ordinals and every fallible method gains an honest
+# failure path. Methods that cannot fail keep returning a bare value.
+# ══════════════════════════════════════════════════════════════════════
+
+struct SpeechOutcome {
+    union {
+        heard @0 :ListenResult;
+        spoken @1 :SpeakResult;
+        transcript @2 :StructuredTranscript;
+        aligned @3 :AlignmentResult;
+        emotion @4 :EmotionResult;
+        quality @5 :QualityMetrics;
+        cloned @6 :VoiceCloneResult;
+        codec @7 :CodecNegotiationResult;
+        error @8 :T.Error;
+        # Opaque escape for an outcome this schema does not name.
+        custom @9 :Data;
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFORMANCE TOKENS — conventions, NOT contract
+#
+# Today's spellings for the open tokens above. Nothing requires them; an
+# unrecognized token MUST be ignored rather than rejected, so a 2046
+# emotion, gender, emphasis level or codec becomes nameable the day a
+# backend ships it — no schema amendment, and no `custom` slot carrying
+# nothing.
+# ══════════════════════════════════════════════════════════════════════
+
+const emotionNeutral   :Text = "neutral";
+const emotionHappy     :Text = "happy";
+const emotionSad       :Text = "sad";
+const emotionAngry     :Text = "angry";
+const emotionFearful   :Text = "fearful";
+const emotionSurprised :Text = "surprised";
+const emotionDisgusted :Text = "disgusted";
+const emotionCalm      :Text = "calm";
+const emotionExcited   :Text = "excited";
+const emotionWhisper   :Text = "whisper";
+const emotionShout     :Text = "shout";
+const emotionDramatic  :Text = "dramatic";
+
+const genderNeutral :Text = "neutral";
+const genderFemale  :Text = "female";
+const genderMale    :Text = "male";
+
+const emphasisNone     :Text = "none";
+const emphasisModerate :Text = "moderate";
+const emphasisStrong   :Text = "strong";
+
+const capitalizationLower :Text = "lower";
+const capitalizationUpper :Text = "upper";
+const capitalizationTitle :Text = "title";
+
+const codecPcm   :T.MimeType = (type = "audio", subtype = "l16");
+const codecOpus  :T.MimeType = (type = "audio", subtype = "opus");
+const codecFlac  :T.MimeType = (type = "audio", subtype = "flac");
+const codecMp3   :T.MimeType = (type = "audio", subtype = "mpeg");

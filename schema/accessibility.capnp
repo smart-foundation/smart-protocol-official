@@ -1,32 +1,79 @@
 @0xa1b2c3d4e5f6000c;
 
-using T = import "types.capnp";
-
 # ═══════════════════════════════════════════════════════════════════════
 # Accessibility - tree traversal, node inspection, action execution,
 # and event streaming for assistive technologies.
 #
-# This schema is the contract between UI toolkits and assistive tech
-# (screen readers, switch control, voice control, magnifiers). It is
-# backend-agnostic: the same schema works on Linux (AT-SPI), macOS
-# (NSAccessibility), Windows (UIA), and custom compositors.
+# 2026-10-10 integration pass — three names disambiguated (a tree-state
+# change, an event subscription and a tree export all shared names with
+# discovery, usb and vcard):
+#   - StateChange -> AccessibilityStateChange (discovery owns
+#     ServiceStateChange).
+#   - EventSubscription -> AccessibilityEventSubscription (usb owns
+#     UsbEventSubscription).
+#   - ExportResult -> AccessibilityExportResult (vcard owns
+#     VcardExportResult).
+# WHAT THIS IS
+#   The contract between UI toolkits and assistive tech (screen readers,
+#   switch control, voice control, magnifiers). It is backend-agnostic: the
+#   same schema works on Linux (AT-SPI), macOS (NSAccessibility), Windows
+#   (UIA), and custom compositors.
 #
-# The tree is lazy: children are IDs, not inline objects. Assistive
-# tech fetches only what it needs.
+# The tree is lazy: children are IDs, not inline objects. Assistive tech
+# fetches only what it needs. Deltas are incremental. Traversal is paginated.
+# This is the model the rest of the protocol should copy, and it is unchanged
+# here apart from the fixes below.
 #
-# Audit-7 enhancements (zero-cost, info-density):
-#   - Additional roles: grid, statusBar, tooltip, spinButton, tabList, etc.
-#   - Additional actions: scrollToPoint, showOnScreen, drag, accessibilityFocus
-#   - Additional state fields: highlighted, collapsedByUser, autoplay, etc.
-#   - TextAttribute: inline formatting for rich text nodes
-#   - AccessibilityPreferences additions: magnifier, switch control, etc.
-#   - TextRange for selection operations with character/word/line granularity
-#   - NodeRelationship: typed parent/child/flow relationships
+# WAI-ARIA IS GONE FROM THE REQUIRED POSITION
+#   `AriaProperties` and the four methods that read and wrote it made a W3C
+#   WEB DOCUMENT mechanism a required vocabulary of the universal contract.
+#   The Swap Test fails on it: swapping a webview backend for an AR/VR HMI
+#   backend requires EMULATING ARIA semantics the backend does not possess
+#   (`current: step`, `owns`, `hasPopup: listbox`), and a non-web AT (voice
+#   control on a car cluster) must map its model onto web roles. This file's
+#   own header promises AT-SPI/NSAccessibility/UIA neutrality and then bolted
+#   on ARIA. All of it is deleted; only `NodeRelationship` survives, as the
+#   neutral relationship form with an open type token. Web-backed UIs map
+#   ARIA onto the neutral node model — which they must do to serve any other
+#   AT anyway.
+#
+# WHAT ELSE WAS FIXED
+#   - `exportTreeJson` returned the whole tree as inline `Text` — the file's
+#     own lazy design undone for the one call where trees are largest. A
+#     50k-node spreadsheet returned megabytes of JSON allocated whole on both
+#     ends. It is now a buffer reference.
+#   - `getSelectedText` returned the whole selection inline. A "select all" in
+#     a large document copied the entire document. It is now a handle plus the
+#     range, so the caller reads what it needs.
+#   - `NodePropertyChange` set node fields as TEXT PAIRS: a boolean became
+#     "true"/"false" by convention, a number became "42", and every backend
+#     and every client agreed on nothing. It is now `T.MetaValue`, and
+#     `batchUpdate` reports a per-update result, so "node 4 failed" is
+#     answerable instead of "the batch failed".
+#   - There were TWO politeness scales: `LiveRegionMode {off, polite,
+#     assertive}` and `AriaLive {off, polite, assertive, rude}`. One scale,
+#     one home — `rude` folded in.
+#   - ROOT DISCOVERY, previously a fork with every new backend: nothing said
+#     how a consumer found the root of an app's tree. `getRoot` now does, and
+#     node-id issuance is stated: ids are APP-issued and stable for the life
+#     of the node; the compositor binds a surface to a root through
+#     `Compositor.Session.updateAccessibilityTree`.
+#   - `simulateEvent` took an `AccessibilityActionType`, which is an action
+#     vocabulary, not an event one. It now takes an open event-kind token.
+#
+# ON `AccessibilityRole` (70 values)
+#   Kept deliberately. Cross-platform AT interop genuinely needs a shared
+#   vocabulary — that IS its interop purpose — and it has `custom @69`. A
+#   parallel open token would create two naming systems, which is the defect
+#   this rewrite removes elsewhere. Recorded in the batch report as a
+#   considered decision rather than an oversight.
 # ═══════════════════════════════════════════════════════════════════════
 
+using T = import "types.capnp";
+
 interface AccessibilityService {
-    # Fetch the full subtree rooted at a node.
-    getTree @0 (rootId :T.AccessNodeId) -> (tree :AccessibilityNode);
+    # Fetch the subtree rooted at a node.
+    getTree @0 (rootId :T.AccessNodeId) -> (result :TreeResult);
 
     # Subscribe to tree structure changes (child added/removed, node destroyed).
     subscribeTree @1 (rootId :T.AccessNodeId) -> (subscription :TreeSubscription);
@@ -34,70 +81,146 @@ interface AccessibilityService {
     cancelTree @3 (subscription :TreeSubscription) -> T.VoidResult;
 
     # Subscribe to accessibility events (focus, announcement, alert, value).
-    subscribeEvents @4 () -> (subscription :EventSubscription);
-    pullEvents @5 (subscription :EventSubscription) -> (events :List(AccessibilityEvent));
-    cancelEvents @6 (subscription :EventSubscription) -> T.VoidResult;
+    subscribeEvents @4 () -> (subscription :AccessibilityEventSubscription);
+    pullEvents @5 (maxEvents :UInt32) -> (events :List(AccessibilityEvent));
+    cancelEvents @6 (subscription :AccessibilityEventSubscription) -> T.VoidResult;
 
-    # Execute an action on a node.
-    performAction @7 (nodeId :T.AccessNodeId, action :AccessibilityAction) -> T.VoidResult;
+    # Execute an action on a node. An unsupported action returns
+    # `T.ErrorCode.notSupported`, so a consumer can degrade instead of retry.
+    performAction @7 (nodeId :T.AccessNodeId, action :AccessibilityAction)
+                  -> T.VoidResult;
 
     # Get the currently focused node.
-    getFocusedNode @8 () -> (node :AccessibilityNode);
+    getFocusedNode @8 () -> (result :TreeResult);
 
     # Set focus to a specific node.
     setFocus @9 (nodeId :T.AccessNodeId) -> T.VoidResult;
 
     # Get selected text within a node (for text-input, staticText, etc).
-    getSelectedText @10 (nodeId :T.AccessNodeId) -> (text :Text, range :TextRange);
+    # A buffer reference plus the range, so a "select all" in a large
+    # document does not copy the document.
+    getSelectedText @10 (nodeId :T.AccessNodeId)
+                     -> (result :SelectedTextResult);
 
     # Set text selection range within a node.
     setSelection @11 (nodeId :T.AccessNodeId, range :TextRange) -> T.VoidResult;
 
-    # Query user accessibility preferences.
+    # Query user accessibility preferences. This is THE preference contract;
+    # theme.capnp reports the active theme, not the user's preferences.
     getPreferences @12 () -> (preferences :AccessibilityPreferences);
 
-    # Audit-7: get node relationships (parent, siblings, flows).
-    getRelationships @13 (nodeId :T.AccessNodeId) -> (relationships :NodeRelationships);
+    # Get node relationships (parent, siblings, flows).
+    getRelationships @13 (nodeId :T.AccessNodeId)
+                      -> (relationships :NodeRelationships);
 
-    # Audit-7: get text attributes (inline formatting) for a text node.
+    # Get text attributes (inline formatting) for a text node.
     getTextAttributes @14 (nodeId :T.AccessNodeId, range :TextRange)
                       -> (attributes :List(TextAttribute));
 
-    # Audit-7: get the accessibility tree as a flat list (for linear navigation).
+    # Get the accessibility tree as a flat list (for linear navigation).
     getFlatTree @15 (rootId :T.AccessNodeId, pagination :T.Pagination)
-                -> (nodes :List(AccessibilityNode), totalCount :UInt32);
+                -> (nodes :List(AccessibilityNode), total :UInt64);
 
-    # Audit-9: export accessibility tree as JSON for debugging.
-    exportTreeJson @16 (rootId :T.AccessNodeId) -> (json :Text);
+    # Export accessibility tree as a buffer for debugging. The content type
+    # is declared by the caller, so the export is not frozen to JSON.
+    exportTreeJson @16 (rootId :T.AccessNodeId, format :T.MimeType)
+                    -> (result :AccessibilityExportResult);
 
-    # Audit-9: batch update multiple nodes atomically.
-    batchUpdate @17 (updates :List(NodeUpdate)) -> T.VoidResult;
+    # Batch update multiple nodes. Per-update results, so partial success is
+    # visible instead of "the batch failed, re-fetch the world".
+    batchUpdate @17 (updates :List(NodeUpdate)) -> (result :BatchUpdateResult);
 
-    # Audit-9: simulate accessibility events for testing.
-    simulateEvent @18 (nodeId :T.AccessNodeId, eventType :AccessibilityActionType) -> T.VoidResult;
+    # Simulate accessibility events for testing. `eventKind` is an open
+    # token — it is an event kind, not an action.
+    simulateEvent @18 (nodeId :T.AccessNodeId, eventKind :Text) -> T.VoidResult;
 
-    # Audit-10: get ARIA properties for a node.
-    getAriaProperties @19 (nodeId :T.AccessNodeId) -> (properties :AriaProperties);
-
-    # Audit-10: set ARIA properties on a node.
-    setAriaProperties @20 (nodeId :T.AccessNodeId, properties :AriaProperties) -> T.VoidResult;
-
-    # Audit-10: resolve aria-labelledby reference chain.
-    resolveLabelledBy @21 (nodeId :T.AccessNodeId) -> (label :Text, sourceNodes :List(T.AccessNodeId));
-
-    # Audit-10: resolve aria-describedby reference chain.
-    resolveDescribedBy @22 (nodeId :T.AccessNodeId) -> (description :Text, sourceNodes :List(T.AccessNodeId));
+    # Discover the root of a surface's tree. Node ids are app-issued and
+    # stable for the life of the node; this returns the binding the compositor
+    # recorded for the surface.
+    getRoot @19 (surface :T.SurfaceId) -> (result :RootResult);
 }
 
-# Audit-9: batch node update for atomic multi-change updates.
+# ── Results ───────────────────────────────────────────────────
+
+struct TreeResult {
+    union {
+        node    @0 :AccessibilityNode;
+        # No tree is published for this node/surface. An answer, not a fault.
+        none    @1 :Void;
+        error   @2 :T.Error;
+        unknown @3 :Void;
+    }
+}
+
+struct RootResult {
+    union {
+        root    @0 :T.AccessNodeId;
+        none    @1 :Void;
+        error   @2 :T.Error;
+        unknown @3 :Void;
+    }
+}
+
+struct SelectedTextResult {
+    union {
+        selection @0 :SelectedText;
+        none      @1 :Void;
+        error     @2 :T.Error;
+        unknown   @3 :Void;
+    }
+}
+
+struct SelectedText {
+    # The selection itself: a buffer reference, because a "select all" in a
+    # large document must not copy the document.
+    text  @0 :T.DataHandle;
+    # The range the text was read from.
+    range @1 :TextRange;
+    metadata @2 :T.StringMap;
+}
+
+struct AccessibilityExportResult {
+    union {
+        export  @0 :TreeExport;
+        error   @1 :T.Error;
+        unknown @2 :Void;
+    }
+}
+
+struct TreeExport {
+    # The exported tree, in the requested content type. A buffer reference:
+    # the file's lazy design does not end at the largest structure.
+    data      @0 :T.DataHandle;
+    format    @1 :T.MimeType;
+    nodeCount @2 :UInt64;
+    metadata @3 :T.StringMap;
+}
+
+struct BatchUpdateResult {
+    # One entry per submitted update, in the submitted order.
+    results @0 :List(NodeUpdateResult);
+    metadata @1 :T.StringMap;
+}
+
+struct NodeUpdateResult {
+    union {
+        ok      @0 :Void;
+        error   @1 :T.Error;
+        unknown @2 :Void;
+    }
+}
+
+# Audit-9: batch node update for multi-change updates.
 struct NodeUpdate {
     nodeId @0 :T.AccessNodeId;
     changes @1 :List(NodePropertyChange);
 }
 
+# Typed, not text: a boolean is a boolean and a number is a number, so no
+# backend has to agree on how "true" is spelled.
 struct NodePropertyChange {
     field @0 :Text;
-    value @1 :Text;
+    value @1 :T.MetaValue;
 }
 
 interface TreeSubscription {
@@ -105,15 +228,13 @@ interface TreeSubscription {
     cancel @1 () -> T.VoidResult;
 }
 
-interface EventSubscription {
-    pull @0 () -> (events :List(AccessibilityEvent));
+interface AccessibilityEventSubscription {
+    pull @0 (maxEvents :UInt32) -> (events :List(AccessibilityEvent));
     cancel @1 () -> T.VoidResult;
 }
 
-# ── Text Range ────────────────────────────────────────────────────────
-# Audit-7 addition: typed text range for selection operations. Replaces
-# raw start/end UInt32 pairs with a structured range that supports
-# character, word, and line granularity.
+# ── Text Range ────────────────────────────────────────────────
+
 struct TextRange {
     start @0 :UInt32;
     end @1 :UInt32;
@@ -122,20 +243,20 @@ struct TextRange {
 }
 
 enum TextGranularity {
-    character @0;
-    word @1;
-    line @2;
-    sentence @3;
-    paragraph @4;
-    all @5;
-    custom @6;
+    # Absent means the backend decides; it must never mean a
+    # specific paradigm value.
+    unspecified @0;
+    character @1;
+    word @2;
+    line @3;
+    sentence @4;
+    paragraph @5;
+    all @6;
+    custom @7;
 }
 
-# ── Text Attribute ────────────────────────────────────────────────────
-# Audit-7 addition: inline formatting for rich text nodes. Screen
-# readers need to know that a word is bold, italic, or a link — not
-# just the plain text. TextAttribute provides that without duplicating
-# the entire text tree.
+# ── Text Attribute ───────────────────────────────────────────
+
 struct TextAttribute {
     # Character offset where this attribute starts.
     offset @0 :UInt32;
@@ -166,15 +287,16 @@ struct TextAttributeValue {
         bool @0 :Bool;
         text @1 :Text;
         integer @2 :UInt32;
-        custom @3 :Data;
+        custom @3 :T.StringMap;
+        unknown @4 :Void;
     }
 }
 
-# ── Node Relationships ────────────────────────────────────────────────
-# Audit-7 addition: typed parent/child/flow relationships. Assistive
-# tech needs to navigate the tree in ways that differ from the visual
-# layout (e.g. reading order, logical grouping). NodeRelationships
-# provides that without requiring the entire tree.
+# ── Node Relationships ───────────────────────────────────────
+
+# The neutral relationship form. `type` is an open token, which is what lets a
+# relationship kind invented later be expressed — and it is why the ARIA
+# property model was removable rather than merely moved.
 struct NodeRelationships {
     nodeId @0 :T.AccessNodeId;
     parent @1 :T.AccessNodeId;
@@ -184,13 +306,23 @@ struct NodeRelationships {
     previousInFlow @4 :T.AccessNodeId;
     # Controlled elements (for combobox -> listbox relationships).
     controlledElements @5 :List(T.AccessNodeId);
-    # Details element (for aria-details).
+    # Details element.
     detailsElement @6 :T.AccessNodeId;
-    # Error message element (for aria-errormessage).
+    # Error message element.
     errorMessage @7 :T.AccessNodeId;
+    # Additional relationships, keyed by an open type token.
+    others @8 :List(NodeRelationship);
 }
 
-# ── Tree Model ────────────────────────────────────────────────────────
+struct NodeRelationship {
+    # Relationship type, e.g. "related", "group", "flow".
+    type @0 :Text;
+    # Target node IDs for this relationship.
+    targets @1 :List(T.AccessNodeId);
+    metadata @2 :T.StringMap;
+}
+
+# ── Tree Model ───────────────────────────────────────────────
 
 struct AccessibilityNode {
     id @0 :T.AccessNodeId;
@@ -202,24 +334,25 @@ struct AccessibilityNode {
     coordinateSpace @6 :CoordinateSpace;
     actions @7 :List(AccessibilityAction);
     children @8 :List(T.AccessNodeId);
-    # Explicit reading/ traversal order (differs from visual order in multi-column layouts).
+    # Explicit reading/traversal order (differs from visual order in
+    # multi-column layouts).
     readingOrder @9 :List(T.AccessNodeId);
     attributes @10 :T.StringMap;
     # Live region mode for dynamic content (chat messages, timers, status bars).
     liveRegion @11 :LiveRegionMode;
-    # Audit-7: text value (for input fields, text nodes).
+    # Text value (for input fields, text nodes).
     value @12 :Text;
-    # Audit-7: minimum value (for sliders, progress bars).
+    # Minimum value (for sliders, progress bars).
     minValue @13 :Float32;
-    # Audit-7: maximum value (for sliders, progress bars).
+    # Maximum value (for sliders, progress bars).
     maxValue @14 :Float32;
-    # Audit-7: current value as float (for numeric controls).
+    # Current value as float (for numeric controls).
     numericValue @15 :Float32;
-    # Audit-7: placeholder text (for input fields).
+    # Placeholder text (for input fields).
     placeholder @16 :Text;
-    # Audit-7: error message node ID.
+    # Error message node ID.
     errorNodeId @17 :T.AccessNodeId;
-    # Audit-7: keyboard shortcut (e.g. "Ctrl+S").
+    # Keyboard shortcut (e.g. "Ctrl+S").
     keyboardShortcut @18 :Text;
 }
 
@@ -231,14 +364,17 @@ enum CoordinateSpace {
     custom @4;
 }
 
+# ONE politeness scale. `rude` was folded in from the deleted ARIA live
+# model, so a live region can be announced at full severity.
 enum LiveRegionMode {
     off @0;
     polite @1;
     assertive @2;
-    custom @3;
+    rude @3;
+    custom @4;
 }
 
-# ── Tree Deltas (incremental updates) ────────────────────────────────
+# ── Tree Deltas (incremental updates) ────────────────────────
 
 struct TreeDelta {
     nodeId @0 :T.AccessNodeId;
@@ -249,14 +385,14 @@ struct TreeChange {
     union {
         childAdded @0 :ChildAddedChange;
         childRemoved @1 :ChildRemovedChange;
-        stateChanged @2 :StateChange;
+        stateChanged @2 :AccessibilityStateChange;
         boundsChanged @3 :BoundsChange;
         nameChanged @4 :NameChange;
         descriptionChanged @5 :DescriptionChange;
         destroyed @6 :Void;
-        # Audit-7: value changed (for live input fields).
         valueChanged @7 :ValueChange;
-        custom @8 :Data;
+        custom @8 :T.StringMap;
+        unknown @9 :Void;
     }
 }
 
@@ -269,7 +405,7 @@ struct ChildRemovedChange {
     childId @0 :T.AccessNodeId;
 }
 
-struct StateChange {
+struct AccessibilityStateChange {
     previous @0 :AccessibilityState;
     current @1 :AccessibilityState;
 }
@@ -289,13 +425,12 @@ struct DescriptionChange {
     current @1 :Text;
 }
 
-# Audit-7 addition: value change for live input fields.
 struct ValueChange {
     previous @0 :Text;
     current @1 :Text;
 }
 
-# ── Accessibility Events ──────────────────────────────────────────────
+# ── Accessibility Events ─────────────────────────────────────
 
 struct AccessibilityEvent {
     union {
@@ -305,11 +440,9 @@ struct AccessibilityEvent {
         alert @3 :AlertEvent;
         treeChanged @4 :TreeChangedEvent;
         valueChanged @5 :ValueChangedEvent;
-        # Audit-7: text selection changed (for text-input, staticText).
         selectionChanged @6 :SelectionChangedEvent;
-        # Audit-7: scroll position changed.
         scrolled @7 :ScrolledEvent;
-        custom @8 :Data;
+        unknown @8 :T.UnknownEvent;
     }
 }
 
@@ -350,21 +483,19 @@ struct ValueChangedEvent {
     timestamp @3 :T.Timestamp;
 }
 
-# Audit-7 addition: text selection changed.
 struct SelectionChangedEvent {
     nodeId @0 :T.AccessNodeId;
     range @1 :TextRange;
     timestamp @2 :T.Timestamp;
 }
 
-# Audit-7 addition: scroll position changed.
 struct ScrolledEvent {
     nodeId @0 :T.AccessNodeId;
     position @1 :T.Rect;
     timestamp @2 :T.Timestamp;
 }
 
-# ── Roles ─────────────────────────────────────────────────────────────
+# ── Roles ─────────────────────────────────────────────────────
 
 enum AccessibilityRole {
     unknown @0;
@@ -412,12 +543,6 @@ enum AccessibilityRole {
     statusBar @42;
     separator @43;
     group @44;
-    # Audit-7 additions: grid, tooltip, spinButton, tabList, tabPanel,
-    # menuBar, figure, caption, term, definition, feed, note, suggestion,
-    # contentDeletion, contentInsertion, emphasized, strong, mark, s,
-    # subscript, superscript, time, status, timer, marquee, math,
-    # searchBox, meter, option, fontViewer, document, log, liveRegion,
-    # alertdialog, buttonGroup, rowHeader, columnHeader, row @45-78
     grid @45;
     gridCell @46;
     tooltip @47;
@@ -445,7 +570,7 @@ enum AccessibilityRole {
     custom @69;
 }
 
-# ── State ─────────────────────────────────────────────────────────────
+# ── State ─────────────────────────────────────────────────────
 
 struct AccessibilityState {
     focused @0 :Bool;
@@ -465,37 +590,36 @@ struct AccessibilityState {
     modal @14 :Bool;
     required @15 :Bool;
     invalid @16 :Bool;
-    # Audit-7 additions:
-    highlighted @17 :Bool;        # Node is visually highlighted
-    collapsedByUser @18 :Bool;    # User explicitly collapsed this node
-    autoplay @19 :Bool;           # Media is autoplaying
-    expandedByUser @20 :Bool;     # User explicitly expanded this node
-    selectedFromFocus @21 :Bool;  # Selection follows focus
-    hovered @22 :Bool;            # Pointer is hovering over this node
-    active @23 :Bool;             # Node is currently active (pressed button)
-    enlarged @24 :Bool;           # Magnifier is enlarging this node
-    dimmed @25 :Bool;             # Node is visually dimmed (off-screen content)
+    highlighted @17 :Bool;
+    collapsedByUser @18 :Bool;
+    autoplay @19 :Bool;
+    expandedByUser @20 :Bool;
+    selectedFromFocus @21 :Bool;
+    hovered @22 :Bool;
+    active @23 :Bool;
+    enlarged @24 :Bool;
+    dimmed @25 :Bool;
 }
 
-# ── Actions ───────────────────────────────────────────────────────────
+# ── Actions ───────────────────────────────────────────────────
 
 struct AccessibilityAction {
     type @0 :AccessibilityActionType;
     name @1 :Text;
     description @2 :Text;
-    # Parameters for parameterized actions (scroll-to-position, set-value, select-range).
+    # Parameters for parameterized actions (scroll-to-position, set-value,
+    # select-range).
     parameters @3 :T.StringMap;
-    # Audit-9: typed action parameters replacing StringMap.
     typedParams @4 :TypedActionParams;
 }
 
-# Audit-9: typed parameters for parameterized actions.
 struct TypedActionParams {
     union {
         scrollToPoint @0 :ScrollToPointParams;
         setValue @1 :SetValueParams;
         selectRange @2 :SelectRangeParams;
-        custom @3 :Data;
+        custom @3 :T.StringMap;
+        unknown @4 :Void;
     }
 }
 
@@ -532,18 +656,17 @@ enum AccessibilityActionType {
     activate @15;
     showTooltip @16;
     hideTooltip @17;
-    # Audit-7 additions:
-    scrollToPoint @18;       # Scroll to specific coordinates
-    showOnScreen @19;        # Ensure node is visible on screen
-    accessibilityFocus @20;  # Set accessibility-specific focus
-    dismiss @21;             # Dismiss popup/dialog/notification
-    drag @22;                # Initiate drag operation
-    expand @23;              # Expand collapsed node
-    collapse @24;            # Collapse expanded node
+    scrollToPoint @18;
+    showOnScreen @19;
+    accessibilityFocus @20;
+    dismiss @21;
+    drag @22;
+    expand @23;
+    collapse @24;
     custom @25;
 }
 
-# ── Preferences ───────────────────────────────────────────────────────
+# ── Preferences ──────────────────────────────────────────────
 
 struct AccessibilityPreferences {
     textScale @0 :Float32;
@@ -556,18 +679,17 @@ struct AccessibilityPreferences {
     monoAudio @7 :Bool;
     captionsEnabled @8 :Bool;
     captionStyle @9 :CaptionStyle;
-    # Audit-7 additions:
-    screenMagnifierEnabled @10 :Bool;   # Screen magnifier is active
-    magnifierScale @11 :Float32;        # Magnifier zoom level
-    switchControlEnabled @12 :Bool;     # Switch control is active
-    voiceControlEnabled @13 :Bool;      # Voice control is active
-    reduceWhitePoint @14 :Bool;         # Reduce white point for light sensitivity
-    pointerControlEnabled @15 :Bool;    # Alternative pointer control
-    stickyKeys @16 :Bool;               # Sticky keys for motor impairments
-    slowKeys @17 :Bool;                 # Slow keys (delay before keypress registers)
-    bounceKeys @18 :Bool;               # Bounce keys (reject rapid repeated presses)
-    caretBlinkRate @19 :UInt32;         # Cursor blink rate in ms (0 = no blink)
-    doubleClickDelay @20 :UInt32;       # Double-click detection window in ms
+    screenMagnifierEnabled @10 :Bool;
+    magnifierScale @11 :Float32;
+    switchControlEnabled @12 :Bool;
+    voiceControlEnabled @13 :Bool;
+    reduceWhitePoint @14 :Bool;
+    pointerControlEnabled @15 :Bool;
+    stickyKeys @16 :Bool;
+    slowKeys @17 :Bool;
+    bounceKeys @18 :Bool;
+    caretBlinkRate @19 :UInt32;
+    doubleClickDelay @20 :UInt32;
 }
 
 enum CaptionStyle {
@@ -576,82 +698,4 @@ enum CaptionStyle {
     yellowOnBlack @2;
     yellowOnBlue @3;
     custom @4;
-}
-
-# ── Audit-10: ARIA Properties ────────────────────────────────────────
-# Explicit ARIA property mapping for WAI-ARIA compatibility.
-# Provides label, labelledby, describedby, and role mapping.
-
-struct AriaProperties {
-    # Explicit accessible name (replaces aria-label).
-    label @0 :Text;
-    # Node IDs that provide the accessible name (replaces aria-labelledby).
-    labelledBy @1 :List(T.AccessNodeId);
-    # Node IDs that provide the description (replaces aria-describedby).
-    describedBy @2 :List(T.AccessNodeId);
-    # Additional description from extended descriptions.
-    describedByExtended @3 :List(T.AccessNodeId);
-    # Live region politeness level.
-    live @4 :AriaLive;
-    # Whether the element is atomic (all or nothing for screen readers).
-    atomic @5 :Bool;
-    # Whether the element is busy (still loading).
-    busy @6 :Bool;
-    # Current state of a toggle (pressed, checked).
-    current @7 :AriaCurrent;
-    # Error message reference.
-    errorMessage @8 :T.AccessNodeId;
-    # Whether the element has a popup.
-    hasPopup @9 :AriaHasPopup;
-    # Whether the element is hidden.
-    hidden @10 :Bool;
-    # Invalid state.
-    invalid @11 :AriaInvalid;
-    # Label for the element's controls (replaces aria-controls).
-    controls @12 :List(T.AccessNodeId);
-    # Elements owned by this element (replaces aria-owns).
-    owns @13 :List(T.AccessNodeId);
-    # Relationship type for related elements.
-    relatedElements @14 :List(AriaRelationship);
-}
-
-enum AriaLive {
-    off @0;
-    polite @1;
-    assertive @2;
-    rude @3;
-}
-
-enum AriaCurrent {
-    page @0;
-    step @1;
-    location @2;
-    date @3;
-    time @4;
-    timer @5;
-    true @6;
-}
-
-enum AriaHasPopup {
-    false @0;
-    true @1;
-    menu @2;
-    listbox @3;
-    tree @4;
-    grid @5;
-    dialog @6;
-}
-
-enum AriaInvalid {
-    false @0;
-    true @1;
-    grammar @2;
-    spelling @3;
-}
-
-struct AriaRelationship {
-    # Relationship type (e.g., "related", "group", "flow").
-    type @0 :Text;
-    # Target node IDs for this relationship.
-    targets @1 :List(T.AccessNodeId);
 }
