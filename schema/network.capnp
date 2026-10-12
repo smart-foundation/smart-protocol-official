@@ -65,6 +65,15 @@ using T = import "types.capnp";
 #     a persistent disabled-networking state once survived reboot with
 #     every device reported unmanaged and no contract surface that could
 #     have said so.
+#   - The configuration the command surface proved missing (the route pass
+#     against the original CLI drafts): setInterfaceMtu @76, the
+#     known-network bookkeeping around wifiConnect (forgetWifiNetwork @77,
+#     listKnownWifiNetworks @78, KnownWifiNetwork), the routing table
+#     (getRoutes @79, setRoutes @80, Route), and system proxy
+#     configuration (getProxyConfig @81, setProxyConfig @82, ProxyConfig —
+#     the host's own proxy; web.capnp keeps the fetch-scoped one).
+#     FirewallRule gained hitCount @13 so a rule's counter is measured,
+#     never assumed.
 # ═══════════════════════════════════════════════════════════════════════
 
 interface Network {
@@ -223,6 +232,21 @@ interface Network {
     # freeze 2020s hardware into the contract.
     setRadioEnabled @74 (radio :Text, enabled :Bool) -> T.VoidResult;
     listRadioStates @75 (pagination :T.Pagination) -> (radios :List(RadioState), total :UInt64);
+
+    # ── Configuration the command surface proved missing ──
+    # The host-global and per-interface configuration the shell commands
+    # route to, added by the route pass: an MTU setter, the known-network
+    # bookkeeping around wifiConnect, the routing table, and system proxy
+    # configuration. Doctrine unchanged: plain mutators gated by the held
+    # service reference, open tokens for every vocabulary, pagination on
+    # every list.
+    setInterfaceMtu @76 (interfaceId :T.NetworkInterfaceId, mtu :UInt32) -> T.VoidResult;
+    forgetWifiNetwork @77 (ssid :Text) -> T.VoidResult;
+    listKnownWifiNetworks @78 (pagination :T.Pagination) -> (networks :List(KnownWifiNetwork), total :UInt64);
+    getRoutes @79 (pagination :T.Pagination) -> (routes :List(Route), total :UInt64);
+    setRoutes @80 (interfaceId :T.NetworkInterfaceId, routes :List(Route)) -> T.VoidResult;
+    getProxyConfig @81 () -> (config :ProxyConfig);
+    setProxyConfig @82 (config :ProxyConfig) -> T.VoidResult;
 }
 
 using import "capability.capnp".Capability;
@@ -633,6 +657,48 @@ struct FirewallRule {
     # Rule priority (lower = higher priority).
     priority @11 :UInt32;
     metadata @12 :T.StringMap;
+    # How many packets this rule has matched. A counter is measured by the
+    # host or it is absent — a backend that cannot count reports 0 only
+    # when it knows it is zero, and says so in metadata.
+    hitCount @13 :UInt64;
+}
+
+# A network the host remembers. The bookkeeping half of wifiConnect: what
+# is known, whether it joins automatically, and when it last did. The
+# credential is NOT here — it stays a reference to secret material.
+struct KnownWifiNetwork {
+    ssid @0 :Text;
+    autoConnect @1 :Bool;
+    lastConnected @2 :T.Timestamp;
+    # Security as an open token ("wpa3", "wpa2", "open", or a 2046
+    # scheme nobody has named yet).
+    security @3 :Text;
+    metadata @4 :T.StringMap;
+}
+
+# One entry in the host's routing table. The whole table for an interface
+# is read with getRoutes and replaced with setRoutes — the same shape as
+# the firewall surface, for the same reason: a full-set mutator is honest
+# about being one.
+struct Route {
+    # Destination in CIDR text ("10.0.0.0/8", "0.0.0.0/0" for default).
+    destinationCidr @0 :Text;
+    # Next hop; empty for directly-connected routes.
+    gateway @1 :Text;
+    metric @2 :UInt32;
+    interfaceId @3 :T.NetworkInterfaceId;
+    metadata @4 :T.StringMap;
+}
+
+# System-wide proxy configuration — the host's own proxy, not a fetch
+# override (web.capnp owns the fetch-scoped one). `url` is an open token
+# ("http://host:port", "socks5://host:port", or a scheme that does not
+# exist yet); `bypass` is the open set of destinations that never use it.
+struct ProxyConfig {
+    enabled @0 :Bool;
+    url @1 :Text;
+    bypass @2 :T.StringMap;
+    metadata @3 :T.StringMap;
 }
 
 enum FirewallDirection {
