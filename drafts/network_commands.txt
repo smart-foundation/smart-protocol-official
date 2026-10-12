@@ -1,0 +1,52 @@
+ # ═══ NETWORK (rebuilt) ═══════════════════════════════════════
+ net                                # overview dashboard
+ net ui                             # interactive TUI (mouse + keys)
+ net diagnose                       # guided health check w/ suggestions
+ # interfaces
+ net interfaces                     # list
+ net interface <name>               # detail + rx/tx bars
+ net interface <name> up|down       # admin state
+ net interface <name> mtu <n>       # configure
+ # wifi
+ net scan                           # clickable scan table
+ net wifi pick                      # interactive picker (mouse)
+ net connect "<ssid>" [pass]        # phased progress: scan/auth/dhcp/route
+ net disconnect
+ net wifi known                     # known networks, auto-join order
+ net wifi stats                     # signal history, rate, bssid, roam
+ net forget "<ssid>"                # confirms y/N
+ net wifi on|off
+ # address / dns
+ net ip | net ip4 | net ip6         # local + public + geo
+ net dns                            # servers + resolve time
+ net dns resolve <host>             # A/AAAA/ttl, per-server timing
+ net dns reverse <ip>
+ net dns bench                      # rank servers, one-key switch
+ net dns set <ip>
+ net whois <domain>
+ # diagnostics
+ net ping <host> [--live] [--count n]   # sparkline + histogram summary
+ net traceroute <host>              # hops w/ ASN + reverse names
+ net speed [--server s]             # bars, eta, plan comparison
+ net latency --window 5m            # loss/jitter history
+ # traffic
+ watch net bandwidth                # live dual sparkline chart
+ net usage [--window 5m]            # per-app traffic table w/ share bars
+ net history --window 1h            # hourly chart + events (handoffs…)
+ # connections / ports
+ net ports                          # listening, owner, since
+ net connections [--live] [--sort rate]  # per-conn rates, click=inspect
+ net connections close <id>         # y/N confirm
+ # lan
+ net discover                       # LAN scan, vendor, services, NEW flag
+ net wol <mac>                      # sends + waits for wake
+ net neighbors                      # arp/mdns cache
+ # vpn / proxy / firewall
+ net vpn [connect|disconnect <profile>]
+ net vpn killswitch on|off
+ net proxy [set <url> | off]
+ net firewall [allow|deny <app> inbound|outbound]
+ # profiles / integration
+ net profile <name>                 # apply wifi+vpn+dns+proxy atomically
+ net export > state.net.toml
+ @server1 net …                     # remote parity
