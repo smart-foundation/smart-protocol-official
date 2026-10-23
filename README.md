@@ -1,168 +1,186 @@
 # Smart Protocol
 
-**The system contract for the post-app era.**
+**One contract for every component of a computer — from the first instruction to an agent's last tool call.**
 
-Smart-protocol is 89 Cap'n Proto schemas that define how every component of a computer — kernel, bootloader, drivers, filesystems, display, security, AI — talks to every other component, so that any two implementations of any component interoperate without coordination, forever. The contract is the design; the implementations are disposable. Authority is a reference you hold, gated once at acquisition. Bulk data is a buffer handle, never a copy. And nothing on the wire names today's technology — which is why a backend built in 2046 satisfies the same schema unmodified. One wire format from the kernel's first instruction to an agent's last tool call; six shapes of the same contract (library, CLI, IPC, file, network, script), none of them primary.
+Smart Protocol is the open system contract for the post-app era: **89 Cap'n Proto schemas** that define how a kernel, bootloader, driver, filesystem, display server, network stack, security system, language runtime and intelligence service talk to one another. Implement the contract and your component interoperates with every other implementation of every other component — without a coordination meeting, without a version negotiation by email, and without either side knowing what the other is built from.
+
+The contract is the design. Implementations are disposable. That single sentence is the whole architecture: it is why a compositor that does not exist yet can be written against a schema that predates it, why a kernel written in 2046 satisfies a schema written today, and why the products built on this layer are free to be replaced by better ones without taking the system down with them.
 
 ---
 
-## What is in this repository
+## The short version
 
-```
-schema/      89 .capnp schemas — the contract itself, with the doctrine in every header
-scripts/     validate.py (the E1–E14 gate), check.sh (per-file compile), regenerate.sh
-docs/        SCHEMAS.md (the catalog), TIMELESSNESS.md, MANIFESTO.md
-DESIGN_PRINCIPLES.md   the doctrine, with the validator's rule table
-audit-revamp/ the 2026-10-10 revamp: five batch reports, the verification evidence,
-              and INTEGRATION-REPORT.md (the pass that closed every gap the five left)
-```
+Every computing era leaves behind one durable artifact, and it is never a product. TCP/IP outlived the network operating systems that fought it. HTTP outlived every browser that carried it. SQL outlived every database company that implemented it. POSIX outlived every workstation vendor. The applications were theater; the contract was the stage.
 
-Everything here is checkable. The counts are mechanical, the interface names are parsed, and the gate runs on every change.
+The next era has a property no earlier one had: **the caller of a system is as likely to be an agent as a person.** When that is true, a contract that privileges a human at a keyboard is already obsolete. Smart Protocol is built on the opposite premise — that a human at a CLI and an agent calling over a network hold the same references, pass the same payloads and hit the same gates, because the contract does not know which of them is calling.
 
-## Why it exists
+That makes three things possible that are not possible today:
 
-Applications and operating systems are moats. The durable value of every computing era lives in its contracts — TCP/IP, HTTP, SQL, CSS, POSIX outlived every product that fought them. This repository is the contract layer for the era after apps: the stage everything else is built on. It is not a library, not a daemon, not an OS. It is the agreement that makes all of those replaceable.
+**Every component becomes replaceable.** Swap the kernel, the compositor, the audio server, the filesystem, the init system or the AI backend, and userspace does not notice — because userspace never spoke to an implementation. It spoke to the contract. A second kernel implements 248 lines of schema and no application can tell the difference.
 
-The mechanism of that agreement is refusal. The protocol refuses to name a vendor, refuses to prescribe an algorithm, refuses to inspect a handle, refuses to carry bulk in a message, refuses a second authority path, refuses an enum where a token will do. Each refusal is a backend's freedom to exist without asking permission — and each is checked by a machine, not by a reviewer's memory.
+**An operating system becomes an afternoon.** A bootloader's entire obligation is 24 typed bytes at one well-known address: a Cap'n Proto manifest describing the memory, the kernel menu, the channels and the arguments. No page tables. No physical-address arithmetic. No format knowledge. Everything after that is a schema implemented behind a capability reference.
 
-## The doctrine
+**Intelligence becomes a service like any other.** `ai.capnp` names no architecture, no vendor, no model format and no tokenizer — not as a courtesy, but as a hard gate enforced by the validator. A diffusion engine, a state-space model, a neuro-symbolic solver or a paradigm not yet conceived is a `ModelDescriptor` behind a capability, exactly as a filesystem is.
 
-Six rules, each a mechanism, each enforced by `scripts/validate.py` (rules E1–E14):
+The full argument is in [`docs/VISION.md`](docs/VISION.md). The doctrine is in [`DESIGN_PRINCIPLES.md`](DESIGN_PRINCIPLES.md).
 
-1. **The contract is the design; implementations are disposable.** The Agnostic Test: external contract (what components exchange) goes in the protocol; internal implementation (how a component works) stays inside it. The revamp deleted a kernel schema from 881 lines to 248 on this criterion alone — scheduler introspection, fork flags, kernel swapping and six interfaces nothing could call, all gone.
-2. **Timelessness is a negative constraint.** You cannot enumerate the future; you can forbid what may never appear. Zero enums in `ai.capnp` (a hard gate, E1). Open tokens instead of lists. Ordinal permanence. Every event union terminates in `unknown @N :T.UnknownEvent` — 153 arms across 47 schemas.
-3. **Authority is capability.** Holding a reference *is* permission. One gate at acquisition: a `Capability` parameter on a root accessor that returns a service; nothing but plain requests behind it. Attenuation, transfer and revocation live in exactly one file — `capability.capnp`. The revamp deleted every second authority grammar: role strings, ACLs, per-method tokens, authority-as-text. The only hardcoded capability in the system is handle 1, `KernelService`, placed by the kernel before entering userspace.
-4. **Zero-cost is a rule, not a slogan.** `T.DataHandle` or it is a copy: the union is inline `Data` for small payloads, a `BufferId` reference for large. Validator rules E2/E10 reject bulk payloads outside it. 353 field and parameter positions in the tree are typed `T.DataHandle`, and that number is counted from the schemas, not remembered.
-5. **Opacity.** Handles are not parsed. `ProcessId`, `BufferId`, `Capability.id` are opaque; the backend decides the backing, the protocol never inspects it. Lifecycle is one canonical set (`T.ExecutionState`) — no POSIX afterlife anywhere.
-6. **The Swap Test.** Swap the kernel, compositor, audio server, filesystem or init system and the protocol still runs. If a swap breaks the protocol, the protocol leaked implementation — and the leak is a bug.
+---
 
-## What it replaces
+## What this repository is — and is not
 
-| Legacy surface | Replacement | Mechanism |
+| It is | It is not |
+|---|---|
+| A contract: the interfaces two components exchange | A library, a framework or an SDK |
+| A specification with a machine-checked gate | A standards body or a committee |
+| The layer every implementation is interchangeable across | An operating system |
+| MIT OR Apache-2.0, free to implement | A product with a licence fee or a certification tax |
+
+There are no adopters to recruit, because a contract does not need permission to be correct. There is no partner programme and no vendor lock. The schema is the offer: read it, implement it, and your component joins a system that assumes nothing about how you built it.
+
+---
+
+## The mechanism: seven refusals
+
+A contract's power is what it forbids, not what it enumerates. Every refusal below is a freedom for a backend that does not exist yet. Where a rule exists, `scripts/validate.py` enforces it; where none does, review does — and the gap is stated rather than hidden.
+
+| The contract refuses | Because | Rule |
 |---|---|---|
-| POSIX syscall surface | `kernel.capnp` / `process.capnp` / `signal.capnp` | Typed contracts: `spawn`, `resolveService`, typed signal kinds — no POSIX numbers, no uid/gid model, no `zombie` state. E9 (platform nouns) is 0 tree-wide. |
-| D-Bus service sprawl | `discovery.capnp` + `capability.capnp` | One registry gated at acquisition; authority is the reference you hold, not a bus name plus a policy file. |
-| Wayland/X11 wire protocols | `compositor.capnp` | One `CompositorSession`, one commit path: buffer by `T.BufferId`, fence by a typed handle, damage as geometry. The backend's display protocol is internal. |
-| gRPC/protobuf sprawl | One wire format | Cap'n Proto everywhere, zero-copy, six equal shapes. An agent calling over the network has exactly the power of a human at the CLI. |
-| Vendor AI glue | `ai.capnp` | Zero enums; no architecture, vendor or format named; one `Artifact` (mime type + `T.DataHandle`) carries every modality. Any paradigm plugs in without a schema edit. |
+| To name a vendor, platform or POSIX noun in a required position | The word for a Linux fd is not a system-contract word | E9 |
+| To prescribe an algorithm or a schedule | The backend chooses how it works; the contract says what crosses the boundary | — |
+| To freeze today's technology into an enum | An enum is a permanent commitment to a paradigm that will age | E1, E8 |
+| To carry bulk data inside a message | A copy is a cost the contract has no right to impose | E2, E10 |
+| To accept a second authority grammar | Two permission paths must agree forever, and one is never revocable | E11 |
+| To inspect an opaque handle | `ProcessId`, `BufferId` and `Capability.id` are the backend's business | — |
+| To ship a union without an `unknown` arm | A producer must be able to forward a kind the contract never foresaw | E6 |
+
+Holding a capability *is* the permission. Discovery is ungated so that nothing deadlocks before it can act; every state-changing accessor takes a `Capability` once, at acquisition, and nothing behind it takes a token. Attenuation, transfer and revocation exist in exactly one file. Authority amplifies nowhere else.
+
+---
+
+## How a system runs on it
+
+```
+  bootloader            kernel                 userspace
+  ──────────            ──────                 ─────────
+  24 bytes     ──▶   BootManifest    ──▶   init  ──▶  services
+  at a fixed         (Cap'n Proto)          │
+  address                                   ├─ Discovery.register
+                                            ├─ CapabilityService.issue
+                                            └─ every domain schema,
+                                               behind a capability
+```
+
+The bootloader places one `HandoffPointer` — magic, address, size — and its job is done. The kernel reads a declarative `BootManifest` and places `KernelService` at capability handle 1, the only hardcoded capability in the system. Init brings up the service plane in dependency order. From that moment the system is a graph of capability references, and every edge in the graph is a schema in this repository.
+
+`docs/ARCHITECTURE.md` walks the whole path, interface by interface.
+
+---
 
 ## Six shapes, none primary
 
 ```
-LIBRARY          CLI               IPC               FILE
-link & call      `smart` command   capnp over        declarative config
-                                  shared memory     `smart apply`
+LIBRARY          CLI                IPC                 FILE
+link & call      `smart` command    capnp over          declarative config
+                                    shared memory       `smart apply`
 
 NETWORK          SCRIPT
-TCP/WebSocket    `.smart` script
+TCP / WebSocket  `.smart` script
 remote
 ```
 
-A human typing a command and an agent calling over the network hold the same references, pass the same handles, and hit the same gates. The shapes are equal because the contract does not know which shape is calling.
+The six shapes are equal by construction because the contract cannot tell them apart. A shell command is not a human concession bolted onto a machine API, and the network is not a back door around the UI. They are the same method ordinals, the same types, the same capability references, reached through different doors.
 
-## Current state — honestly
+---
 
-- **89 schemas**, 303 interfaces, ~49,500 lines. All compile (`capnp compile`, 89/89). The validator gate is green: `python3 scripts/validate.py` exits 0, with E1, E2, E4, E6, E9, E12, E13 and E14 at zero tree-wide — including E12, one canonical home per type name, which the 2026-10-10 integration pass closed by resolving all 36 cross-file duplicates. The remaining E7/E8/E10/E11 REPORT residuals are enumerated rule by rule in `audit-revamp/INTEGRATION-REPORT.md`.
-- **Reference implementation: the Naledzi microkernel.** A working Rust microkernel that boots and speaks this contract — `KernelService` at capability handle 1, userspace services exchanging Cap'n Proto messages over shared memory. This is not a port plan; the live working tree feeds the canonical schemas: its `ShellService` (45 methods) is imported verbatim into `shell.capnp`, its vendor-agnostic GPU contract is `gpu.capnp`, its console byte path and boot configuration plane are imported as-is.
-- **In progress:** the CLI and library backends. This repository is the contract, the doctrine, and the gate — the runtimes that speak it are being built, and every product the company ships will speak this contract.
-- **The 2026-10-10 revamp** rewrote all 89 schemas against the doctrine: four files deleted or absorbed (`ipc-message`, `filesystem`, `surface`, `textinput`), one imported (`gpu`), every technology museum demolished, every second authority grammar removed. The evidence is in `audit-revamp/`, batch by batch, with the verification records and the integration report that closed what they left open.
+## What it replaces
 
-## How the contract stays forever
+This is not a proposal in the abstract. It is a concrete replacement for surfaces that exist today and that each solve one boundary for one platform.
 
-1. **Ordinal stability** — once published, a method's ordinal is permanent; new capabilities take fresh ordinals.
-2. **Additive only** — new methods, types and fields are minor versions. Breaking means a new schema ID.
-3. **The pre-release carve-out** — nothing external consumes these schemas yet, so ordinals may still be renumbered and deletion preferred over deprecation. From first release, the permanent rules bind in full.
-4. **Forward compatibility** — every event union ends in `unknown @N :T.UnknownEvent { typeId, payload }`, so a producer can forward a kind it did not foresee and a consumer routes it without breaking.
-5. **ABI negotiation** — `abi.capnp` lets two parties declare what they speak and agree on the intersection before either commits to a call.
-6. **The gate** — E1–E14 run on every change. A schema that adds a finding must justify it in its own header. The gate is green or the change does not land.
+| Legacy surface | Replacement | The mechanism that changes |
+|---|---|---|
+| The POSIX syscall table | `kernel.capnp`, `process.capnp`, `signal.capnp` | Typed contracts instead of numbered calls: no uid/gid model, no `zombie` state, no inherited file-descriptor table |
+| D-Bus service sprawl | `discovery.capnp` + `capability.capnp` | One registry; authority is the reference you hold, not a bus name plus a policy file |
+| Wayland / X11 wire protocols | `compositor.capnp` | One commit path: buffer by `T.BufferId`, fence by typed handle, damage as geometry |
+| gRPC / protobuf service sprawl | One wire format, six shapes | Zero-copy payloads and capabilities in the RPC layer; an agent on the network has exactly the power of a human at the CLI |
+| Vendor AI glue | `ai.capnp` | Zero enums; one `Artifact` for every modality; any paradigm plugs in without a schema edit |
+| Per-service permission models | `capability.capnp` | Issue, attenuate, transfer and revoke in exactly one file |
 
-## The gate: what is mechanically enforced
+The point is not that those systems were badly designed. It is that each of them specified one boundary for one platform, and a computer is a system of boundaries.
 
-`scripts/validate.py` parses the schemas with a real parser — comments stripped first, so a phrase in prose is not evidence — and enforces:
+---
 
-| Rule | Enforces |
+## Measured status
+
+Every number below is counted from the tree by `scripts/docstats.py`; every rule result is produced by `scripts/validate.py`. Neither is written by hand, and both can be run in the checkout you are reading.
+
+| Property | Today |
 |---|---|
-| E1 | `ai.capnp` declares zero enums |
-| E2 | `ai.capnp` has no bulk lists — payload is `T.DataHandle` |
-| E3 | `Capability` appears only on `AI` accessors |
-| E4 | Every interface is reachable |
-| E5 | Every stream's `pull` returns a structural terminator |
-| E6 | Every union has an `unknown`/`custom` variant |
-| E7 | Every struct has an open extension point (value structs exempt) |
-| E8 | Every enum's `@0` is a neutral sentinel |
-| E9 | No platform, vendor or POSIX noun in a required position |
-| E10 | No bulk payload outside `T.DataHandle` |
-| E11 | Authority is the reference — no per-method token, no authority-by-string |
-| E12 | One canonical home per type name |
-| E13 | Interface method ordinals sequential and declared in order |
-| E14 | Every interface reachable; no declared type unreferenced |
+| Schemas | 89 |
+| Lines of schema | 49,655 |
+| Interfaces | 303 |
+| Methods | 3,154 |
+| Structs / enums | 2,565 / 461 |
+| Bulk payload positions typed `T.DataHandle` | 421 |
+| Open-vocabulary positions typed `T.StringMap` | 744 |
+| Forward-compatible `unknown` arms carrying `T.UnknownEvent` | 154, across 49 schemas |
+| Capability-gated accessors | 35 |
+| Compile (`capnp compile`, 89/89) | clean |
+| Validator gate | exit 0 |
 
-E1–E5 are hard ERRORs for the gold standard and REPORT elsewhere; E6–E14 are measured tree-wide. Current run: 89 schemas parsed, exit 0, E1/E2/E4/E9 at zero across the whole tree.
+The gate's enforced rules — E1 (zero enums in `ai.capnp`), E2 (no bulk in `ai.capnp`), E4 and E14 (every interface reachable), E6 (every union extensible), E9 (no platform nouns in required positions), E13 (sequential ordinals) — are all at zero tree-wide. The tree is pre-release, and the remaining REPORT residuals are published rather than hidden: E7 716, E8 267, E10 59, E11 6, E12 1. [`docs/VERIFICATION.md`](docs/VERIFICATION.md) explains what each one means, why the gate still exits 0, and how the count is driven to zero.
 
-## What a schema looks like
+**Running today:** the contract, the validator, the generator scripts, and the reference implementation — the **Naledzi microkernel** — which boots and speaks this contract: `KernelService` at capability handle 1, services exchanging Cap'n Proto over shared memory, init spawning from the boot manifest it was handed. The working OS is not a port target; it feeds the canonical schemas. Its `ShellService` (45 methods) was imported into `shell.capnp`, its vendor-agnostic GPU contract became `gpu.capnp`, and its console byte path and boot configuration plane were imported as-is.
 
-Every schema opens with its argument, not its advertisement — what the contract is, who consumes it, what is deliberately opaque, what was deleted and why. The shape is identical tree-wide:
+**In progress:** the CLI and library backends. They are named here as in-progress because an unlabelled ambition is a lie with a deadline.
 
-```capnp
-interface AI {                                                     # schema/ai.capnp
-    handshake @0 () -> (info :T.Version,
-                        contentTypes :List(T.MimeType),
-                        models :List(ModelDescriptor));            # ungated
-    discover  @1 (model :ModelId) -> (descriptor :ModelDescriptor);
+---
 
-    models    @2 (authority :Capability) -> (service :ModelService);   # gated once
-    inference @3 (authority :Capability) -> (service :InferenceService);
-}
-```
+## Read it in three files
 
-That is the whole authority model, and it is the same in every schema: ungated discovery, one gate at acquisition, plain requests behind it.
+1. **[`schema/ai.capnp`](schema/ai.capnp)** — the doctrine in miniature. Zero enums, one `Artifact` carrying any modality through `T.DataHandle`, discovery ungated, every operation behind a gated accessor.
+2. **[`schema/capability.capnp`](schema/capability.capnp)** — authority. Issue, attenuate, transfer, revoke, delegation chains. Nothing else in the tree implements permission.
+3. **[`schema/boot.capnp`](schema/boot.capnp)** — the handoff. Twenty-four bytes resolving to a declarative manifest.
 
-## Quick start — the mental model
-
-Read three files, in this order, and you have the whole design:
-
-1. **`schema/ai.capnp`** — the doctrine in miniature. Zero enums; every bulk payload a `T.DataHandle`; discovery ungated, everything else gated once at acquisition. If a schema in this tree ever confuses you, this file is the answer to "what would the contract do?"
-2. **`schema/capability.capnp`** — authority. Issuance, attenuation, transfer, revocation, delegation chains. Nothing else in the tree implements permission, because nothing else needs to.
-3. **`schema/boot.capnp`** — the handoff. A 24-byte pointer at a well-known address resolves to a declarative Cap'n Proto manifest. No memory math, no format knowledge, no handler tables. This is how small a system contract can be.
-
-Then run the gate (exits 0 on success):
+Then run the gate:
 
 ```bash
-python3 scripts/validate.py
-# Schemas parsed: 89 (88 besides ai.capnp)
-# E1 enums in ai.capnp            : 0
-# E2 bulk lists in ai.capnp       : 0
-# E4 interfaces unreachable (all) : 0 reported
-# E6 hits (all schemas)        : 0
-# E9 hits (all schemas)        : 0
-# E10 hits (all schemas)        : 59
-# E12 hits (all schemas)        : 1
-# E13 hits (all schemas)        : 0
-# E14 hits (all schemas)        : 0
-# --- REPORTED (not blocking, 1049) ---
-# (full list of E7/E8/E10/E11 residuals; exit status 0)
+python3 scripts/docstats.py    # the inventory above, counted from schema/
+python3 scripts/validate.py    # E1–E14; must exit 0
 ```
 
-Implementing a backend? See `docs/implementer.md` (5-step process, per-language notes, honesty model).
+---
 
-The subscription pattern is worth one look as well: every live stream is a reference with a bounded `pull` — no raw subscription ids, no offset-into-a-live-stream arithmetic, no producer that can outrun its consumer. And the error model: anything that can fail returns a union carrying `T.Error`, so a missing file, a failed fetch and a locked SIM are routable, not silent.
+## Repository map
 
-The doctrine documents (`DESIGN_PRINCIPLES.md` → `docs/TIMELESSNESS.md` → `docs/MANIFESTO.md`), the full schema catalog (`docs/SCHEMAS.md`) and the implementer guide (`docs/implementer.md`) sit alongside. Validator green. Every claim in this README is checkable against the files.
+```
+schema/                   the contract — 89 .capnp files, each header an argument
+scripts/validate.py       the E1–E14 gate, with a real parser (comments stripped)
+scripts/docstats.py       the counter behind every number in these documents
+scripts/check.sh          per-file compile check
+scripts/regenerate.sh     Rust binding generation
+docs/                     VISION, ARCHITECTURE, MANIFESTO, TIMELESSNESS, SCHEMAS,
+                          VERIFICATION, implementer, CONTRIBUTING, GLOSSARY, FAQ
+DESIGN_PRINCIPLES.md      the constitution: tests, anti-patterns, rule table
+BINDING_CONVENTIONS.md    what a language binding author must get right
+audit-revamp/             the 2026-10-10 rewrite, batch by batch, with evidence
+```
 
-## Build your own OS on this
+Start at [`docs/README.md`](docs/README.md) for a reading path by role.
 
-The contract is free to implement. That is the point of a contract.
+---
 
-You need exactly one thing to start: place 24 typed bytes at one well-known address. The bootloader's entire job is a Cap'n Proto message describing what it handed you — memory regions, the kernel menu, channels, arguments. No HHDM, no page tables, no format knowledge. Read the manifest, take the kernel, call `KernelService` at capability handle 1. Everything after that — services, filesystems, display, security, intelligence — is a schema you implement behind a capability reference, and any two implementations swap without userspace noticing.
+## Build on it
 
-Bring your own kernel: microkernel, monolithic, exokernel, runtime. Bring your own compositor, your own filesystem, your own AI backend. The contract asks only that you exchange what the schemas declare, keep your handles opaque, and never freeze today's nouns into tomorrow's wire. If you can satisfy `ai.capnp`, your intelligence system is future-proof; if you can satisfy `boot.capnp`, your afternoon handoff is an operating system.
+The contract is free to implement — that is the point of a contract. You need one thing to start: place 24 typed bytes at one well-known address, read the manifest, take the kernel, call `KernelService` at capability handle 1. Everything after that is a schema you implement behind a capability reference.
 
-The stage is built. Bring your theater.
+Bring your own kernel — microkernel, monolithic, exokernel, unikernel, actor runtime. Bring your own compositor, filesystem, audio server and AI backend. The contract asks only three things: exchange what the schemas declare, keep your handles opaque, and never freeze today's nouns into tomorrow's wire.
 
-Implementation guide: `docs/implementer.md` (minimum viable implementation, 5-step process, per-language notes).
+If you can satisfy `ai.capnp`, your intelligence system is future-proof. If you can satisfy `boot.capnp`, your afternoon handoff is an operating system.
+
+See [`docs/implementer.md`](docs/implementer.md) for the five-step implementation path and per-language notes.
 
 ---
 
 ## License
 
-MIT OR Apache-2.0 (your choice)
+MIT OR Apache-2.0, at your option.

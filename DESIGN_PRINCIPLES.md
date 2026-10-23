@@ -1,421 +1,397 @@
-# smart-protocol Design Principles
+# Smart Protocol — design principles
 
-> Version 1.0 · Established 2026-07-01
-> Amended 2026-10-10 — pre-release carve-out for schema evolution, the
-> authority-reference precedent, and the validator's tree-wide gate (E1–E14).
-> Purpose: Governs all schema design, evolution, and review for smart-protocol.
+> Version 2.0 · Established 2026-07-01 · Rewritten 2026-10-23
+> Status: governing document. It decides what a schema may contain, how it may
+> evolve, and how a reviewer judges a change.
+
+A contract outlives the products built on it by design, so its design rules have
+to be stricter than a product's. This document is those rules. It is organised
+around the two tests that decide every line of schema, the anti-patterns those
+tests exist to catch, the template a schema follows, and the machine that checks
+what a reviewer cannot.
 
 ---
 
-## Table of Contents
+## Table of contents
 
-1. [The Agnostic/Timeless Test](#1-the-agnostictimeless-test)
+1. [The Agnostic / Timeless Test](#1-the-agnostic--timeless-test)
 2. [The Opacity Principle](#2-the-opacity-principle)
-3. [Anti-Patterns Found in Existing Schemas](#3-anti-patterns-found-in-existing-schemas)
-4. [Schema Template](#4-schema-template)
+3. [The anti-pattern catalogue](#3-the-anti-pattern-catalogue)
+4. [The schema template](#4-the-schema-template)
 5. [The Swap Test](#5-the-swap-test)
-6. [Appendix: Schema-by-Schema Verdicts](#6-appendix-schema-by-schema-verdicts)
+6. [How a change is judged](#6-how-a-change-is-judged)
 
 ---
 
-## 1. The Agnostic/Timeless Test
+## 1. The Agnostic / Timeless Test
 
-Every proposed addition to smart-protocol must pass this test before it is accepted.
+Every proposed addition must answer one question before it is argued on merit:
 
-### The Question
+> **Is this an EXTERNAL contract — what two components exchange in order to
+> interoperate — or an INTERNAL implementation — how a component works?**
 
-**"Is this an EXTERNAL contract (how components interoperate) or an INTERNAL implementation (how a component works)?"**
+External goes in the protocol. Internal stays inside the component.
 
-If it is an external contract, it belongs in the protocol. If it is an internal implementation, it belongs inside the component.
-
-### Decision Framework
+### Decision procedure
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │  Does this describe HOW a component  │
-                    │  implements its behavior internally?  │
-                    └──────────────┬──────────────────────┘
-                                   │
-                          ┌────────┴────────┐
-                          │                 │
-                         YES                NO
-                          │                 │
-                          ▼                 ▼
-                  ┌──────────────┐  ┌──────────────────────┐
-                  │  KEEPS OUT   │  │  Does this describe  │
-                  │  (not in     │  │  WHAT two components  │
-                  │   protocol)  │  │  exchange to interop? │
-                  └──────────────┘  └──────────┬───────────┘
-                                               │
-                                      ┌────────┴────────┐
-                                      │                 │
-                                     YES                NO
-                                      │                 │
-                                      ▼                 ▼
-                              ┌──────────────┐  ┌──────────────────┐
-                              │  KEEPS IN    │  │  Am I sure?       │
-                              │  (protocol   │  │  Re-evaluate with │
-                              │   contract)  │  │  the Swap Test.   │
-                              └──────────────┘  └──────────────────┘
+Does it describe HOW a component implements its behaviour?
+        │
+        ├── yes ──▶  KEEP OUT. It is the component's business.
+        │
+        └── no ──▶  Does it describe WHAT two components exchange to interop?
+                        │
+                        ├── yes ──▶  KEEP IN. It is a contract.
+                        │
+                        └── no ──▶  Re-evaluate with the Swap Test (§5).
+                                    If you cannot name the two parties and
+                                    what each must do with it, it is not a
+                                    contract yet.
 ```
 
-### Clear Examples
+### Clear examples
 
-| Proposal | Verdict | Reasoning |
-|----------|---------|-----------|
-| "Add a scheduler interface" | **KEEPS OUT** | Whether the kernel uses CFS, deadline scheduling, actor model, or dataflow is internal. The protocol defines what tasks exist and their state, not how they are scheduled. |
-| "Add page table management" | **KEEPS OUT** | Page table structure is a kernel-internal memory management detail. The protocol exposes memory regions and permissions, not PT hierarchy. |
-| "Add DNS resolution service" | **KEEPS IN** | Any component needing network access must resolve hostnames. This is an external contract: "resolve this name, get an address." How the resolver works (cached, forwarded, distributed) is internal. |
-| "Add socket API" | **KEEPS IN** | Creating network connections is a cross-cutting concern. How the kernel implements sockets (TCP stack, io_uring, capability-based) is internal. The contract is: "open a connection to this endpoint." |
-| "Add interrupt dispatch" | **KEEPS OUT** | How the kernel routes interrupts to handlers is internal. HAL describes the affordances (subscribe to IRQ vector), not the dispatch mechanism. |
-| "Add process group/session management" | **KEEPS IN** | Grouping processes for signal delivery and lifecycle control is an external contract. How the kernel tracks process groups internally is irrelevant. |
-| "Add quota/resource limits" | **KEEPS IN** | Declaring "this service gets 512MB max" is an external contract between the resource consumer and the resource provider. How enforcement happens is internal. |
-| "Add audit logging service" | **KEEPS IN** | Recording who did what to which resource is a cross-cutting concern that multiple components need. Where logs are stored is internal. |
-| "Add CFS scheduler tuning knobs" | **KEEPS OUT** | This is Linux-specific and kernel-internal. |
-| "Add inotify watch limits" | **KEEPS OUT** | inotify is a Linux implementation detail. The protocol defines file watching as a contract. |
+| Proposal | Verdict | Why |
+|---|---|---|
+| "Resolve this hostname and return the result or a typed error" | Contract | It names an exchange, not a resolver library |
+| "Use systemd-resolved and its D-Bus interface" | Implementation | It names a specific process and its internal protocol |
+| "Declare that this service receives 512 MB" | Contract | The grant crosses a boundary |
+| "Create a cgroup with `memory.max=512M`" | Implementation | Linux's mechanism, not the contract's meaning |
+| "Send these audio frames to this device" | Contract | Two parties, an observable exchange |
+| "Open a PulseAudio stream with this sample spec" | Implementation | A specific server's API |
+| "Allocate GPU memory of this size and return a handle" | Contract | Affordance, not mechanism |
+| "Call `DRM_IOCTL_GEM_CREATE`" | Implementation | A kernel driver's ioctl number |
 
-### Edge Cases and Resolution
+### Edge cases
 
-**Edge Case 1: "Should we expose thread scheduling priority?"**
+**"But the contract has to say *something* about it."** Then say the smallest
+thing that both parties must agree on, and stop. "This operation may take an
+unbounded time and can be cancelled" is a contract. "Cancel within 100 ms" is a
+performance target for one backend.
 
-The protocol should define *what priority means to the caller* (e.g., "this task is latency-critical" vs "this task is background"), NOT how the kernel maps that to scheduling classes. The current `priorityHint @6 :Int8` in `SpawnRequest` is correct: it is a hint, not an instruction.
+**"But every implementation will need this."** Then every implementation is
+doing something the contract has not expressed yet — but check first whether the
+need is for agreement or for convenience. Convenience fields accumulate in
+schemas and never leave.
 
-Resolution: Accept if it describes intent. Reject if it describes mechanism.
+**"But without it, the consumer cannot optimise."** Optimisation is the
+backend's business. If a consumer must adapt to a provider's internals to be
+fast, the boundary is in the wrong place.
 
-**Edge Case 2: "Should we define memory page sizes?"**
+**"It is only a hint."** Hints are still fields, fields are still ordinals, and
+ordinals are permanent. A hint that everyone ignores is dead weight; a hint that
+one backend honours is implementation leakage with a schema ID.
 
-No. Page size is kernel-internal. The protocol defines "map this region with these permissions" and the kernel picks page sizes, alignment, and backing.
+### The five litmus questions
 
-Resolution: Reject. Memory region specs describe intent (base, length, perms), not implementation (page size, TLB entries, cache lines).
+Answer all five in the pull request:
 
-**Edge Case 3: "Should we define network packet formats?"**
+1. Can two completely different implementations satisfy this?
+2. Does a consumer need this in order to interoperate with a provider?
+3. Does this data cross a trust boundary?
+4. Will this still make sense on different hardware in ten years?
+5. If the implementation is swapped, does the contract still hold?
 
-No. Packet framing is internal to the network stack. The protocol defines "send this data to this endpoint" and "receive data from this endpoint."
+Any "no" means the proposal belongs inside a component.
 
-Resolution: Reject. The contract is the message, not the wire format.
+### Timelessness, the second axis
 
-**Edge Case 4: "Should we define how capabilities are cryptographically signed?"**
+The Agnostic Test asks *where* something belongs. Timelessness asks *how it
+should be expressed* once it does belong. The rule is negative:
 
-No. The protocol defines what a capability grants (operations, target, constraints). How it is signed, stored, and verified is backend-specific. The `proof @3 :Data` field in `Capability.Audit` is deliberately opaque.
+> You cannot enumerate the future. You can forbid what may never appear.
 
-Resolution: Accept the contract. Reject the mechanism.
+Concretely, in this tree:
 
-**Edge Case 5: "Should we define how the init system resolves dependencies?"**
+- no vendor, platform or POSIX noun in a required position (E9);
+- no enum in `ai.capnp`, and no enum whose `@0` is a paradigm value (E1, E8);
+- technology-specific values as open tokens, never as closed lists;
+- every union extensible (E6);
+- bulk through `T.DataHandle` (E2, E10).
 
-No. Whether init uses a dependency graph, a declarative order, or parallel boot with retry is internal. The protocol defines what services exist, their state, and lifecycle events.
-
-Resolution: Reject the algorithm. Accept the observable state.
-
-### The Litmus Test Questions
-
-Before adding anything to smart-protocol, answer these:
-
-1. **Can two completely different implementations satisfy this contract?** If no, it is too specific.
-2. **Does a consumer need this to interoperate with a provider?** If no, it is not a protocol concern.
-3. **Is this describing data that crosses a trust boundary?** If no, it belongs inside the component.
-4. **Will this still make sense in 10 years on different hardware?** If no, it is an implementation detail.
-5. **Would swapping the underlying implementation break the contract?** If yes, the contract leaks implementation.
+The full argument, including worked examples from the revamp, is in
+[`docs/TIMELESSNESS.md`](docs/TIMELESSNESS.md).
 
 ---
 
 ## 2. The Opacity Principle
 
-### The Rule
-
-**A type should be opaque (UInt64, Data, Text) when its internal representation varies across implementations and consumers never need to inspect its structure.**
-
-**A type should be structured (struct with named fields) when consumers must read or write specific fields to interoperate.**
-
-### The Decision Tree
+> Push every type as far toward opaque as the contract can afford.
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │  Do consumers need to inspect the   │
-                    │  internal structure of this value?   │
-                    └──────────────┬──────────────────────┘
-                                   │
-                          ┌────────┴────────┐
-                          │                 │
-                         YES                NO
-                          │                 │
-                          ▼                 ▼
-                  ┌──────────────┐  ┌──────────────────────┐
-                  │  STRUCTURED  │  │  Could the internal  │
-                  │  (named      │  │  representation vary  │
-                  │   fields)    │  │  across backends?     │
-                  └──────────────┘  └──────────┬───────────┘
-                                               │
-                                      ┌────────┴────────┐
-                                      │                 │
-                                     YES                NO
-                                      │                 │
-                                      ▼                 ▼
-                              ┌──────────────┐  ┌──────────────┐
-                              │  OPAQUE      │  │  STRUCTURED  │
-                              │  (UInt64,    │  │  (fixed      │
-                              │   Data,Text) │  │   fields)    │
-                              └──────────────┘  └──────────────┘
+OPAQUE ─────────────────────────────────────────────▶ STRUCTURED
+UInt64    Data      Text       Enum      Struct with    Struct with
+ (id)     (bytes)   (string)  (closed)   fixed fields   variable fields
+   │        │          │          │            │              │
+ProcessId  CapId    DeviceName  ErrorCode   Rect, Vec2    StringMap
+BufferId   proof    LayoutId    Severity    BatteryState  metadata
+WindowId            Tag                      AudioFormat
 ```
 
-### Application to 10 Existing Types
+### The rule
 
-| Type | Current Form | Verdict | Rationale |
-|------|-------------|---------|-----------|
-| **ProcessId** | `struct { id @0 :UInt64; }` | ✅ **Correct (opaque)** | Different kernels have different process models. A UInt64 is sufficient for consumers to reference a process. The struct wrapper adds type safety without leaking internals. |
-| **FileHandle** | `struct { handle @0 :UInt64; path @1 :Text; mode @2 :OpenMode; }` | ⚠️ **Partially wrong** | The `handle` field is correct (opaque). But `path` and `mode` leak implementation details: a capability-based system may not have path-based handles; a microkernel may not expose mode at handle creation. **Fix:** Keep handle opaque. Move path/mode to a separate `FileInfo` query. |
-| **Capability.id** | `@0 :Data` | ✅ **Correct (opaque)** | Content-addressed identifier. Backend decides format (ed25519, HMAC, UUID). Consumers never parse it. |
-| **AudioDevice.id** | `@0 :Text` | ⚠️ **Should be opaque UInt64 or Data** | Text IDs are fragile (strings change across versions). An opaque numeric or byte identifier is more robust. The `name` field already serves human-readable identification. |
-| **InputDevice.id** | `@0 :UInt64` | ✅ **Correct (opaque)** | Referenced by number, never inspected. |
-| **TunnelHandle** | `struct { id @0 :UInt64; subject @1 :Text; }` | ⚠️ **Subject should be separate** | The `id` is correctly opaque. But `subject` leaks routing internals. The subject is part of the tunnel specification, not the handle. A handle should be a pure reference. **Fix:** Remove `subject` from handle; it belongs in `TunnelSpec` and `TunnelInfo`. |
-| **WindowId** | `struct { id @0 :UInt64; }` | ✅ **Correct (opaque)** | Window identity is backend-specific. Consumers only need to reference windows. |
-| **BufferId** | `struct { id @0 :UInt64; }` | ✅ **Correct (opaque)** | Buffer identity is backend-specific. |
-| **NotificationId** | `struct { id @0 :UInt64; }` | ✅ **Correct (opaque)** | |
-| **NodeId** | `struct { id @0 :UInt64; }` | ✅ **Correct (opaque)** | Node identity in a distributed system is inherently opaque. |
+Make a type structured **only when a consumer must read or write specific
+fields in order to interoperate.** Otherwise use an opaque value — an integer
+identity, a byte string, or text — and let the backend decide what it means.
 
-### Additional Types to Fix
+Every field you structure is a promise about how a component works. Every such
+promise is implementation leaking into a contract that must outlive it.
 
-| Type | Current Form | Issue | Fix |
-|------|-------------|-------|-----|
-| **FilePermissions** | `struct { owner @0 :UInt8; group @1 :UInt8; other @2 :UInt8; }` | POSIX-specific. Capability-based systems don't have owner/group/other. | Replace with `Data` (opaque capability tokens) or a `List(Permission)` enum (read, write, execute, administer). |
-| **ProcessState** | `enum { running, sleeping, waiting, stopped, zombie, defunct }` | POSIX-specific. A capability-based kernel has no "zombie" state. An actor system has no "sleeping" state. | Keep the enum but rename states to be universal: `active`, `blocked`, `suspended`, `terminated`. Remove POSIX-isms. **DONE 2026-10-10:** one canonical `T.ExecutionState` in types.capnp, shared by kernel.capnp, process.capnp and the lifecycle schemas. |
-| **UserInfo.id** | `@0 :UInt32` | Too small for distributed systems. Unix uid is 32-bit. | Use `UInt64` or opaque type. |
-| **DiskUsage** | `struct { total, used, free, percentUsed, mountPoint, filesystem }` | `mountPoint` and `filesystem` are implementation details. | Keep total/used/free. Move mountPoint/filesystem to a separate `MountInfo` query. |
-| **LogSource** | `struct { file, line, function }` | Implementation-specific (assumes compiled languages). | Make opaque: `source @0 :Data` (backend-decided format). |
-
-### The Opacity Spectrum
-
-Types fall on a spectrum from fully opaque to fully structured:
+### Decision procedure
 
 ```
-FULLY OPAQUE                                              FULLY STRUCTURED
-   │                                                              │
-   ▼                                                              ▼
-UInt64    Data    Text        Enum       Struct with    Struct with
-(id)      (bytes) (string)    (有限集)    fixed fields   variable fields
-                                                      (List, union)
-   │         │         │          │              │              │
-   ▼         ▼         ▼          ▼              ▼              ▼
-ProcessId  CapId    DeviceName  OpenMode    Rect, Vec2    StringMap
-WindowId   proof    LayoutId    ErrorCode   BatteryState  Meta
-BufferId                                          AudioFormat
+Must the peer understand the internal layout to interoperate?
+        │
+        ├── no ──▶  OPAQUE.
+        │            Is it an identity?        → a typed id wrapper
+        │            Is it bytes of unknown shape? → Data / T.DataHandle
+        │            Is it a name or a token?  → Text
+        │
+        └── yes ─▶  STRUCTURED, and no further than necessary.
+                     Is the value set closed by mathematics or protocol? → enum
+                     Otherwise                                            → open token
 ```
 
-**Rule of thumb:** Push types as far left (opaque) as possible. Only move right (structured) when consumers demonstrably need to read specific fields for interoperability.
+### What opacity buys
+
+| Opaque type | What the backend may change without a schema edit |
+|---|---|
+| `T.ProcessId`, `T.BufferId`, `T.KeyId`, `T.ServiceId` | Width, allocation strategy, backing store |
+| `T.DataHandle` | Whether a payload is inline or a shared buffer |
+| `T.Capability.id` | The entire capability representation |
+| `T.StringMap` values | Anything named but not yet enumerated |
+| `T.MimeType` | Every format that exists or will exist |
+
+### Where the tree applies it
+
+- **Identifiers** are wrapper structs, never bare integers in a public
+  signature, so no consumer can do arithmetic on a process id.
+- **Handles** are opaque. Nothing in the protocol parses a `BufferId`, and DMA
+  tokens in `buffer.capnp` are opaque bytes rather than per-process numbers.
+- **Payloads** are `T.DataHandle`. 421 positions in the tree use it.
+- **Vocabularies** are tokens. `ServiceDescriptor.category`, a transport, a
+  device format, a media type and a model's architecture are all open strings
+  with published conformance spellings, so a 2046 value is spellable today.
+- **Lifecycle** is one vocabulary, `T.ExecutionState` — including the states a
+  POSIX system would describe in its own words.
+
+### The failure mode opacity prevents
+
+A structured field is a public commitment to a private detail. Once published,
+the detail cannot change: not the width, not the encoding, not the semantics.
+An opaque handle can be re-implemented entirely — a different allocator, a
+different backing store, a different machine — and the wire does not move.
 
 ---
 
-## 3. Anti-Patterns Found in Existing Schemas
+## 3. The anti-pattern catalogue
 
-### Category A: Duplicate/Conflicting Interfaces
+These are the shapes that have actually appeared in this tree, been caught, and
+been deleted. They are listed because a rule is easier to apply when you can
+recognise its violation.
 
-| Schemas | Conflict | Severity | Resolution |
-|---------|----------|----------|------------|
-| `ime.capnp` (Session) vs `textinput.capnp` (TextInput) | Both define IME context management, input method listing, preedit/commit. `ime.capnp` is the newer Session-based design. `textinput.capnp` is the older flat design. | 🔴 High | **DONE 2026-10-10:** `textinput.capnp` deleted; unique pieces absorbed into `ime.capnp`. |
-| `files.capnp` (Files) vs `filesystem.capnp` (Filesystem) | Both define `getSpecialPath`, file operations. `files.capnp` is comprehensive (30 methods). `filesystem.capnp` adds mount/unmount and trash. | 🔴 High | **DONE 2026-10-10:** `filesystem.capnp` deleted; mount/unmount and trash merged into `files.capnp`. |
-| `session.capnp` (Session) vs `compositor.capnp` (Session) vs `shell.capnp` (Session) vs `ime.capnp` (Session) vs `buffer.capnp` (BufferSession) vs `windowmanager.capnp` (Session) | Six different `Session` interfaces across schemas. Each is a service-specific handshake. This is acceptable IF each represents a distinct service domain. | 🟡 Medium | **Accept but rename for clarity.** Each `Session` is scoped to its service domain. Consider whether a universal `ServiceSession` pattern could unify the handshake. But do NOT merge domains (compositor ≠ shell ≠ IME). |
-| `surface.capnp` (Surface) vs `compositor.capnp` (Session surface management) | `surface.capnp` defines a standalone Surface interface. `compositor.capnp` Session also manages surfaces. Overlapping responsibilities. | 🔴 High | **DONE 2026-10-10:** `surface.capnp` deleted; surface management lives in `compositor.capnp` Session. |
-| `buffer.capnp` (Buffer) vs `buffer.capnp` (BufferSession) | Two interfaces in the same file. `Buffer` is the older flat design. `BufferSession` is the newer handshake design. | 🟡 Medium | **Deprecate `Buffer`.** Keep `BufferSession`. Same pattern as compositor (old flat interface coexists with new Session interface during transition). |
-| `compositor.capnp` (Compositor) vs `compositor.capnp` (Session) | Two compositor interfaces in the same file. `Compositor` is the older flat design. `Session` is the newer handshake design. | 🟡 Medium | **Deprecate `Compositor`.** Keep `Session`. |
-| `windowmanager.capnp` (WindowManager) vs `windowmanager.capnp` (Session) | Same pattern: old flat + new Session. | 🟡 Medium | **Deprecate `WindowManager`.** Keep `Session`. |
-| `notification.capnp` (Notifications) vs `shell.capnp` Shell Notification methods | `notification.capnp` defines a standalone Notifications interface. `shell.capnp` also has notification management (lines 55-67). | 🟡 Medium | **Clarify ownership.** `notification.capnp` should be the canonical notification service. `shell.capnp` should delegate to it, not duplicate it. Shell's notification methods should be thin wrappers or removed. |
-| `clipboard.capnp` (Clipboard) vs `shell.capnp` Shell Clipboard methods | Same pattern as notifications. | 🟡 Medium | **Same resolution.** `clipboard.capnp` is canonical. Shell delegates. |
-| `settings.capnp` (Settings) vs `shell.capnp` Shell Settings methods | Same pattern. | 🟡 Medium | **Same resolution.** |
+### A. The parallel authority model
 
-### Category B: Over-Specification (Dictating HOW, not WHAT)
+**Symptom.** A role string, an ACL, a permission enum, a per-method capability
+token, a free-text `authority` field, a capability id accepted as a parameter.
 
-| Schema | Line(s) | Issue | Severity | Fix |
-|--------|---------|-------|----------|-----|
-| `logging.capnp` | `LogFormat` enum (text, json, xml) | Dictates output format. A logging backend may use binary, CBOR, protobuf, or custom formats. | 🔴 High | **DONE 2026-10-10:** `LogFormat`/`LogOutput` deleted, `LogSource` opaque. |
-| `logging.capnp` | `LogOutput` enum (stdout, stderr, syslog, journal, file) | Dictates output destination. Backend-specific. | 🔴 High | **DONE 2026-10-10:** `LogOutput` deleted. |
-| `logging.capnp` | `LogSource` struct (file, line, function) | Assumes compiled languages with source files. WASM, interpreted, and JIT languages don't have this. | 🟡 Medium | **DONE 2026-10-10:** `LogSource` made opaque (`source @0 :Data`). |
-| `files.capnp` | `FilePermissions` struct (owner/group/other as UInt8) | POSIX-specific permission model. Capability-based systems don't use this. | 🔴 High | **DONE 2026-10-10:** `FilePermissions` removed; permissions are capability-gated, not POSIX modes. |
-| `files.capnp` | `ExtendedMetadata.inode @15 :UInt64` | inode is a filesystem implementation detail. Distributed filesystems don't have inodes. | 🟡 Medium | **DONE 2026-10-10:** no `inode`/`device` fields; backend internals live in `metadata @16 :T.StringMap`. |
-| `files.capnp` | `ExtendedMetadata.device @16 :UInt64` | Device number is Linux-specific. | 🟡 Medium | **DONE 2026-10-10:** removed. |
-| `process.capnp` | `ProcessState` enum (running, sleeping, waiting, stopped, zombie, defunct) | POSIX-specific states. "zombie" and "defunct" are Unix process lifecycle details. | 🟡 Medium | **DONE 2026-10-10:** `T.ExecutionState` canonical, shared tree-wide. |
-| `process.capnp` | `ThreadInfo.state @2 :Text` | Thread states are backend-defined but exposing as raw Text is too vague. | 🟢 Low | Define a `ThreadState` enum with universal states. |
-| `session.capnp` | `UserInfo.id @0 :UInt32` | Unix uid is 32-bit. Distributed systems need larger. | 🟢 Low | **DONE 2026-10-10:** `id @0 :T.UserId` (not a POSIX uid). |
-| `session.capnp` | `UserInfo.shell @4 :Text` | Assumes Unix shell concept. | 🟢 Low | **DONE 2026-10-10:** no `shell` field in `UserInfo`. |
-| `windowmanager.capnp` | `Window.pid @15 :UInt32` | Too small for distributed systems. Also, not all window systems have PIDs. | 🟡 Medium | **DONE 2026-10-10:** `processId @15 :T.ProcessId`. |
-| `windowmanager.capnp` | `WindowFilter.processId @6 :UInt32` | Same issue. | 🟡 Medium | **DONE 2026-10-10:** `processId @6 :T.ProcessId`. |
+**Why it fails.** Authority is already carried by the capability reference.
+A parallel model must agree with it forever, and the parallel model keyed by
+text can never be revoked. Two permission paths are worse than one, even when
+they agree today.
 
-### Category C: Under-Specification (Missing Contracts)
+**Fixed by.** Ungated discovery plus one gated accessor that returns a service.
+Delegation only through `capability.capnp`.
 
-| Missing Contract | Why It Matters | Priority |
-|-----------------|----------------|----------|
-| **DNS resolution service** | Any component doing networking needs hostname resolution. Without a protocol-level contract, each implementation reinvents this. | 🔴 High |
-| **Socket/connection API** | TCP/UDP/network connections are fundamental. The protocol defines `network.capnp` for interface management but not for creating connections. | 🔴 High |
-| **Process group/session management** | Grouping processes for signal delivery and lifecycle control is essential for service management. | 🟡 Medium |
-| **Resource quota/limits** | Declaring resource constraints (CPU, memory, file descriptors) is a cross-cutting contract between consumers and providers. | 🟡 Medium |
-| **Audit logging** | Recording security-relevant events is a cross-cutting concern. Multiple services need to emit audit events. | 🟡 Medium |
-| **Time synchronization** | `time.capnp` exists but doesn't address NTP/PTP synchronization contracts. | 🟢 Low |
+**Seen in.** Clipboard, app layer, secret store, sandbox administration (still
+open — see `docs/VERIFICATION.md` E11).
 
-### Category D: Structural Inconsistencies
+### B. The technology museum
 
-| Pattern | Where It Appears | Issue | Fix |
-|---------|-----------------|-------|-----|
-| **Subscription: pull-based interface** | Most schemas (audio, display, power, etc.) | `interface XSubscription { pull @0 () -> ...; }` | ✅ This is the canonical pattern. Keep it. |
-| **Subscription: stream-based interface** | compositor, ime, shell | `interface XEventStream { next @0 () -> ...; cancel @1 (); }` | ⚠️ Two subscription patterns coexist. Standardize on pull-based for consistency, or document when stream-based is preferred (e.g., for ordered event delivery with cancellation). |
-| **Error handling: VoidResult** | Most schemas | `T.VoidResult` union with success/error | ✅ Canonical. Keep it. |
-| **Error handling: custom results** | buffer.capnp, compositor.capnp | `BufferResult`, `DragStartResult` with custom success variants | ⚠️ Acceptable when the success case carries data. But ensure error cases always use `T.Error`. |
-| **Handshake pattern** | compositor, shell, ime, buffer, windowmanager | `handshake @0 (...) -> (...)` as first method | ✅ Good pattern for session-based services. Ensure all new session-based services follow this. |
-| **No handshake** | audio, display, input, network, etc. | Flat interface, no session establishment | ⚠️ Acceptable for stateless services. But document why a service doesn't need a handshake. |
-| **Query pattern** | compositor, shell, windowmanager | `query @N (...) -> (...)` with union-based dispatch | ✅ Good for extensible interrogation. Ensure query types have a `custom` variant for forward compatibility. |
-| **No query pattern** | Most other schemas | No way to interrogate service capabilities | 🟡 Consider adding a query method to services that have complex capability surfaces. |
+**Symptom.** Named storage buses, firmware tables, wire transports, codecs,
+compression formats, model architectures, vendors, kernels, display servers.
+
+**Why it fails.** Each name is a permanent commitment to a technology that may
+not exist in twenty years. The enum that froze 27 compression codecs is the
+canonical example.
+
+**Fixed by.** An open token, plus published conformance constants for today's
+spellings, plus the tolerance rule (unknown values are ignored, never rejected).
+
+### C. Bulk in the message
+
+**Symptom.** `List(Float32)`, `List(UInt8)`, inline `Data` in a payload position.
+
+**Why it fails.** Cap'n Proto's zero-copy guarantee applies to the serialised
+message. A list in a field is copied into the message, which is a cost the
+contract has no right to impose and an assumption that the payload is small.
+
+**Fixed by.** `T.DataHandle` — inline `Data` for small payloads, a `BufferId`
+reference for large ones.
+
+### D. The duplicate home
+
+**Symptom.** The same type name declared in two schemas; the same concept
+described by two interfaces.
+
+**Why it fails.** Two homes drift. The tree had 36 such duplicates before the
+revamp collapsed them.
+
+**Fixed by.** One canonical home, the other side imports. Where the two shapes
+are materially different, both names are disambiguated — never kept as twins.
+
+### E. The frozen default
+
+**Symptom.** An enum whose `@0` is a paradigm value (`trace`, `always`, `srgb`,
+`usd`, `terminate`).
+
+**Why it fails.** An unset field silently asserts that value. "Unset" must be
+sayable.
+
+**Fixed by.** A neutral sentinel at `@0` (`unknown`, `none`, `unspecified`), or
+deletion of the enum in favour of an open token.
+
+### F. The unreachable interface
+
+**Symptom.** An interface no method returns or accepts.
+
+**Why it fails.** Nothing can call it, so it is not a contract — it is a
+description of an implementation's internal structure that has been promoted
+into the protocol.
+
+**Fixed by.** Delete it, or make it reachable through an accessor.
+
+### G. The silent failure
+
+**Symptom.** A method that can fail returns an empty struct, a zero, or a
+plausible default.
+
+**Why it fails.** The consumer cannot distinguish "none" from "failed", which
+makes every downstream decision unsound.
+
+**Fixed by.** A result union carrying `T.Error`. Unsupported operations return
+`Unavailable` with a reason, never a fabricated value.
+
+### H. The raw handler table
+
+**Symptom.** Services writing function pointers into slots by index; raw
+subscription ids; offsets into a live stream.
+
+**Why it fails.** It bakes a specific dispatch mechanism and a specific
+lifetime model into the contract.
+
+**Fixed by.** Channels and `ServiceEndpoint` for dispatch; a subscription
+reference with a bounded `pull` for streaming.
 
 ---
 
-## 4. Schema Template
+## 4. The schema template
 
-### The gate: scripts/validate.py
+### 4.1 Structure
 
-Every rule in this document that can be checked mechanically is checked, and the
-check is the gate. `scripts/validate.py` parses the schemas with a real parser
-(it strips comments first, so a phrase in prose is not a violation) and enforces:
-
-| Rule | What it enforces |
-|------|------------------|
-| E1 | `ai.capnp` declares zero enums. |
-| E2 | `ai.capnp` has no bulk lists — payload is `T.DataHandle`. |
-| E3 | `Capability` appears only on `interface AI` accessors. |
-| E4 | Every interface is reachable. |
-| E5 | Every stream's `pull` returns a structural terminator. |
-| E6 | Every union has an `unknown`/`custom` variant, EXCEPT a union whose non-success arm is `T.Error` — the error model this document defines below is itself the extension point, so a further arm would be noise. The three terminal result unions are named. |
-| E7 | Every struct has an open extension point (value structs exempt). |
-| E8 | Every enum's `@0` is a neutral sentinel (not applied where a default is harmless — see audit-verification O4). |
-| E9 | No platform, vendor or POSIX noun in a required position (R5). |
-| E10 | No bulk payload outside `T.DataHandle` (R2). |
-| E11 | Authority is the reference — no per-method token, no authority-by-string (R3). |
-| E12 | One canonical home per type name (R6). |
-| E13 | Interface method ordinals are sequential and declared in order. |
-| E14 | Every interface is reachable and no declared type is unreferenced (R8). |
-
-E1–E5 are ERROR for `ai.capnp` and REPORT elsewhere; E6–E14 are REPORT for the
-other schemas, so the tree stays green while other waves land. The target is zero
-in every rule, for every schema. A schema that adds a finding must justify it in
-its own header.
-
-Two rule E5/E7 scoping decisions are doctrine, not oversight: event subscriptions
-are terminated by `cancel` (a terminator field would contradict the protocol's own
-subscription convention), and value structs — `AckHandle`, `TimeBox`, `Rect`,
-`Timestamp` — are complete by construction, so forcing an extension point onto
-them would bloat every message for no gain.
-
-Two further scoping decisions, both doctrine: **reachability (E14)** counts an
-interface taken as a *parameter* as reachable — a provider-registered callback
-(`registerAuthMethod(handler :AuthHandler)`) is reachable because the caller
-supplies an implementation and the peer calls it; and **one canonical home (E12)**
-is satisfied by ELIMINATION, not by exemption — the 2026-10-10 integration pass
-resolved every same-name-different-file type by giving one side the canonical
-name and having the other side import it (or, where the two shapes were
-materially different, by disambiguating both names), so the rule has zero
-findings with no sanctioned-exception list to maintain.
-### Canonical Schema Structure
-
-Every smart-protocol schema should follow this structure:
+Every `.capnp` file in `schema/` follows this shape. The order matters: a reader
+should be able to decide whether to keep reading from the first thirty lines.
 
 ```capnp
-@0x<unique_hex_id>;
+@0x<unique_schema_id>;
 
 # ═══════════════════════════════════════════════════════════════════════
-# <ServiceName> - <one-line description of what this contract governs>
+# <Domain> — <what boundary this file defines>
 #
-# <2-5 sentences explaining:
-#   1. What this service IS (the contract, not the implementation)
-#   2. Who consumes it (apps, other services, the kernel)
-#   3. What is deliberately left opaque (implementation freedom)
-#   4. How it relates to other services>
+# THE CONTRACT
+#   What two components exchange here, and why the boundary is where it is.
+#
+# DELIBERATELY OPAQUE
+#   What the backend decides and the protocol never inspects.
+#
+# DELETED / NOT HERE
+#   What this file used to contain, why it was removed, and what replaced it.
+#
+# AUTHORITY
+#   Where the one gate at acquisition is, and what sits behind it.
+#
+# TIMELESSNESS
+#   Which values are open tokens, which are enums, and why each enum is closed.
 # ═══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
-using import "capability.capnp".Capability;
 
-# ── Types ─────────────────────────────────────────────────────────────
-# All types used by this service's interfaces.
-# Organized: IDs first, then data structs, then enums, then events.
+# ── Identity ──────────────────────────────────────────────────────────
+# Typed opaque ids first.
 
-# ── Interface ─────────────────────────────────────────────────────────
-# The primary interface (or Session interface for session-based services).
-
-interface <ServiceName> {
-    # Session-based services start with handshake:
-    # handshake @0 (...) -> (...);
-
-    # Methods organized by concern, ordinals assigned sequentially.
-}
+# ── Value types ───────────────────────────────────────────────────────
+# Fixed-shape descriptors: geometry, status, capability description.
 
 # ── Events ────────────────────────────────────────────────────────────
-# Event types and subscription interface.
+# Event unions, each terminating in `unknown @N :T.UnknownEvent`.
 
-# ── Capabilities ──────────────────────────────────────────────────────
-# What authority this service requires/grants.
+# ── Interfaces ────────────────────────────────────────────────────────
+# The ungated discovery surface, then the gated accessor(s), then the
+# services they return, then subscriptions.
+
+# ── Subscriptions ─────────────────────────────────────────────────────
+# bounded pull + cancel.
 ```
 
-### What Goes IN a Schema
+### 4.2 What belongs in a schema
 
-| Element | Purpose | Example |
-|---------|---------|---------|
-| **Interfaces** | Define the contract surface | `interface Process { ... }` |
-| **Types** | Define data structures that cross trust boundaries | `struct ProcessInfo { ... }` |
-| **Enums** | Define finite sets of states/categories | `enum ProcessState { ... }` |
-| **Events** | Define what state changes are observable | `struct ProcessEvent { union { ... } }` |
-| **Subscriptions** | Define how consumers observe changes | `interface ProcessSubscription { pull @0 () -> ...; }` |
-| **Capabilities** | Define what authority is needed/granted | `enum ProcessCapability { ... }` |
-| **Doc comments** | Explain WHY, not WHAT | `# Backend decides scheduling; protocol sees only state.` |
+| Element | Purpose |
+|---|---|
+| Interfaces | The contract surface |
+| Value types | Data both sides must read field by field |
+| Events | Observable state changes, each extensible |
+| Subscriptions | Bounded observation (`pull`, `cancel`) |
+| Capability references | Authority, gated once at acquisition |
+| Doc comments | The argument: why this boundary, what is opaque, what was deleted |
 
-### What Does NOT Go in a Schema
+### 4.3 What does not belong
 
-| Element | Why Not | Where It Belongs |
-|---------|---------|-----------------|
-| **Algorithm hints** | "Use round-robin scheduling" | Inside the kernel |
-| **Performance tuning** | "Set thread stack size to 2MB" | Inside the component |
-| **Platform assumptions** | "inode", "syslog", "zombie" | Use universal terms |
-| **Wire format details** | "Use little-endian encoding" | Inside the transport |
-| **Internal state machines** | "Transition from INIT to RUNNING" | Inside the component |
-| **Optimization parameters** | "Use 4KB pages" | Inside the kernel |
-| **Implementation-specific enums** | `LogOutput { stdout, stderr, journal }` | Use opaque `Text` targets |
+| Element | Where it belongs instead |
+|---|---|
+| Algorithm hints ("round-robin", "LRU") | Inside the component |
+| Performance targets ("2 MB stack", "within 100 ms") | Inside the component's documentation |
+| Platform assumptions (`inode`, `syslog`, `zombie`, `cgroup`) | Universal terms, or nowhere |
+| Wire-format details (endianness, framing) | The transport |
+| Internal state machines | The component |
+| Vendor, product, format or architecture names in required positions | Open tokens |
+| Permission strings, roles, ACLs, per-method tokens | `capability.capnp` |
+| Resource-tuning parameters (page size, ring depth) | The backend |
 
-### How to Version Interfaces
+### 4.4 Evolution rules
 
-1. **Ordinal stability:** Once a method is published, its ordinal number is permanent. Never reuse or reorder ordinals.
+1. **Ordinal stability.** Once published, a method's ordinal is permanent. New
+   capabilities take fresh ordinals and never displace old ones.
+2. **Additive by default.** New methods, types and fields are minor changes.
+3. **Breaking means a new ID.** Removing a method, changing a signature or
+   changing a field type is a new schema ID. A retired ID is never reused —
+   `ai.capnp` carries `@0xa1b2c3d4e5f60109` precisely because the retired
+   `...0061` was never implemented and must not be inherited by a wrong draft.
+4. **Deprecation.** Post-release, mark with a comment and preserve the ordinal.
+   Pre-release, delete.
+5. **Forward compatibility.** Every event and specification union terminates in
+   an `unknown` arm carrying `T.UnknownEvent { typeId, payload }`. `T.VoidResult`
+   and `T.BoolResult` are exempt: their non-success arm is `T.Error`, which is
+   itself the extension point.
+6. **ABI negotiation.** `abi.capnp` lets two parties declare what they speak and
+   agree on the intersection before either commits to a call.
 
-   **PRE-RELEASE CARVE-OUT (added 2026-10-10).** "Published" means released to someone outside this repository. Nothing external consumes these schemas yet, so no ordinal is yet a promise: until the first external release, ordinals, types and interfaces may be renumbered, reordered and deleted outright, and DELETE is preferred over deprecate-and-keep. The revamp exercised this across the foundation/kernel batch. From first release onward, rules 1–4 bind in full, and breaking a published schema requires a new schema ID.
+**The pre-release carve-out.** "Published" means released to someone outside
+this repository. Nothing external consumes these schemas yet, so until the first
+external release ordinals, types and interfaces may be renumbered, reordered and
+deleted outright — and **deletion is preferred to deprecation**. From first
+release, rules 1–4 bind in full. The carve-out is stated rather than assumed,
+and it expires at a stated event rather than a stated date.
 
-2. **Additive changes:** New methods, new types, new enum variants, new fields in structs → increment **minor** version.
+### 4.5 Capability integration
 
-3. **Breaking changes:** Removing methods, changing signatures, changing field types → increment **major** version (requires new schema ID).
-
-4. **Deprecation:** Mark old methods with a comment `# Deprecated: use newMethod instead. Ordinal preserved for wire compatibility.` Never delete them. (Pre-release: delete — see the carve-out. A deprecated variant that survives this wave becomes the next schema's example.)
-
-5. **Forward compatibility:** Every union type should have a `unknown` or `custom` variant with opaque `Data` payload. This allows backends to extend without breaking consumers.
-
-   Scoped: the terminator binds EVENT and SPECIFICATION unions, where a producer must forward a kind it did not foresee. `T.VoidResult`/`T.BoolResult` (their non-success arm is `T.Error`) and `T.DataHandle` (closed by construction) are exempt.
-
-   ```capnp
-   struct CompositorEvent {
-       union {
-           knownEvent @0 :KnownEvent;
-           # ... existing variants ...
-           unknown @N :UnknownEvent;  # Always last
-       }
-   }
-   
-   struct UnknownEvent {
-       typeId  @0 :UInt64;
-       payload @1 :Data;
-   }
-   ```
-
-6. **ABI negotiation:** Use `abi.capnp` to declare which schema versions an implementation supports. Consumers negotiate at startup.
-
-### How to Handle Capability Integration
-
-Every service should accept capabilities as part of its authority model:
+The shape is identical in every schema, and it is the precedent that governs
+every service method in the protocol:
 
 ```capnp
 using import "capability.capnp".Capability;
 
 interface MyRoot {
-    # Ungated: discovery is open to everyone.
+    # Ungated: discovery must never deadlock on authority.
     discover @0 () -> (descriptor :MyDescriptor);
 
     # Gated once, at acquisition.
@@ -424,233 +400,189 @@ interface MyRoot {
 
 interface MyService {
     # Holding `service` IS the authority. No per-method token.
-    doSensitiveThing @0 (request :SensitiveRequest) -> (result :SensitiveResult);
+    read  @0 (id :MyId) -> (data :T.DataHandle);
+    write @1 (id :MyId, data :T.DataHandle) -> T.VoidResult;
 }
 ```
 
-**Rules:**
-- Authority is the **interface reference**, not a per-method parameter. In Cap'n Proto
-  RPC a capability is a reference: holding it conveys authority to call it.
-- Privileged services are obtained through an accessor that takes a `Capability`, and
-  their methods then take no authority token.
-- Ungate discovery: keep "what exists and what can it do" readable without authority,
-  so a caller can learn before it can act.
-- The capability's `target` field identifies the resource; its `operations` field
-  determines what is permitted.
-- Attenuation and revocation are `capability.capnp`'s job, not re-specified per service.
-- Capability verification is a backend concern; the protocol only specifies the contract.
+**A `Capability` parameter is legal in exactly two places:**
 
-**Why not a per-method parameter?** It duplicates authority the reference already carries,
-leaving two authority paths that must agree forever. `schema/ai.capnp`
-implements the reference model (validator rule E3), and it is the precedent that
-governs every service method in the protocol.
+1. on a root accessor that **returns a service** — taking the capability is how
+   the caller is granted the reference; and
+2. inside `capability.capnp`, on the methods that act **on** the capability the
+   parameter names (`attenuate @2`, `transfer @3`, `revoke @4`,
+   `revokeControlled @8`, `evaluateCondition @11`).
 
-**The precedent, stated precisely (this paragraph supersedes the older "the per-method
-`Capability` pattern survives" reading of this section):** a `Capability` parameter is
-legal in exactly two places —
+Everywhere else it is a second authority path and a defect. E3 and E11 enforce
+this.
 
-1. on a root accessor that RETURNS a service, where taking the capability is how the
-   caller is granted the reference (`AI.models @2 (authority :Capability) ->
-   (service :ModelService)`); and
-2. inside `capability.capnp` itself, on the five methods that act ON the capability the
-   parameter names (`attenuate @2`, `transfer @3`, `revoke @4`, `revokeControlled @8`,
-   `evaluateCondition @11`). There the parameter is the object under manipulation, not an
-   authority token.
+Authority rules:
 
-Everywhere else a per-method authority parameter is a second authority path and is a
-defect. The revamp deleted all of them: free-text `authority` headers, `requiredCaps :
-List(Text)`, role strings, ACLs, per-command capability parameters and permission
-enums. `scripts/validate.py` rule E11 enforces the two-Place shape tree-wide.
+- **Ungate discovery.** A caller must be able to learn what exists before it can
+  act; discovery that deadlocks on a capability never runs.
+- **Gate once.** The accessor takes the capability; nothing behind it does.
+- **Put the algebra in one place.** Attenuation, transfer, revocation and
+  evaluation live in `capability.capnp` and nowhere else.
+- **Verification is the backend's job.** The protocol specifies what a
+  capability *is*, not how a backend checks it.
 
-**Do NOT** define permission strings, boolean flags, or role-based access control in the protocol. The capability system IS the access control mechanism.
+35 accessors in the tree have this shape.
 
-### How to Handle Errors
-
-The protocol uses a unified error model defined in `types.capnp`:
+### 4.6 The error model
 
 ```capnp
 struct VoidResult {
     union {
         success @0 :Void;
-        error @1 :Error;
+        error   @1 :T.Error;
     }
 }
 
 struct Error {
-    code @0 :ErrorCode;
-    message @1 :Text;       # Human-readable description
-    context @2 :Text;       # What was being attempted
-    retryable @3 :Bool;     # Whether retry makes sense
+    code      @0 :ErrorCode;
+    message   @1 :Text;       # human-readable, enough for debugging
+    context   @2 :Text;       # what was being attempted
+    retryable @3 :Bool;       # whether retrying can plausibly succeed
+    metadata  @4 :StringMap;  # structured detail, open vocabulary
 }
 ```
 
-**Rules:**
-1. All methods that can fail MUST return a result union containing `Error`.
-2. Methods that always succeed return `Void` (not `VoidResult`).
-3. Use the most specific `ErrorCode` from the standard set.
-4. `message` MUST be human-readable and include enough context for debugging.
-5. `context` SHOULD describe what operation was attempted.
-6. `retryable` SHOULD be `true` for transient failures (timeout, temporary unavailable).
-7. NEVER swallow errors silently. Every error path MUST be explicit.
-8. Custom error types are permitted for domain-specific errors, but MUST include a standard `ErrorCode` for routing.
+Rules:
 
-```capnp
-# Acceptable custom error:
-struct BufferResult {
-    union {
-        buffer @0 :BufferInformation;
-        error  @1 :T.Error;  # Standard error, not custom
-    }
-}
-```
+1. Anything that can fail returns a union carrying `T.Error`.
+2. A method that cannot fail returns `T.VoidResult` or plain `Void` — be
+   consistent within an interface.
+3. Use the most specific `ErrorCode`.
+4. `message` is for humans and must include enough context to debug.
+5. `retryable` is true only for transient failures.
+6. Never swallow an error. Every failure path is explicit.
+7. Domain-specific detail goes in `metadata`, not in a new error type per
+   domain.
+
+The honesty rule extends the model: an operation that is not implemented returns
+`Unavailable` with a reason. A fabricated success is the one unforgivable defect.
 
 ---
 
 ## 5. The Swap Test
 
-For each design principle, validate by swapping component implementations. If the protocol still works, the principle holds.
+> Replace the implementation of a component. If the contract still holds, the
+> principle held. If a swap breaks the contract, the contract leaked
+> implementation, and the leak is a bug.
 
-### Principle 1: The Protocol is Implementation-Agnostic
+### Five applications
 
-| Swap | Protocol Still Works? | Evidence |
-|------|----------------------|----------|
-| **Linux kernel → seL4 microkernel** | ✅ Yes *(corrected 2026-10-10)* | `kernel.capnp` defines spawn, signal, memory regions, and seL4 has capabilities natively but exposes the same interface. The earlier claim that `TaskState` (newBorn, ready, running, waiting, stopped, terminated, zombie) "maps to seL4's thread states" was FALSE — seL4 has no zombie state, which is why the schema carried it: the enum was POSIX vocabulary. The canonical `T.ExecutionState` (active/blocked/suspended/terminated) is the set that actually swaps. Memory regions map to seL4's untyped memory. |
-| **PipeWire → custom Rust audio server** | ✅ Yes | `audio.capnp` defines devices, streams, volume. A custom server exposes the same concepts. PipeWire's graph model is internal; the protocol sees endpoints and streams. |
-| **ext4 → distributed filesystem (Ceph, GlusterFS)** | ✅ Yes | `files.capnp` defines open/read/write/stat. The filesystem type is opaque in `DiskUsage.filesystem`. Inodes are implementation-specific. The protocol sees paths and content. |
-| **X11 → Wayland → custom compositor** | ✅ Yes | `compositor.capnp` defines surfaces, commits, input events. The backend's display protocol (X11, Wayland, custom) is internal. The Session interface is the contract. |
-| **systemd → runit → s6** | ✅ Yes | `init.capnp` defines service lifecycle (start, stop, restart, state). Whether the init system uses cgroups, process supervision trees, or dependency graphs is internal. The protocol sees service state and lifecycle events. |
+1. **Kernel-agnostic.** Linux → seL4 → a purpose-built microkernel. The protocol
+   still defines spawn, memory regions, waitables and service resolution.
+2. **Type opacity.** A `ProcessId` that is a 32-bit index in one kernel and an
+   opaque 128-bit token in another. The wire does not change.
+3. **No implementation-specific types.** The protocol never declares a type that
+   belongs to one backend (`LogOutput { stdout, stderr, journal }` is the classic
+   mistake).
+4. **Completeness.** A contract with a gap forces the consumer to reach past it
+   into implementation. Gaps are bugs even when nothing is wrong yet.
+5. **Forward compatibility.** A consumer written today must survive an event,
+   token or capability invented later.
 
-### Principle 2: Types Are Opaque Where Appropriate
+### The historical evidence
 
-| Swap | Protocol Still Works? | Evidence |
-|------|----------------------|----------|
-| **ProcessId as UInt64 on Linux → seL4 TCB IDs** | ✅ Yes | Both map to UInt64. The protocol doesn't care whether it's a PID or a thread control block. |
-| **FileHandle as opaque UInt64 on ext4 → capability-based handle on seL4** | ✅ Yes | The handle is opaque. The backend decides what it represents. Consumers only pass it back. |
-| **Capability.id as opaque Data on local system → distributed token** | ✅ Yes | A local system might use a pointer. A distributed system might use a JWT. Both are opaque `Data`. The protocol doesn't inspect them. |
-| **AudioDevice.id as UInt64 on PipeWire → UUID on custom server** | ✅ Yes | Both map to an opaque identifier. The protocol doesn't care about the format. |
+| Swap | Result |
+|---|---|
+| Linux kernel → seL4 / a Rust microkernel | Contract holds: `kernel.capnp` defines the boundary, not the scheduler |
+| PipeWire → a custom audio server | Contract holds: `audio.capnp` defines devices, streams, focus |
+| ext4 → a distributed filesystem | Contract holds: `files.capnp` defines open/read/write/stat semantics |
+| X11 → Wayland → a future compositor | Contract holds: `compositor.capnp` defines commit, fences and damage |
+| systemd → runit → s6 | Contract holds: `init.capnp` defines lifecycle, not dependency algebra |
+| a 2026 bootloader → a 2046 one | Contract holds: 24 bytes and a declarative manifest |
 
-### Principle 3: No Implementation-Specific Types
+### Running the test on your own work
 
-| Swap | Protocol Still Works? | Evidence |
-|------|----------------------|----------|
-| **FilePermissions as POSIX mode bits → capability-based access** | ✅ If fixed | Current POSIX-specific `owner/group/other` model breaks capability systems. **Fix required:** Replace with opaque permissions or universal permission enum. |
-| **ProcessState with "zombie" → seL4 with no zombie state** | ✅ If fixed | seL4 doesn't have zombies. **Fix required:** Rename to universal states. |
-| **LogOutput with "journal" → custom logging backend** | ✅ If fixed | A custom backend doesn't use journald. **Fix required:** Replace with opaque output target. |
-
-### Principle 4: Contracts Are Complete (No Gaps)
-
-| Scenario | Protocol Coverage? | Gap? |
-|----------|-------------------|------|
-| App needs to resolve a hostname | ❌ No DNS service | **Gap.** Add DNS resolution contract. |
-| App needs to open a TCP connection | ❌ No socket API | **Gap.** Add connection contract. |
-| App needs to query device topology | ✅ `device.capnp` | No gap. |
-| App needs to manage capabilities | ✅ `capability.capnp` | No gap. |
-| App needs to discover hardware | ✅ `hal.capnp`, `device.capnp` | No gap. |
-| Service needs to declare resource limits | ❌ No quota contract | **Gap.** Add resource limits contract. |
-
-### Principle 5: Events Are Forward-Compatible
-
-| Scenario | Protocol Handles It? | Evidence |
-|----------|---------------------|----------|
-| Backend adds a new event type unknown to consumer | ✅ Yes | Every event union has `unknown @N :UnknownEvent` with `typeId` and opaque `Data`. Consumer skips unknown events. |
-| Backend adds a new field to a struct | ✅ Yes | Cap'n Proto handles unknown fields gracefully. Old consumers ignore new fields. |
-| Backend removes a field from a struct | ⚠️ Risky | Cap'n Proto preserves old fields but semantics may break. **Rule:** Never remove fields. Deprecate with comments. |
-| Two backends implement different subsets of an interface | ✅ Yes | ABI negotiation via `abi.capnp` declares which methods are supported. |
+The test is not rhetorical. Delete your implementation, write another, and point
+the same consumer at it. If the consumer needs a change, you either leaked
+implementation into it or found a genuine gap in the schema. Both are worth
+knowing, and only one of them is your bug.
 
 ---
 
-## 6. Appendix: Schema-by-Schema Verdicts
+## 6. How a change is judged
 
-### Schemas That Are Exemplary (Follow All Principles)
+### The gate
 
-| Schema | Why |
-|--------|-----|
-| `capability.capnp` | Opaque id, textual targets, backend-agnostic operations. Perfect. |
-| `boot.capnp` | *(Amended 2026-10-10)* The pre-revamp body was the tree's largest collection of frozen technology — 24 hardware enums, ACPI/SMBIOS/DMI/UART structs, an `hhdmOffset` and a raw handler table. It has been rewritten to a trivial loader contract: one well-known pointer, a declarative manifest, open tokens. Exemplary again, and this time it is true. |
-| `kernel.capnp` | *(Amended 2026-10-10)* The body contradicted its own header: scheduler introspection, CLONE_* fork flags, live kernel swapping, six unreachable interfaces. All deleted. The header's claim now matches the file. |
-| `init.capnp` | Observable lifecycle, no dependency resolution algorithm specified. |
-| `tunnel.capnp` | Universal channel, transport-agnostic. |
-| `manifest.capnp` | Self-description, timeless. |
-| `abi.capnp` | Versioning and compatibility negotiation. *(Amended 2026-10-10)* The registry/endorsement apparatus and the duplicate `BootCapability` enum are deleted; the negotiation core remains and was always the model. |
-| `hal.capnp` | Describes affordances, not implementations. *(Amended 2026-10-10)* The page-table/x86-port-I/O block, the POSIX fd, the duplicate primitives and the three IRQ paths are gone. |
-| `device.capnp` | Backend-decided device tree. |
-| `database.capnp` | Clean key-value contract, no storage engine assumptions. |
-| `logging.capnp` | *(Amended 2026-10-10)* The canonical log contract. The 2026-07-01 release-blocker (`LogFormat`, `LogOutput`, structured `LogSource`) is executed; the observability-platform layer is deleted. |
+Every rule in this document that can be checked mechanically is checked by
+`scripts/validate.py`, which parses the schemas with a real parser — comments
+stripped first, so a phrase in prose is not evidence.
 
-### Schemas That Need Fixes
+| Rule | Enforces |
+|---|---|
+| E1 | `ai.capnp` declares zero enums |
+| E2 | `ai.capnp` has no bulk lists — payload is `T.DataHandle` |
+| E3 | `Capability` appears only on `AI` accessors |
+| E4 | Every interface is reachable |
+| E5 | Every stream's `pull` returns a structural terminator |
+| E6 | Every union has an `unknown`/`custom` arm |
+| E7 | Every struct has an open extension point (value structs exempt) |
+| E8 | Every enum's `@0` is a neutral sentinel |
+| E9 | No platform, vendor or POSIX noun in a required position |
+| E10 | No bulk payload outside `T.DataHandle` |
+| E11 | Authority is the reference — no per-method token, no authority-as-string |
+| E12 | One canonical home per type name |
+| E13 | Interface method ordinals sequential and declared in order |
+| E14 | Every interface reachable; no declared type unreferenced |
 
-| Schema | Issue | Priority |
-|--------|-------|----------|
-| `logging.capnp` | Over-specifies format and output targets | 🔴 High — **DONE 2026-10-10:** `LogFormat`/`LogOutput` deleted, `LogSource` opaque. |
-| `files.capnp` | POSIX-specific permissions and metadata | 🔴 High — **DONE 2026-10-10:** `FilePermissions` removed; `inode`/`device` removed. |
-| `textinput.capnp` | Duplicates `ime.capnp` | 🔴 High — **DONE 2026-10-10:** file deleted, absorbed into `ime.capnp`. |
-| `filesystem.capnp` | Duplicates `files.capnp` | 🔴 High — **DONE 2026-10-10:** file deleted, merged into `files.capnp`. |
-| `surface.capnp` | Duplicates compositor surface management | 🔴 High — **DONE 2026-10-10:** file deleted, merged into `compositor.capnp`. |
-| `process.capnp` | POSIX-specific process states | 🟡 Medium — **DONE 2026-10-10** (see `T.ExecutionState`). |
-| `session.capnp` | Unix-specific UserInfo | 🟢 Low — **DONE 2026-10-10:** `T.UserId`, no `shell` field. |
-| `windowmanager.capnp` | Window.pid uses UInt32 | 🟡 Medium — **DONE 2026-10-10:** `T.ProcessId`. |
+`docs/VERIFICATION.md` states the current result of each rule, the severity
+model, and every residual finding by name.
 
-### Schemas That Are Acceptable (No Changes Needed)
+### Scoping decisions that are doctrine, not oversight
 
-| Schema | Notes |
-|--------|-------|
-| `audio.capnp` | Clean contract. Device ID should be UInt64 but Text is acceptable. |
-| `compositor.capnp` | Excellent Session design. Old Compositor interface is deprecated but preserved. |
-| `buffer.capnp` | Good Session design. Old Buffer interface deprecated. |
-| `windowmanager.capnp` | Good Session design. Old WindowManager deprecated. |
-| `ime.capnp` | Good Session design. Replaces textinput.capnp. |
-| `shell.capnp` | Good Session design. Should delegate to canonical services for notifications/clipboard/settings. |
-| `network.capnp` | Clean contract. Missing socket API is a gap. |
-| `display.capnp` | Clean contract. |
-| `input.capnp` | Clean contract. |
-| `power.capnp` | Clean contract. |
-| `auth.capnp` | Clean contract. |
-| `notification.capnp` | Clean contract. Canonical notification service. |
-| `clipboard.capnp` | Clean contract. Canonical clipboard service. |
-| `settings.capnp` | Clean contract. Canonical settings service. |
-| `secret.capnp` | Clean contract. |
-| `time.capnp` | Clean contract. |
-| `speech.capnp` | Clean contract. |
-| `web.capnp` | Clean contract. Missing DNS resolution is a gap. |
-| `app.capnp` | Clean contract. |
-| `system.capnp` | *(Amended 2026-10-10)* Clean contract. The "capabilities bitmap is extensible" claim was wrong: it was 47 fixed booleans naming today's schema catalog, already missing `ai`, `tunnel` and `sandbox`. It is now an open token set. |
-| `manifest.capnp` | Clean contract. |
-| `abi.capnp` | Clean contract. |
-| `tunnel.capnp` | Clean contract. |
-| `hal.capnp` | Clean contract. |
-| `device.capnp` | Clean contract. |
+- **E5** — subscriptions are terminated by `cancel`; a terminator *field* would
+  contradict the subscription convention.
+- **E6** — `T.VoidResult` and `T.BoolResult` are exempt because `T.Error` is
+  their extension point. `T.DataHandle` is closed by construction.
+- **E7** — value structs (`Rect`, `Vec2`, `T.Timestamp`, `AckHandle`) are
+  complete by construction; forcing an extension point onto them would bloat
+  every message for no gain.
+- **E14** — an interface accepted as a *parameter* counts as reachable, because
+  a registered callback is supplied by the caller and invoked by the peer.
+- **E12** — satisfied by elimination, not exemption. There is no sanctioned
+  duplicates list.
 
----
+### The review order
 
-## Summary of Actionable Items
+1. Does the gate pass?
+2. Does the header argue for the change, or merely describe it?
+3. Is anything named that will not exist in ten years?
+4. Is there a second home, a second authority path, or a second way to carry the
+   same data?
+5. Does an existing interface already answer this? Most proposals are answered
+   already.
+6. If this were deleted tomorrow, would anyone notice? If not, delete it now —
+   that is what the pre-release carve-out is for.
 
-### Immediate (Block v1.0 Release)
+### What review cannot do, and what the gate must
 
-1. **Deprecate `textinput.capnp`** — consolidate into `ime.capnp`. **DONE 2026-10-10** (deleted).
-2. **Deprecate `filesystem.capnp`** — merge mount/unmount into `files.capnp`. **DONE 2026-10-10** (deleted).
-3. **Deprecate `surface.capnp`** — merge into compositor Session. **DONE 2026-10-10** (deleted).
-4. **Fix `logging.capnp`** — remove `LogFormat` and `LogOutput` enums, make `LogSource` opaque. **DONE 2026-10-10.**
-5. **Fix `files.capnp` `FilePermissions`** — replace POSIX model with universal permissions. **DONE 2026-10-10**.
-6. **Fix `process.capnp` `ProcessState`** — rename to universal states. **DONE 2026-10-10.**
+A reviewer's memory is not a measurement. The gate exists so that the mechanical
+promises — ordinals, one home per type, no frozen default, no second permission
+grammar, no bulk in a message — are checked on every change by a machine that
+does not get tired.
 
-### Short-term (Before v1.1)
-
-7. **Add DNS resolution service** — `dns.capnp`.
-8. **Add socket/connection API** — `connection.capnp` or extend `network.capnp`.
-9. **Add resource quota service** — `quota.capnp`.
-10. **Standardize subscription pattern** — choose pull-based or stream-based, apply consistently.
-11. **Fix `FileHandle`** — remove path/mode, keep opaque handle.
-12. **Fix `TunnelHandle`** — remove subject, keep opaque id.
-
-### Long-term (v2.0+)
-
-13. **Add process group/session management.**
-14. **Add audit logging service.**
-15. **Unify Session handshake pattern** — consider a universal `ServiceSession` base.
-16. **Review all `UInt32` IDs** — ensure they are `UInt64` for forward compatibility.
+What the gate cannot check is judgement: whether a boundary is in the right
+place, whether a type should be opaque, whether an interface earns its
+existence. Those remain review questions, and they are the reason this document
+exists.
 
 ---
 
-*This document is the canonical reference for smart-protocol schema design. All schema reviews, new proposals, and audit findings should be evaluated against these principles.*
+## Appendix — the reading order
 
-Next in the chain: `docs/TIMELESSNESS.md` (timelessness rationale), then `docs/MANIFESTO.md` (the thesis). See also `README.md`.
+| To see | Read |
+|---|---|
+| The doctrine implemented | `schema/ai.capnp` — zero enums, one `Artifact`, ungated discovery, gated acquisition |
+| Authority end to end | `schema/capability.capnp` |
+| The smallest handoff | `schema/boot.capnp` |
+| The boundary that swaps | `schema/kernel.capnp` — 248 lines, and what is not in them |
+| Opacity applied | `schema/types.capnp` |
+| The session pattern, once | `schema/session.capnp` and `compositor.capnp`'s `SessionRequest` |
+| The whole tree | [`docs/SCHEMAS.md`](docs/SCHEMAS.md) |
+| The argument | [`docs/VISION.md`](docs/VISION.md), [`docs/MANIFESTO.md`](docs/MANIFESTO.md) |
+| The constraints | [`docs/TIMELESSNESS.md`](docs/TIMELESSNESS.md) |
+| The evidence | [`docs/VERIFICATION.md`](docs/VERIFICATION.md), `audit-revamp/` |
