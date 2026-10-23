@@ -1,263 +1,260 @@
-# Timelessness Design Rationale
+# Timelessness
 
-This document explains the design principles that make Smart Protocol timeless — able to survive hardware, OS, and language changes for decades.
+> How do you write a contract today that a machine built in twenty years can
+> satisfy without being edited?
 
----
-
-## The Core Philosophy
-
-> **The protocol is the only thing that must never change. Everything else is replaceable.**
-
-Smart Protocol is not a library, not a daemon, not an OS. It is the **contract** that makes everything else interoperate.
+This document is the long answer. It is about one constraint, why it is a
+constraint rather than a hope, and where it has already changed the tree.
 
 ---
 
-## The Agnostic/Timeless Test
+## I. The problem with predicting the future
 
-Every proposed addition must pass this test:
+Every protocol is a bet about what will exist.
 
-> **"Is this an EXTERNAL contract (how components interoperate) or an INTERNAL implementation (how a component works)?"**
+The bet is rarely stated. It is made implicitly, one field at a time: a list of
+supported codecs, an enum of compression algorithms, a boolean for whether a
+display is stereoscopic, a field for the number of CPU cores. Each of those
+reads as a description of the present. Each is a prediction about the future,
+and each is a permanent one — because in Cap'n Proto a field's ordinal is fixed
+for the life of the schema ID, so a field cannot be removed, and an enum value
+cannot be renumbered.
 
-| External Contract (KEEP) | Internal Implementation (REJECT) |
-|--------------------------|----------------------------------|
-| "Resolve this hostname" | "Use systemd-resolved" |
-| "Allocate 512MB for this service" | "Create cgroup with memory.max=512M" |
-| "Send audio to this device" | "Open PulseAudio stream" |
-| "Allocate GPU memory" | "Call ioctl DRM_IOCTL_GEM_CREATE" |
+The failure mode is not dramatic. It is a slow accumulation of small lies:
 
-**Rule:** If it describes HOW a component works internally, it belongs inside the component. If it describes WHAT two components exchange to interop, it belongs in the protocol.
+- a `Compression` enum with 27 values, including codecs that no longer exist;
+- a `Transport` enum with fourteen named variants, none of whose numbers can
+  ever be reused when the fifteenth arrives;
+- a crypto schema that must be edited every time a standards body renames a
+  construction — a contract that admits, by its own changelog, that it was never
+  timeless;
+- a `LogLevel` enum whose `@0` is `trace`, so an absent field silently means
+  the noisiest possible verbosity;
+- an AI schema that names `transformer`, `onnx`, `gguf` and `q4km`, freezing
+  one decade of machine learning into the foundation of an operating system.
+
+None of these is a bug in the ordinary sense. Each is the most natural thing
+to write at the moment it was written. That is the point: **the natural
+encoding of today is the anti-pattern of a contract.**
+
+You cannot fix this by trying harder to predict. Prediction has a bounded
+shelf life and no verification. The only durable move is to stop predicting.
 
 ---
 
-## The Opacity Principle
+## II. Timelessness is a negative constraint
 
-**Push types as far left (opaque) as possible.**
+> You cannot enumerate what will exist in a hundred years, because any list is
+> today's list. You *can* specify what must never appear.
+
+This inverts the usual design process. Instead of asking *what should the
+contract support?* — a question that can only be answered for the present — ask
+*what must the contract never contain?* That question has answers that stay
+true: no vendor names, no algorithm choices, no required field whose value is a
+fad, no assumption about the shape of a machine.
+
+The constraints are then expressed in the vocabulary the contract uses for
+everything else:
+
+| A value that is technology-specific | travels as | `T.MimeType`, an open media-type vocabulary |
+| A value that is named but unbounded | travels as | `T.StringMap`, an open key/value vocabulary |
+| A payload of any size or shape | travels as | `T.DataHandle`, a buffer reference |
+| An event kind the producer invents | travels as | an `unknown` arm carrying `T.UnknownEvent` |
+| A capability the backend invents | travels as | a capability reference, gated once |
+
+Three files do most of this work, and every schema imports them:
+`types.capnp` defines the open vocabularies (744 `T.StringMap` positions and
+421 `T.DataHandle` positions tree-wide), `capability.capnp` defines authority,
+and `abi.capnp` defines what two parties say to each other before either
+commits to a call.
+
+This is subtraction, not prophecy. Nothing in the tree claims to know what will
+exist. The tree only refuses to forbid it.
+
+---
+
+## III. The four mechanisms
+
+Timelessness in this repository is not an attitude; it is four mechanical
+properties, each with a rule number.
+
+### 1. No frozen paradigms — E1, E8
+
+`schema/ai.capnp` declares **zero enums**, and validator rule E1 fails the build
+on the first one. That is the gold standard stated as a gate rather than a
+guideline, because the temptation to add "just one" enum of architectures is
+continuous and entirely reasonable.
+
+Enums are not banned everywhere — a finite vocabulary that is genuinely closed
+(an error severity, a byte order, a transport state) is legitimate. What is
+banned is a `@0` that means a paradigm (E8: every enum's first value must be a
+neutral sentinel such as `unknown`, `none` or `unspecified`), and any enum whose
+values are the names of today's products.
+
+The replacement pattern is uniform:
 
 ```
-FULLY OPAQUE                                              FULLY STRUCTURED
-   │                                                              │
-   ▼                                                              ▼
-UInt64    Data    Text        Enum       Struct with    Struct with
- (id)      (bytes) (string)    (finite)    fixed fields   variable fields
-                                                 (List, union)
-   │         │         │          │              │              │
-   ▼         ▼         ▼          ▼              ▼              ▼
-ProcessId  CapId    DeviceName  OpenMode    Rect, Vec2    StringMap
-WindowId   proof    LayoutId    ErrorCode   BatteryState  Meta
-BufferId                                          AudioFormat
+enum   Architecture { transformer @0; diffusion @1; ... }      ← never
+struct ModelDescriptor { ...; metadata :T.StringMap; }         ← always
 ```
 
-**Rule of thumb:** Only make types structured when consumers MUST read/write specific fields to interoperate. Otherwise, use opaque `UInt64`, `Data`, or `Text`.
+A backend reports what it is. The contract does not ask what kind of thing it is
+expected to be.
 
----
+### 2. Ordinal permanence — E13
 
-## The Swap Test
+Once published, a method's ordinal is permanent. New capabilities take fresh
+ordinals; nothing is ever renumbered or reused. E13 enforces that interface
+ordinals are sequential and declared in order, so that the wire layout is a
+readable property of the file rather than an archaeological one.
 
-**Can you swap implementations without changing the protocol?**
+The corollary is that deletion is preferred to deprecation while the tree is
+pre-release, and that a breaking change is a new schema ID rather than a new
+version of the old one. `ai.capnp` is at `@0xa1b2c3d4e5f60109` precisely
+because the retired ID `@0xa1b2c3d4e5f60061` was never implemented and the
+retired ID is deliberately not reused. An ID bound forever should not be
+inherited by a draft that was wrong.
 
-| Swap | Protocol Still Works? | Evidence |
-|------|----------------------|----------|
-| Linux kernel → seL4 microkernel | ✅ Yes | `kernel.capnp` defines spawn, signal, memory regions. seL4 has capabilities natively. |
-| PipeWire → custom Rust audio server | ✅ Yes | `audio.capnp` defines devices, streams, volume. |
-| ext4 → distributed filesystem (Ceph) | ✅ Yes | `files.capnp` defines open/read/write/stat. |
-| X11 → Wayland → custom compositor | ✅ Yes | `compositor.capnp` defines surfaces, commits, input events. |
-| systemd → runit → s6 | ✅ Yes | `init.capnp` defines service lifecycle (start/stop/restart/state). |
+### 3. Forward-compatible unions — E6
 
-**If a swap breaks the protocol, the protocol leaks implementation.**
-
----
-
-## What We Explicitly Reject
-
-### Platform-Specific Types
-| Rejected | Reason | Replacement |
-|----------|--------|-------------|
-| `inode`, `device` (files) | Filesystem internals | Opaque `FileHandle` + `FileInfo` query |
-| `zombie`, `defunct` (process) | POSIX-specific | Universal: `active`, `blocked`, `suspended`, `terminated` (`T.ExecutionState`) |
-| `stdout`, `stderr`, `journal` (logging) | Backend-specific | Opaque `Data` target |
-| `cr3`, `HHDM` (kernel) | x86-specific | `pageTableRoot`, `bootstrapPointer` |
-| `systemd`, `syslinux` (boot) | Product names | **No enum at all.** An earlier draft of this document prescribed `BootloaderKind { limine, grub, uefiDirect, custom }` — which is the same violation it was rejecting. The replacement is an OPEN TEXT TOKEN the backend declares; a consumer that does not recognise the token ignores it. `boot.capnp` now follows this. |
-
-### Implementation Details
-| Rejected | Reason |
-|----------|--------|
-| Scheduler algorithm hints | Kernel internal |
-| Page size, TLB entries | Hardware internal |
-| Network packet framing | Transport internal |
-| Cryptographic signing details | Backend concern (capability.proof is opaque) |
-| Init dependency resolution algorithm | Init internal |
-
----
-
-## Schema Evolution Rules (Guarantees Timelessness)
-
-> **PRE-RELEASE CARVE-OUT — read this first.**
->
-> Rules 1–4 below bound a PUBLISHED protocol. They apply after the first
-> external release, because from that moment a schema id is a promise to
-> someone who is not in this room.
->
-> Before that release — the state of this repository today — nothing
-> external consumes these schemas, and no ordinal, type or interface is
-> yet a promise. Every fix is therefore still free, and a defect kept
-> "for wire compatibility" with a protocol nobody speaks is a defect
-> kept forever. So, pre-release:
->
->   * ordinals MAY be renumbered, reordered and reclaimed (they are
->     repurposed freely — the revamp did so in boot, kernel, logging,
->     klog, diagnostics, process, session, hal, init, service,
->     discovery, queue, task_scheduler, signal, system, abi, types and
->     capability);
->   * types and interfaces MAY be deleted outright — no deprecation
->     comment is required for something no consumer ever held;
->   * DELETE is preferable to deprecate-and-keep, because a deprecated
->     variant that survives this wave becomes the next schema's example;
->   * the tree's own `scripts/validate.py` is the gate: it must stay
->     green, and the revamp extended it (E9–E14) to check the rules that
->     were previously only prose.
->
-> A BREAKING change to an already-published schema still requires a new
-> schema ID (rule 3) — the carve-out expires at first release, not at
-> convenience.
-
-1. **Ordinal stability** — Once published, an ordinal is permanent. Never reuse or reorder. (See the carve-out above: pre-release, revise freely.)
-2. **Additive only** — New methods, types, enum variants, fields → minor version.
-3. **Breaking = new schema ID** — Removing methods, changing signatures, changing field types → major version (new `@0x...`).
-4. **Deprecate, don't delete** — `# Deprecated: use newMethod instead. Ordinal preserved for wire compatibility.` (Pre-release: delete instead — see the carve-out.)
-5. **Forward compatibility** — Every union MUST have `unknown @N :UnknownEvent { typeId: UInt64, payload: Data }`, promoted to `types.capnp` so the pattern is checkable against one canonical type. The rule binds EVENT and SPECIFICATION unions, where a producer must forward a kind it did not foresee. The three terminal unions are exempt by construction: `T.VoidResult` and `T.BoolResult` carry `T.Error` (their non-success arm IS the extension point), and `T.DataHandle` is closed (inline bytes or a buffer reference — there is no third possibility).
-6. **ABI negotiation** — Use `abi.capnp` to declare supported versions at startup.
-
----
-
-## The Six Shapes Equality
-
-No shape is primary. All six are equal:
+Every union terminates in an `unknown` arm. Where the union carries an event,
+the arm is the canonical `T.UnknownEvent { typeId, payload }` — 154 of them
+across 49 schemas.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Smart Protocol                           │
-├──────────────┬──────────────┬──────────────┬────────────────┤
-│   LIBRARY    │     CLI      │     IPC      │     CONFIG     │
-│   link &     │   `smart`    │   capnp over │   TOML/JSON    │
-│   call       │   command    │   shared mem │   `smart apply`│
-├──────────────┼──────────────┼──────────────┼────────────────┤
-│   NETWORK    │    SCRIPT    │              │                │
-│   TCP/WS     │   `.smart`   │              │                │
-│   remote     │   script     │              │                │
-└──────────────┴──────────────┴──────────────┴────────────────┘
-```
-
-An AI agent using the network shape has the same power as a human using the CLI.
-
----
-
-## Zero-Cost, No Runtime Diffing
-
-- **Cap'n Proto zero-copy**: Messages read directly from wire. No serialization/deserialization step.
-- **No runtime diffing**: No virtual DOM, no tree diffing. Retained mode: explicit mutations only.
-- **Compiler is the only authority**: Monomorphization, not vtables.
-- **No heap in hot path**: Pre-allocated arenas, slot-indexed lookup.
-
----
-
-## Capability System IS the Access Control
-
-- No permission strings, no RBAC, no boolean flags
-- **Authority IS the interface reference.** In Cap'n Proto RPC a capability is a
-  reference: holding it conveys authority to call it. So authority is expressed
-  by *which reference you hold*, gated once at acquisition — not by a
-  `Capability` parameter on every privileged method.
-- Verification is backend concern; protocol only specifies contract
-
-```capnp
-interface MyRoot {
-    # Ungated: discovery stays open, so a caller can learn what exists.
-    discover @0 () -> (descriptor :MyDescriptor);
-
-    # Gated once, at acquisition. Holding `service` IS the authority to call
-    # its methods; no further token is passed per call.
-    sensitive @1 (authority :Capability) -> (service :MyService);
-}
-
-interface MyService {
-    # No `cap` parameter — the reference itself is the authority.
-    doSensitiveThing @0 (request :SensitiveRequest) -> (result :SensitiveResult);
+union {
+    started @0 :StartInfo;
+    stopped @1 :StopInfo;
+    unknown @2 :T.UnknownEvent;   # a kind the producer invented
 }
 ```
 
-**Why:** a per-method parameter duplicates authority the reference already
-carries, producing two authority paths that must agree forever — every future
-method can get one wrong. Attenuation and revocation belong to
-`capability.capnp` (`attenuate @2`, `revoke @4`, `revokeControlled @8`).
+A producer can forward an event it did not foresee; a consumer routes it
+without breaking. This is the mechanism by which a system built in 2026 can
+receive an event kind defined in 2046 and *not fail*. It may not understand the
+event — but the contract's obligation is to carry it intact, not to comprehend
+it.
 
-**The one exception, stated so it is not mistaken for a violation:** the five
-methods in `capability.capnp` that take a `Capability` parameter
-(`attenuate`, `transfer`, `revoke`, `revokeControlled`,
-`evaluateCondition`) act ON the capability named by that parameter — the
-parameter is the object under manipulation, not an authority token. That is
-the only file in the protocol where this is true, and `scripts/validate.py`
-rule E11 encodes exactly this shape: a `Capability` parameter is legal on a
-root accessor that returns a service (the ai.capnp precedent) and inside
-`capability.capnp` itself, nowhere else.
+### 4. Tolerance, not validation
 
-**Reference implementation:** `schema/ai.capnp` — `Capability` appears only on
-`interface AI` accessors, never inside a service method. Enforced by validator
-rule E3. The older per-method pattern survives only in the exception above;
-every other per-method authority token in the tree (free-text `authority`
-headers, `requiredCaps :List(Text)`, RBAC role strings, ACLs, per-command
-capability parameters) was deleted in the revamp.
+An unrecognised media type, capability name, contributor token, status token or
+metadata key **MUST be ignored, never rejected.** A consumer that does not
+understand a value skips it; a consumer that does, acts on it.
+
+This is stated once in the doctrine and repeated in the header of every schema
+that has an open vocabulary, because it is the half of extensibility that is
+easy to forget. Open vocabularies only help if readers are permissive: a strict
+reader turns every future extension into a compatibility incident.
 
 ---
 
-## Schema Structure Template
+## IV. Zero cost is a timelessness property
 
-Every schema follows this structure:
+It is tempting to treat `T.DataHandle` as a performance concern. It is not, or
+not only. It is a correctness constraint about what a contract is allowed to
+assume.
 
-```capnp
-@0x<unique_hex_id>;
+Cap'n Proto's zero-copy guarantee applies to the serialised message. A field of
+type `List(Float32)`, `Text` or inline `Data` is copied into the message that
+contains it. That copy is a hidden assumption: it assumes the payload is small,
+that the consumer is local, that the producer can afford the memcpy. Every one
+of those assumptions is about today's hardware and today's topology.
 
-# ════════════════════════════════════════════════════════════════════════
-# <ServiceName> - <one-line description>
-#
-# 1. What this service IS (the contract, not the implementation)
-# 2. Who consumes it (apps, other services, the kernel)
-# 3. What is deliberately left opaque (implementation freedom)
-# 4. How it relates to other services
-# ═══════════════════════════════════════════════════════════════════════
+So there is exactly one way to carry bulk, and it is a reference:
 
-using T = import "types.capnp";
-using import "capability.capnp".Capability;
-
-# ── Types ─────────────────────────────────────────────────────────────
-# IDs first, then data structs, then enums, then events.
-
-# ── Interface ─────────────────────────────────────────────────────────
-interface <ServiceName> {
-    # Session-based services start with handshake:
-    # handshake @0 (...) -> (...);
-
-    # Methods organized by concern, ordinals assigned sequentially.
+```
+union DataHandle {
+    inline @0 :Data;        # small payloads
+    buffer @1 :T.BufferId;  # large payloads: a reference, never a copy
 }
-
-# ── Events ────────────────────────────────────────────────────────────
-# Event types and subscription interface (pull-based, UInt64 subscription IDs).
-
-# ── Capabilities ──────────────────────────────────────────────────────
-# What authority this service requires/grants.
 ```
 
+E2 enforces it in `ai.capnp` as a hard error; E10 measures it tree-wide. A
+4096-dimensional embedding, a video frame, a container image or a model's
+response travels as a handle. The contract never decides how much data is too
+much, because that decision belongs to the backend and to the moment.
+
+The same logic governs the small things. A timestamp is a struct with an
+explicit clock and unit rather than a bare integer, because "seconds since an
+epoch" is an assumption about a calendar, a planet and a species. A duration is
+explicit about monotonicity. An identifier is an opaque wrapper type rather
+than a `UInt64`, so a consumer cannot accidentally do arithmetic on a process
+ID and so a backend can change its width without a schema edit.
+
 ---
 
-## Summary
+## V. What the tree gave up, and what it bought
 
-**Smart Protocol is timeless because:**
-1. It only defines **external contracts**, never internal implementations
-2. It uses **opaque types** wherever possible
-3. It passes the **Swap Test** for every major component
-4. It **rejects platform nouns** from required enums
-4. It has **strict evolution rules** that guarantee forward compatibility
-5. It treats **all six shapes equally** — no privileged access path
-6. It has **zero-cost serialization** with no runtime diffing
+The 2026-10-10 revamp applied these rules to every schema in the tree. The
+ledger is worth reading as evidence rather than as history.
 
-**The protocol is the only thing that must never change. Everything else is replaceable.**
-Next in the chain: `docs/MANIFESTO.md` (the thesis). Previous: `DESIGN_PRINCIPLES.md`. Front door: `README.md`.
+| Removed | Where it was | What it bought |
+|---|---|---|
+| Scheduler introspection, `CLONE_*` fork flags, live kernel swap | `kernel.capnp` | A kernel boundary of 248 lines that a microkernel, a monolithic kernel or an exokernel can each satisfy |
+| Named storage buses, firmware table layouts, partition enums, UART parity, an ACPI/SMBIOS/DMI surface, an HHDM offset, a raw handler table | `boot.capnp` | A boot handoff of 24 typed bytes and a declarative manifest — no physical-address arithmetic, no format knowledge |
+| ~130 algorithm values in 8 closed crypto enums | `crypto.capnp` | Open tokens with today's spellings published as conformance constants; a construction standardised next year needs no schema edit |
+| A 27-value compression enum, a 14-value transport enum, frozen TLS versions | several | Codecs and transports that do not exist yet are spellable today |
+| Role strings, ACLs, per-method capability parameters, permission enums, free-text authority headers | nine files | One authority model: the reference you hold, gated once |
+| A frozen 47-boolean capability catalogue | `system.capnp` | An open token set with an explicit `partial` honesty flag |
+| Four whole files (`ipc-message`, `filesystem`, `surface`, `textinput`) | tree | Types with one canonical home (E12) instead of two that must agree forever |
+
+The pattern in every row is the same: something that described *how a
+particular implementation worked* was removed, and the contract became smaller,
+cheaper to implement, and larger in the number of implementations it admits.
+
+That is the trade timelessness makes. It does not make the contract more
+capable. It makes the contract **less wrong, for longer**.
+
+---
+
+## VI. What timelessness is not
+
+It is worth being explicit about the boundaries, because "timeless" is a word
+that attracts mysticism.
+
+**It is not a claim of infinite life.** A contract can be defeated by a change
+in the structure of computing itself — a move away from addressable memory, a
+move to a computational substrate where a "buffer reference" is meaningless.
+The claim is narrower and checkable: nothing in this tree is invalidated by a
+new vendor, a new algorithm, a new format, a new architecture, or a new
+paradigm within the same structure.
+
+**It is not absence of change.** Schemas gain methods and types. The rules
+govern *how* they change: additively, at fresh ordinals, with unknown arms and
+open vocabularies so that the change does not break a peer that has not been
+updated.
+
+**It is not vagueness.** An opaque handle is not an unspecified field; it is a
+field whose backing is deliberately the backend's business. The contract is
+precise about what crosses the boundary and silent about what does not.
+
+**It is not free.** Every refusal is a burden on the backend: you must report
+`metadata` instead of naming a model family; you must open a buffer instead of
+passing a pointer; you must tolerate a value you do not understand. The burden
+is deliberate. It is the price of a component that can be replaced.
+
+---
+
+## VII. How you check it
+
+Timelessness is not verified by reading this document. It is verified by
+running the check, and by reading the one schema where the rules are enforced as
+hard errors.
+
+```bash
+python3 scripts/docstats.py    # the open-vocabulary counts, from the tree
+python3 scripts/validate.py    # E1, E2, E8, E13 and the rest
+capnp compile -I schema -o- schema/*.capnp
+```
+
+Then read `schema/ai.capnp` — the gold standard, where the doctrine is not
+described but implemented: zero enums, one `Artifact` for every modality, every
+bulk payload a handle, discovery ungated and every operation behind a gated
+accessor.
+
+If a future edit makes a claim in this document false, the claim is wrong and
+the document is downstream of the artifact. Regenerate it.
+
+---
+
+*Next: [`implementer.md`](implementer.md) for what this means when you build a backend; [`VERIFICATION.md`](VERIFICATION.md) for what the gate measures and what it does not.*
