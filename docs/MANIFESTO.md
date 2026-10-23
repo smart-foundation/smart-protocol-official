@@ -168,6 +168,18 @@ The moat era is ending. Contracts outlive their gardens — TCP/IP, HTTP, SQL, C
 
 ---
 
+## Start here
+
+- Front door: `README.md` (overview, quick start, gate).
+- Doctrine: `DESIGN_PRINCIPLES.md`.
+- Timelessness rationale: `docs/TIMELESSNESS.md`.
+- Implement a backend: `docs/implementer.md` (minimum viable implementation, 5-step process, per-language notes).
+- Run the gate: `python3 scripts/validate.py` (must exit 0).
+
+Previous in the chain: `docs/TIMELESSNESS.md`. Next: `docs/implementer.md`.
+
+---
+
 ## Appendix — the reading map
 
 For the reader who wants the argument in file form. Each of these is a single schema; each is readable in minutes; together they are the whole design.

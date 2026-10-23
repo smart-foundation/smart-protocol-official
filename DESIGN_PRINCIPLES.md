@@ -210,10 +210,10 @@ BufferId                                          AudioFormat
 
 | Schemas | Conflict | Severity | Resolution |
 |---------|----------|----------|------------|
-| `ime.capnp` (Session) vs `textinput.capnp` (TextInput) | Both define IME context management, input method listing, preedit/commit. `ime.capnp` is the newer Session-based design. `textinput.capnp` is the older flat design. | 🔴 High | **Deprecate `textinput.capnp`.** Consolidate into `ime.capnp` Session interface. The Session pattern is the correct forward-compatible design. |
-| `files.capnp` (Files) vs `filesystem.capnp` (Filesystem) | Both define `getSpecialPath`, file operations. `files.capnp` is comprehensive (30 methods). `filesystem.capnp` adds mount/unmount and trash. | 🔴 High | **Merge into `files.capnp`.** Add mount/unmount and trash operations to the Files interface. Delete `filesystem.capnp`. |
+| `ime.capnp` (Session) vs `textinput.capnp` (TextInput) | Both define IME context management, input method listing, preedit/commit. `ime.capnp` is the newer Session-based design. `textinput.capnp` is the older flat design. | 🔴 High | **DONE 2026-10-10:** `textinput.capnp` deleted; unique pieces absorbed into `ime.capnp`. |
+| `files.capnp` (Files) vs `filesystem.capnp` (Filesystem) | Both define `getSpecialPath`, file operations. `files.capnp` is comprehensive (30 methods). `filesystem.capnp` adds mount/unmount and trash. | 🔴 High | **DONE 2026-10-10:** `filesystem.capnp` deleted; mount/unmount and trash merged into `files.capnp`. |
 | `session.capnp` (Session) vs `compositor.capnp` (Session) vs `shell.capnp` (Session) vs `ime.capnp` (Session) vs `buffer.capnp` (BufferSession) vs `windowmanager.capnp` (Session) | Six different `Session` interfaces across schemas. Each is a service-specific handshake. This is acceptable IF each represents a distinct service domain. | 🟡 Medium | **Accept but rename for clarity.** Each `Session` is scoped to its service domain. Consider whether a universal `ServiceSession` pattern could unify the handshake. But do NOT merge domains (compositor ≠ shell ≠ IME). |
-| `surface.capnp` (Surface) vs `compositor.capnp` (Session surface management) | `surface.capnp` defines a standalone Surface interface. `compositor.capnp` Session also manages surfaces. Overlapping responsibilities. | 🔴 High | **Deprecate `surface.capnp`.** Surface management belongs in the compositor Session. The standalone Surface interface duplicates what the compositor already provides with richer context. |
+| `surface.capnp` (Surface) vs `compositor.capnp` (Session surface management) | `surface.capnp` defines a standalone Surface interface. `compositor.capnp` Session also manages surfaces. Overlapping responsibilities. | 🔴 High | **DONE 2026-10-10:** `surface.capnp` deleted; surface management lives in `compositor.capnp` Session. |
 | `buffer.capnp` (Buffer) vs `buffer.capnp` (BufferSession) | Two interfaces in the same file. `Buffer` is the older flat design. `BufferSession` is the newer handshake design. | 🟡 Medium | **Deprecate `Buffer`.** Keep `BufferSession`. Same pattern as compositor (old flat interface coexists with new Session interface during transition). |
 | `compositor.capnp` (Compositor) vs `compositor.capnp` (Session) | Two compositor interfaces in the same file. `Compositor` is the older flat design. `Session` is the newer handshake design. | 🟡 Medium | **Deprecate `Compositor`.** Keep `Session`. |
 | `windowmanager.capnp` (WindowManager) vs `windowmanager.capnp` (Session) | Same pattern: old flat + new Session. | 🟡 Medium | **Deprecate `WindowManager`.** Keep `Session`. |
@@ -225,18 +225,18 @@ BufferId                                          AudioFormat
 
 | Schema | Line(s) | Issue | Severity | Fix |
 |--------|---------|-------|----------|-----|
-| `logging.capnp` | `LogFormat` enum (text, json, xml) | Dictates output format. A logging backend may use binary, CBOR, protobuf, or custom formats. | 🔴 High | Replace with `Data` or remove the enum. The format is an implementation detail of the log consumer. |
-| `logging.capnp` | `LogOutput` enum (stdout, stderr, syslog, journal, file) | Dictates output destination. Backend-specific. | 🔴 High | Replace with `Text` (a named output target, backend-interpreted) or remove. |
-| `logging.capnp` | `LogSource` struct (file, line, function) | Assumes compiled languages with source files. WASM, interpreted, and JIT languages don't have this. | 🟡 Medium | Replace with `source @0 :Data` (opaque, backend-decided). |
-| `files.capnp` | `FilePermissions` struct (owner/group/other as UInt8) | POSIX-specific permission model. Capability-based systems don't use this. | 🔴 High | Replace with an opaque `permissions @0 :Data` field or a universal `List(Permission)` enum. |
-| `files.capnp` | `ExtendedMetadata.inode @15 :UInt64` | inode is a filesystem implementation detail. Distributed filesystems don't have inodes. | 🟡 Medium | Move to a separate `UnixMetadata` struct or make opaque. |
-| `files.capnp` | `ExtendedMetadata.device @16 :UInt64` | Device number is Linux-specific. | 🟡 Medium | Remove or make opaque. |
-| `process.capnp` | `ProcessState` enum (running, sleeping, waiting, stopped, zombie, defunct) | POSIX-specific states. "zombie" and "defunct" are Unix process lifecycle details. | 🟡 Medium | Rename to universal states: `active`, `blocked`, `suspended`, `terminated`. |
+| `logging.capnp` | `LogFormat` enum (text, json, xml) | Dictates output format. A logging backend may use binary, CBOR, protobuf, or custom formats. | 🔴 High | **DONE 2026-10-10:** `LogFormat`/`LogOutput` deleted, `LogSource` opaque. |
+| `logging.capnp` | `LogOutput` enum (stdout, stderr, syslog, journal, file) | Dictates output destination. Backend-specific. | 🔴 High | **DONE 2026-10-10:** `LogOutput` deleted. |
+| `logging.capnp` | `LogSource` struct (file, line, function) | Assumes compiled languages with source files. WASM, interpreted, and JIT languages don't have this. | 🟡 Medium | **DONE 2026-10-10:** `LogSource` made opaque (`source @0 :Data`). |
+| `files.capnp` | `FilePermissions` struct (owner/group/other as UInt8) | POSIX-specific permission model. Capability-based systems don't use this. | 🔴 High | **DONE 2026-10-10:** `FilePermissions` removed; permissions are capability-gated, not POSIX modes. |
+| `files.capnp` | `ExtendedMetadata.inode @15 :UInt64` | inode is a filesystem implementation detail. Distributed filesystems don't have inodes. | 🟡 Medium | **DONE 2026-10-10:** no `inode`/`device` fields; backend internals live in `metadata @16 :T.StringMap`. |
+| `files.capnp` | `ExtendedMetadata.device @16 :UInt64` | Device number is Linux-specific. | 🟡 Medium | **DONE 2026-10-10:** removed. |
+| `process.capnp` | `ProcessState` enum (running, sleeping, waiting, stopped, zombie, defunct) | POSIX-specific states. "zombie" and "defunct" are Unix process lifecycle details. | 🟡 Medium | **DONE 2026-10-10:** `T.ExecutionState` canonical, shared tree-wide. |
 | `process.capnp` | `ThreadInfo.state @2 :Text` | Thread states are backend-defined but exposing as raw Text is too vague. | 🟢 Low | Define a `ThreadState` enum with universal states. |
-| `session.capnp` | `UserInfo.id @0 :UInt32` | Unix uid is 32-bit. Distributed systems need larger. | 🟢 Low | Change to `UInt64`. |
-| `session.capnp` | `UserInfo.shell @4 :Text` | Assumes Unix shell concept. | 🟢 Low | Keep as optional metadata, not a core field. |
-| `windowmanager.capnp` | `Window.pid @15 :UInt32` | Too small for distributed systems. Also, not all window systems have PIDs. | 🟡 Medium | Change to `T.ProcessId` and make optional. |
-| `windowmanager.capnp` | `WindowFilter.processId @6 :UInt32` | Same issue. | 🟡 Medium | Change to `T.ProcessId`. |
+| `session.capnp` | `UserInfo.id @0 :UInt32` | Unix uid is 32-bit. Distributed systems need larger. | 🟢 Low | **DONE 2026-10-10:** `id @0 :T.UserId` (not a POSIX uid). |
+| `session.capnp` | `UserInfo.shell @4 :Text` | Assumes Unix shell concept. | 🟢 Low | **DONE 2026-10-10:** no `shell` field in `UserInfo`. |
+| `windowmanager.capnp` | `Window.pid @15 :UInt32` | Too small for distributed systems. Also, not all window systems have PIDs. | 🟡 Medium | **DONE 2026-10-10:** `processId @15 :T.ProcessId`. |
+| `windowmanager.capnp` | `WindowFilter.processId @6 :UInt32` | Same issue. | 🟡 Medium | **DONE 2026-10-10:** `processId @6 :T.ProcessId`. |
 
 ### Category C: Under-Specification (Missing Contracts)
 
@@ -582,13 +582,13 @@ For each design principle, validate by swapping component implementations. If th
 | Schema | Issue | Priority |
 |--------|-------|----------|
 | `logging.capnp` | Over-specifies format and output targets | 🔴 High — **DONE 2026-10-10:** `LogFormat`/`LogOutput` deleted, `LogSource` opaque. |
-| `files.capnp` | POSIX-specific permissions and metadata | 🔴 High |
-| `textinput.capnp` | Duplicates `ime.capnp` | 🔴 High |
-| `filesystem.capnp` | Duplicates `files.capnp` | 🔴 High |
-| `surface.capnp` | Duplicates compositor surface management | 🔴 High |
+| `files.capnp` | POSIX-specific permissions and metadata | 🔴 High — **DONE 2026-10-10:** `FilePermissions` removed; `inode`/`device` removed. |
+| `textinput.capnp` | Duplicates `ime.capnp` | 🔴 High — **DONE 2026-10-10:** file deleted, absorbed into `ime.capnp`. |
+| `filesystem.capnp` | Duplicates `files.capnp` | 🔴 High — **DONE 2026-10-10:** file deleted, merged into `files.capnp`. |
+| `surface.capnp` | Duplicates compositor surface management | 🔴 High — **DONE 2026-10-10:** file deleted, merged into `compositor.capnp`. |
 | `process.capnp` | POSIX-specific process states | 🟡 Medium — **DONE 2026-10-10** (see `T.ExecutionState`). |
-| `session.capnp` | Unix-specific UserInfo | 🟢 Low |
-| `windowmanager.capnp` | Window.pid uses UInt32 | 🟡 Medium |
+| `session.capnp` | Unix-specific UserInfo | 🟢 Low — **DONE 2026-10-10:** `T.UserId`, no `shell` field. |
+| `windowmanager.capnp` | Window.pid uses UInt32 | 🟡 Medium — **DONE 2026-10-10:** `T.ProcessId`. |
 
 ### Schemas That Are Acceptable (No Changes Needed)
 
@@ -626,11 +626,11 @@ For each design principle, validate by swapping component implementations. If th
 
 ### Immediate (Block v1.0 Release)
 
-1. **Deprecate `textinput.capnp`** — consolidate into `ime.capnp`.
-2. **Deprecate `filesystem.capnp`** — merge mount/unmount into `files.capnp`.
-3. **Deprecate `surface.capnp`** — merge into compositor Session.
+1. **Deprecate `textinput.capnp`** — consolidate into `ime.capnp`. **DONE 2026-10-10** (deleted).
+2. **Deprecate `filesystem.capnp`** — merge mount/unmount into `files.capnp`. **DONE 2026-10-10** (deleted).
+3. **Deprecate `surface.capnp`** — merge into compositor Session. **DONE 2026-10-10** (deleted).
 4. **Fix `logging.capnp`** — remove `LogFormat` and `LogOutput` enums, make `LogSource` opaque. **DONE 2026-10-10.**
-5. **Fix `files.capnp` `FilePermissions`** — replace POSIX model with universal permissions.
+5. **Fix `files.capnp` `FilePermissions`** — replace POSIX model with universal permissions. **DONE 2026-10-10**.
 6. **Fix `process.capnp` `ProcessState`** — rename to universal states. **DONE 2026-10-10.**
 
 ### Short-term (Before v1.1)
@@ -652,3 +652,5 @@ For each design principle, validate by swapping component implementations. If th
 ---
 
 *This document is the canonical reference for smart-protocol schema design. All schema reviews, new proposals, and audit findings should be evaluated against these principles.*
+
+Next in the chain: `docs/TIMELESSNESS.md` (timelessness rationale), then `docs/MANIFESTO.md` (the thesis). See also `README.md`.

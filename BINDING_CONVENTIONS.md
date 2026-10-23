@@ -1,11 +1,13 @@
 # Smart Protocol — Binding Conventions (v0.0.1)
 
+> **Status: LEGACY / GENERATED.** This document was generated against an earlier draft and its schema counts and ordinals may be stale. The `.capnp` files in `schema/` are the source of truth; cross-check before relying on any number here. Current tree: 89 schemas (see `python3 scripts/validate.py`).
+
 **Status:** First implementation. Not yet committed. Nothing has been built against these
 schemas yet, so the wire format is free to evolve within v0.0.1 without breaking anything.
 
 This document explains the **non-obvious contract decisions** that a language binding author
 must follow to build interfaces from the `*.capnp` schemas in `schema/`. The schemas all
-compile cleanly (90/90), but the fixes applied during the audit-10 cleanup introduced a few
+compile cleanly (89/89), but the fixes applied during the audit-10 cleanup introduced a few
 patterns that differ from how Cap'n Proto codegen would normally read the source.
 
 ---
@@ -163,7 +165,7 @@ struct, `ServiceWorkerState` for the enum.
 
 ## 8. Build categories (compile incrementally)
 
-The full workspace has 17 crates and 90 schemas. **Do not compile all at once** — split by
+The full workspace has 17 crates and 89 schemas. **Do not compile all at once** — split by
 category. The `smart-protocol` crate's `build.rs` currently compiles 67 schemas; the
 remaining 23 must be added per category when their crate is built:
 

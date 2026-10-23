@@ -125,15 +125,29 @@ Read three files, in this order, and you have the whole design:
 2. **`schema/capability.capnp`** — authority. Issuance, attenuation, transfer, revocation, delegation chains. Nothing else in the tree implements permission, because nothing else needs to.
 3. **`schema/boot.capnp`** — the handoff. A 24-byte pointer at a well-known address resolves to a declarative Cap'n Proto manifest. No memory math, no format knowledge, no handler tables. This is how small a system contract can be.
 
-Then:
+Then run the gate (exits 0 on success):
 
 ```bash
-python3 scripts/validate.py        # the gate: E1–E14 over all 89 schemas
+python3 scripts/validate.py
+# Schemas parsed: 89 (88 besides ai.capnp)
+# E1 enums in ai.capnp            : 0
+# E2 bulk lists in ai.capnp       : 0
+# E4 interfaces unreachable (all) : 0 reported
+# E6 hits (all schemas)        : 0
+# E9 hits (all schemas)        : 0
+# E10 hits (all schemas)        : 59
+# E12 hits (all schemas)        : 1
+# E13 hits (all schemas)        : 0
+# E14 hits (all schemas)        : 0
+# --- REPORTED (not blocking, 1049) ---
+# (full list of E7/E8/E10/E11 residuals; exit status 0)
 ```
+
+Implementing a backend? See `docs/implementer.md` (5-step process, per-language notes, honesty model).
 
 The subscription pattern is worth one look as well: every live stream is a reference with a bounded `pull` — no raw subscription ids, no offset-into-a-live-stream arithmetic, no producer that can outrun its consumer. And the error model: anything that can fail returns a union carrying `T.Error`, so a missing file, a failed fetch and a locked SIM are routable, not silent.
 
-The doctrine documents (`DESIGN_PRINCIPLES.md`, `docs/TIMELESSNESS.md`), the full schema catalog (`docs/SCHEMAS.md`) and the argument for what this is (`docs/MANIFESTO.md`) sit alongside. Validator green. Every claim in this README is checkable against the files.
+The doctrine documents (`DESIGN_PRINCIPLES.md` → `docs/TIMELESSNESS.md` → `docs/MANIFESTO.md`), the full schema catalog (`docs/SCHEMAS.md`) and the implementer guide (`docs/implementer.md`) sit alongside. Validator green. Every claim in this README is checkable against the files.
 
 ## Build your own OS on this
 
@@ -144,6 +158,8 @@ You need exactly one thing to start: place 24 typed bytes at one well-known addr
 Bring your own kernel: microkernel, monolithic, exokernel, runtime. Bring your own compositor, your own filesystem, your own AI backend. The contract asks only that you exchange what the schemas declare, keep your handles opaque, and never freeze today's nouns into tomorrow's wire. If you can satisfy `ai.capnp`, your intelligence system is future-proof; if you can satisfy `boot.capnp`, your afternoon handoff is an operating system.
 
 The stage is built. Bring your theater.
+
+Implementation guide: `docs/implementer.md` (minimum viable implementation, 5-step process, per-language notes).
 
 ---
 

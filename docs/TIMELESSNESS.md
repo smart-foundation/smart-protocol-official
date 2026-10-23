@@ -260,3 +260,4 @@ interface <ServiceName> {
 6. It has **zero-cost serialization** with no runtime diffing
 
 **The protocol is the only thing that must never change. Everything else is replaceable.**
+Next in the chain: `docs/MANIFESTO.md` (the thesis). Previous: `DESIGN_PRINCIPLES.md`. Front door: `README.md`.
