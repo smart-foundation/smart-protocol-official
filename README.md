@@ -127,7 +127,7 @@ Every number below is counted from the tree by `scripts/docstats.py`; every rule
 | Compile (`capnp compile`, 89/89) | clean |
 | Validator gate | exit 0 |
 
-The gate's enforced rules — E1 (zero enums in `ai.capnp`), E2 (no bulk in `ai.capnp`), E4 and E14 (every interface reachable), E6 (every union extensible), E9 (no platform nouns in required positions), E13 (sequential ordinals) — are all at zero tree-wide. The tree is pre-release, and the remaining REPORT residuals are published rather than hidden: E7 716, E8 267, E10 59, E11 6, E12 1. [`docs/VERIFICATION.md`](docs/VERIFICATION.md) explains what each one means, why the gate still exits 0, and how the count is driven to zero.
+The gate's enforced rules — E1 (zero enums in `ai.capnp`), E2 (no bulk in `ai.capnp`), E4 and E14 (every interface reachable), E6 (every union extensible), E9 (no platform nouns in required positions), E13 (sequential ordinals), and E15 (scoped agent-tool authority) — are all checked by the validator. The tree is pre-release, and the remaining REPORT residuals are published rather than hidden: E7 716, E8 267, E10 59, E11 6, E12 1. [`docs/VERIFICATION.md`](docs/VERIFICATION.md) explains what each one means, why the gate still exits 0, and how the count is driven to zero.
 
 **Running today:** the contract, the validator, the generator scripts, and the reference implementation — the **Naledzi microkernel** — which boots and speaks this contract: `KernelService` at capability handle 1, services exchanging Cap'n Proto over shared memory, init spawning from the boot manifest it was handed. The working OS is not a port target; it feeds the canonical schemas. Its `ShellService` (45 methods) was imported into `shell.capnp`, its vendor-agnostic GPU contract became `gpu.capnp`, and its console byte path and boot configuration plane were imported as-is.
 
@@ -145,7 +145,7 @@ Then run the gate:
 
 ```bash
 python3 scripts/docstats.py    # the inventory above, counted from schema/
-python3 scripts/validate.py    # E1–E14; must exit 0
+python3 scripts/validate.py    # E1–E15; must exit 0
 ```
 
 ---
@@ -154,7 +154,7 @@ python3 scripts/validate.py    # E1–E14; must exit 0
 
 ```
 schema/                   the contract — 89 .capnp files, each header an argument
-scripts/validate.py       the E1–E14 gate, with a real parser (comments stripped)
+scripts/validate.py       the E1–E15 gate, with a real parser (comments stripped)
 scripts/docstats.py       the counter behind every number in these documents
 scripts/check.sh          per-file compile check
 scripts/regenerate.sh     Rust binding generation
