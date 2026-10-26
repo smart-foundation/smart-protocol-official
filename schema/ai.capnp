@@ -1,12 +1,14 @@
-@0xa1b2c3d4e5f60109;
+@0xb6d9e41a73c20f85;
 
 # ══════════════════════════════════════════════════════════════════════
 # AI — universal contract for intelligence: inference, models, tools,
 # agents, knowledge and conversations.
 #
-# REPLACES @0xa1b2c3d4e5f60061, which was never implemented and is deleted.
-# The retired ID is deliberately not reused: an ID bound forever should not
-# be inherited by a draft that was wrong.
+# REPLACES @0xa1b2c3d4e5f60109, retired before first release because its
+# tool-invocation surface could not express least-privilege agent delegation.
+# The earlier @0xa1b2c3d4e5f60061 is also retired. Neither ID is reused.
+# This pre-release revision intentionally makes the breaking authority
+# boundary explicit; deployed implementations must bind to this new ID.
 #
 # ── THE TIMELESSNESS RULE ───────────────────────────────────────────────
 #
@@ -52,6 +54,13 @@
 # authority to call it. Authority is therefore expressed by WHICH
 # REFERENCE YOU HOLD, gated exactly once at acquisition on `interface AI`.
 # `Capability` appears nowhere inside a service method.
+#
+# Tool execution uses a second, deliberately narrower capability: a
+# `ToolExecutor` is bound to one tool and its invoke request contains no
+# `ToolId`. Agents receive only the explicitly supplied executor references,
+# never the broad `ToolRegistry`. An empty tool allowlist means deny all.
+# The agent backend must reject duplicate/missing/mismatched bindings and
+# enforce revocation at invocation time; a declaration alone grants nothing.
 #
 # Consequence: "discover what can I ask for" is available to everyone via
 # the ungated `AI.handshake` / `AI.discover`, while every operation that
@@ -321,10 +330,11 @@ interface InferenceService {
 # A tool declaration is content, so tool schemas are not frozen to JSON
 # Schema: JSON Schema today, anything declarative tomorrow.
 #
-# invoke() carries no authority parameter because holding this reference IS
-# the authority. The previous revision's ToolRegistry.invoke took no
-# authority of any kind — unauthenticated remote code execution — while the
-# file's own header claimed all privileged operations were capability-gated.
+# The registry manages tool declarations and opens scoped executors. It does
+# not expose a generic invoke(ToolId, ...) method: that would let every holder
+# of one broad registry reference select any registered tool at call time.
+# Execution happens only through ToolExecutor, whose reference is bound to
+# one tool at acquisition and whose invocation request contains no ToolId.
 
 struct ToolDeclaration {
     name        @0 :Text;
@@ -332,13 +342,6 @@ struct ToolDeclaration {
     parameters  @2 :Artifact;
     result      @3 :Artifact;
     annotations @4 :T.StringMap;
-}
-
-struct ToolInvocation {
-    request     @0 :RequestId;
-    tool        @1 :ToolId;
-    arguments   @2 :Artifact;
-    annotations @3 :T.StringMap;
 }
 
 # A union, not parallel fields: `success = false` with a nil `error` used
@@ -382,10 +385,10 @@ interface ToolRegistry {
     unregister @1 (tool :ToolId) -> T.VoidResult;
     get        @2 (tool :ToolId) -> (declaration :ToolDeclaration);
     list       @3 (page :T.Pagination) -> (tools :List(ToolDeclaration), total :UInt64);
-    invoke     @4 (invocation :ToolInvocation) -> (outcome :ToolOutcome);
-    # Returns a capability bound to this one tool, only if the caller's
-    # registry reference authorizes execution of this ToolId.
-    open       @5 (tool :ToolId) -> (executor :ToolExecutor);
+    # Opens only the requested tool's executor. Implementations must check
+    # caller authority for this tool and must not treat registry possession
+    # as permission to delegate arbitrary tools to an untrusted agent.
+    open       @4 (tool :ToolId) -> (executor :ToolExecutor);
 }
 
 # ── Agents ──────────────────────────────────────────────────────────────
