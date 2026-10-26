@@ -436,8 +436,10 @@ def main():
     request_has_tool_id = any(t.strip().split(".")[-1] == "ToolId"
                               for _, _, t in request_fields)
     registry_open = any(
-        name == "open" and ordinal == 5 and "ToolExecutor" in results
+        name == "open" and ordinal == 4 and "ToolExecutor" in results
         for name, ordinal, _, results in registry_methods)
+    registry_has_unscoped_invoke = any(
+        name == "invoke" for name, _, _, _ in registry_methods)
     executor_describe = any(
         name == "describe" and ordinal == 0 and "ToolId" in results
         for name, ordinal, _, results in executor_methods)
@@ -450,12 +452,14 @@ def main():
         and "AgentToolBinding" in params
         for name, _, params, _ in agent_methods)
     if not (declaration_tools and binding_executor and registry_open
+            and not registry_has_unscoped_invoke
             and executor_describe and executor_invoke and spawn_scoped):
         errors.append(
-            "E15 ai.capnp lacks explicit per-tool agent authority: require "
+            "E15 ai.capnp lacks scoped agent tool authority: require "
             "AgentDeclaration.tools, AgentToolBinding.executor, ToolRegistry.open "
-            "returning ToolExecutor, ToolExecutor.invoke(ToolRequest without ToolId), "
-            "and AgentService.spawn(toolBindings)")
+            "returning ToolExecutor, no ToolRegistry.invoke(ToolId, ...), "
+            "ToolExecutor.invoke(ToolRequest without ToolId), and "
+            "AgentService.spawn(toolBindings)")
 
     # ---- E5: bounded streams have a structural terminator ---------------
     # Only applies to *STREAM interfaces. An event subscription returns an
