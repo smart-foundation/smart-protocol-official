@@ -1,0 +1,36 @@
+name: Schema validation
+
+on:
+  pull_request:
+    paths:
+      - "schema/**"
+      - "scripts/validate.py"
+      - ".github/workflows/schema-validation.yml"
+  push:
+    branches: [master]
+    paths:
+      - "schema/**"
+      - "scripts/validate.py"
+      - ".github/workflows/schema-validation.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Validate and compile schemas
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Cap'n Proto compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes capnproto
+
+      - name: Enforce schema invariants
+        run: python3 scripts/validate.py
+
+      - name: Compile every schema
+        run: capnp compile -I schema -o- schema/*.capnp

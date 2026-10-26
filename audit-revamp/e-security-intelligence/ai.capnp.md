@@ -20,7 +20,7 @@ None. All method ordinals are unique per interface (`AI` @0–@8; `ModelService`
 - No duplication with any other schema in the batch: `ConversationSpec`, `RetrievalQuery`, `AgentDeclaration` and friends have no counterpart elsewhere. This file is the batch's cleanest on R6.
 
 ## Gaps & holes
-- **Agent tool-permission lifecycle (real fork risk).** `AgentDeclaration` (`:366-376`) has no field naming which tools an agent may use, and `ToolRegistry.invoke @4` (`:357`) accepts any `ToolId`. An agent holding a `ToolRegistry` reference can therefore invoke *every* registered tool, and the capability system cannot narrow it either — `Capability.target` is a free-form string (`capability.capnp:31`) with no declared tool-target grammar, so two implementers will invent two different spellings. Tool permission is the single most-deployed agent control and it has no contract here. Minimal fix: `tools @7 :List(ToolId)` on `AgentDeclaration` (empty = all). One field, no new machinery.
+- **Agent tool-permission lifecycle (pre-fix finding; superseded by the 2026-10-26 E15 proposal below).** The audited baseline allowed `ToolRegistry.invoke` to select any `ToolId` per request and had no portable least-privilege agent binding. The security branch removes that generic invocation path, supplies one-tool `ToolExecutor` references to agents, and defines empty allowlists as deny-all. Runtime enforcement remains a separate acceptance gate; see the follow-up section.
 - `KnowledgeBaseService.add @2` (`:477`) accepts an unbounded `List(Document)` and returns an unbounded `List(DocumentId)`; there is no chunked ingest contract. A 100k-document import exceeds the message limit. Lower priority than the above.
 - `RetrievalHit.evidence @3 :Artifact` (`:454-458`) is documented "optional snippet" but is a required struct field; "absent" has no declared encoding, so backends each invent one.
 
@@ -38,5 +38,34 @@ Correct throughout: every bulk payload is `T.DataHandle` (`:120`, `:164`, `:332-
 3. **Give `AgentService.send @2` a result union.** Gain: agent failure becomes representable instead of silently encoded; cost: one wrapper type.
 4. **Bound the ungated discovery path: `handshake` returns `List(ModelId)` and the existing ungated `discover @1` supplies the descriptor.** Gain: removes an unbounded copy on the path every consumer takes before holding any capability, without reintroducing the acquire-to-discover deadlock the header describes (`:567-570`); cost: one extra round trip callers already have available.
 5. **Add `maxBytes` backpressure (or a `pullPage` variant) to `AISubscription`.** Gain: matches the file's own stream contract and stops subscriber memory exhaustion; cost: one method.
-6. **Drop `AgentDescriptor.grantedAuthority` or mark it explicitly as a cached snapshot with a staleness field.** Gain: one authority source; cost: consumers lose a convenience list they can rebuild from `CapabilityService.list`.
-7. **Add `tools :List(ToolId)` to `AgentDeclaration`.** Gain: the agent tool-permission lifecycle becomes expressible in the contract instead of being re-invented per backend; cost: one field, one new ordinal.
+6. **Follow-up (2026-10-26): remove `AgentDescriptor.grantedAuthority`** in the E15 security revision. Descriptive state no longer duplicates capability-service state.
+7. **Follow-up (2026-10-26): E15 replaces the minimal allowlist-only fix.** The revision adds `AgentDeclaration.tools`, `AgentToolBinding`, and a per-tool `ToolExecutor`; removes generic `ToolRegistry.invoke(ToolId, ...)`; and changes the schema ID for this pre-release breaking revision. Empty tool lists deny all. The schema gate cannot prove that runtime bindings are truthful, so implementation tests must verify exact matching, fail-closed startup, non-delegation of the global registry, and revocation at invocation time.
+
+
+## Follow-up security review — 2026-10-26
+
+This section supersedes the agent-tool lifecycle recommendation above for the
+proposed branch `security/ai-agent-tool-capability-scope`; the earlier sections
+record the pre-fix baseline.
+
+- The schema ID is changed from `@0xa1b2c3d4e5f60109` to
+  `@0xb6d9e41a73c20f85`. The immediately previous ID and the older retired
+  `@0xa1b2c3d4e5f60061` are both recorded as retired and not reused. This is
+  a pre-release breaking change, not a wire-compatible patch.
+- `ToolRegistry` has no unscoped `invoke(ToolId, ...)` method. `open(tool)`
+  returns a `ToolExecutor` for that one tool; its `invoke(ToolRequest)`
+  input contains no tool selector.
+- `AgentDeclaration.tools` is an explicit allowlist. Empty means deny all.
+  `AgentService.spawn` receives explicit `AgentToolBinding` values; each
+  binds one declared ID to one executor capability. Implementations must reject
+  duplicate, missing, extraneous or mismatched bindings and must never pass
+  the broad registry into agent execution.
+- `AgentDescriptor` no longer carries a `List(Capability)` snapshot. The
+  capability service remains the sole source for current authority state.
+- Validator rule E15 checks the structural boundary only. It cannot prove
+  that an implementation enforces the policy, checks revocation on each call,
+  or isolates agent memory from unrelated capabilities. Schema compilation,
+  CI and implementation-level negative tests must pass before merge/release.
+
+This is a proposed fix until the pull request has passed verification; it is
+not a claim that any existing runtime is already secured.

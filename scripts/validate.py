@@ -26,6 +26,7 @@ Rules
   E12 No type name declared in two schemas (R6).
   E13 Interface method ordinals are sequential and declared in order.
   E14 Every interface is reachable; no declared type is unreferenced (R8).
+  E15 Agent tool authority is per-tool, explicit, and deny-by-default.
 
 Severity
   ERROR  — enforced for ai.capnp (the in-scope schema).
@@ -417,6 +418,55 @@ def main():
         errors.append(f"E4 ai.capnp interface {iname} is returned by no method "
                       f"on interface AI — unreachable")
 
+    # ---- E15: explicit scoped agent-tool authority ----------------------
+    # Structural gate only: runtime behavior still needs review and tests.
+    # A spawned agent must receive per-tool capabilities, not a global registry.
+    ai_structs = {n: b for n, b, _ in find_blocks(ai, "struct")}
+    ai_ifaces = {n: b for n, b, _ in find_blocks(ai, "interface")}
+    decl_fields = fields_of(ai_structs.get("AgentDeclaration", ""))
+    descriptor_fields = fields_of(ai_structs.get("AgentDescriptor", ""))
+    binding_fields = fields_of(ai_structs.get("AgentToolBinding", ""))
+    request_fields = fields_of(ai_structs.get("ToolRequest", ""))
+    registry_methods = methods_of(ai_ifaces.get("ToolRegistry", ""))
+    executor_methods = methods_of(ai_ifaces.get("ToolExecutor", ""))
+    agent_methods = methods_of(ai_ifaces.get("AgentService", ""))
+    declaration_tools = any(n == "tools" and t.replace(" ", "") == "List(ToolId)"
+                            for n, _, t in decl_fields)
+    descriptor_exports_authority = any(
+        n.lower() in ("grantedauthority", "grantedcapabilities")
+        or "Capability" in t
+        for n, _, t in descriptor_fields)
+    binding_executor = any(n == "executor" and t.strip() == "ToolExecutor"
+                           for n, _, t in binding_fields)
+    request_has_tool_id = any(t.strip().split(".")[-1] == "ToolId"
+                              for _, _, t in request_fields)
+    registry_open = any(
+        name == "open" and ordinal == 4 and "ToolExecutor" in results
+        for name, ordinal, _, results in registry_methods)
+    registry_has_unscoped_invoke = any(
+        name == "invoke" for name, _, _, _ in registry_methods)
+    executor_describe = any(
+        name == "describe" and ordinal == 0 and "ToolId" in results
+        for name, ordinal, _, results in executor_methods)
+    executor_invoke = any(
+        name == "invoke" and ordinal == 1 and "ToolRequest" in params
+        and not request_has_tool_id
+        for name, ordinal, params, _ in executor_methods)
+    spawn_scoped = any(
+        name == "spawn" and "AgentDeclaration" in params
+        and "AgentToolBinding" in params
+        for name, _, params, _ in agent_methods)
+    if not (declaration_tools and not descriptor_exports_authority
+            and binding_executor and registry_open and not registry_has_unscoped_invoke
+            and executor_describe and executor_invoke and spawn_scoped):
+        errors.append(
+            "E15 ai.capnp lacks scoped agent tool authority: require "
+            "AgentDeclaration.tools, an AgentDescriptor with no embedded authority, "
+            "AgentToolBinding.executor, ToolRegistry.open returning ToolExecutor, "
+            "no ToolRegistry.invoke(ToolId, ...), "
+            "ToolExecutor.invoke(ToolRequest without ToolId), and "
+            "AgentService.spawn(toolBindings)")
+
     # ---- E5: bounded streams have a structural terminator ---------------
     # Only applies to *STREAM interfaces. An event subscription returns an
     # unbounded batch and is terminated by cancel(), so requiring a terminator
@@ -722,6 +772,8 @@ def main():
     print(f"Schemas parsed: {len(schemas)} ({other_schemas} besides ai.capnp)")
     print(f"E1 enums in ai.capnp            : {len(ai_enums)}")
     print(f"E2 bulk lists in ai.capnp       : {len(bulk)}")
+    print("E15 scoped agent tool authority  : " +
+          ("FAILED" if any(e.startswith("E15") for e in errors) else "OK"))
     print(f"E4 interfaces unreachable (all) : "
           f"{len([r for r in reports if r.startswith('E4')])} reported")
     for tag in ("E6", "E7", "E8", "E9", "E10", "E11", "E12", "E13", "E14"):
@@ -740,7 +792,7 @@ def main():
         print()
         print("FAILED")
         return 1
-    print("PASSED — all enforced rules clean for schema/ai.capnp")
+    print("PASSED — enforced rules clean, including scoped agent tool authority (E15)")
     return 0
 
 

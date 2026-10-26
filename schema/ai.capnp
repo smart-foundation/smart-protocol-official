@@ -1,12 +1,14 @@
-@0xa1b2c3d4e5f60109;
+@0xb6d9e41a73c20f85;
 
 # ══════════════════════════════════════════════════════════════════════
 # AI — universal contract for intelligence: inference, models, tools,
 # agents, knowledge and conversations.
 #
-# REPLACES @0xa1b2c3d4e5f60061, which was never implemented and is deleted.
-# The retired ID is deliberately not reused: an ID bound forever should not
-# be inherited by a draft that was wrong.
+# REPLACES @0xa1b2c3d4e5f60109, retired before first release because its
+# tool-invocation surface could not express least-privilege agent delegation.
+# The earlier @0xa1b2c3d4e5f60061 is also retired. Neither ID is reused.
+# This pre-release revision intentionally makes the breaking authority
+# boundary explicit; deployed implementations must bind to this new ID.
 #
 # ── THE TIMELESSNESS RULE ───────────────────────────────────────────────
 #
@@ -53,6 +55,13 @@
 # REFERENCE YOU HOLD, gated exactly once at acquisition on `interface AI`.
 # `Capability` appears nowhere inside a service method.
 #
+# Tool execution uses a second, deliberately narrower capability: a
+# `ToolExecutor` is bound to one tool and its invoke request contains no
+# `ToolId`. Agents receive only the explicitly supplied executor references,
+# never the broad `ToolRegistry`. An empty tool allowlist means deny all.
+# The agent backend must reject duplicate/missing/mismatched bindings and
+# enforce revocation at invocation time; a declaration alone grants nothing.
+#
 # Consequence: "discover what can I ask for" is available to everyone via
 # the ungated `AI.handshake` / `AI.discover`, while every operation that
 # consumes resources or mutates state requires a granted reference. An
@@ -84,7 +93,6 @@
 # ══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
-using import "capability.capnp".Capability;
 
 # ── Identifiers ─────────────────────────────────────────────────────────
 # Opaque references (Opacity Principle). A ModelId is not a file path, a
@@ -321,10 +329,11 @@ interface InferenceService {
 # A tool declaration is content, so tool schemas are not frozen to JSON
 # Schema: JSON Schema today, anything declarative tomorrow.
 #
-# invoke() carries no authority parameter because holding this reference IS
-# the authority. The previous revision's ToolRegistry.invoke took no
-# authority of any kind — unauthenticated remote code execution — while the
-# file's own header claimed all privileged operations were capability-gated.
+# The registry manages tool declarations and opens scoped executors. It does
+# not expose a generic invoke(ToolId, ...) method: that would let every holder
+# of one broad registry reference select any registered tool at call time.
+# Execution happens only through ToolExecutor, whose reference is bound to
+# one tool at acquisition and whose invocation request contains no ToolId.
 
 struct ToolDeclaration {
     name        @0 :Text;
@@ -332,13 +341,6 @@ struct ToolDeclaration {
     parameters  @2 :Artifact;
     result      @3 :Artifact;
     annotations @4 :T.StringMap;
-}
-
-struct ToolInvocation {
-    request     @0 :RequestId;
-    tool        @1 :ToolId;
-    arguments   @2 :Artifact;
-    annotations @3 :T.StringMap;
 }
 
 # A union, not parallel fields: `success = false` with a nil `error` used
@@ -360,12 +362,32 @@ struct ToolOutcomeSuccess {
     custom @1 :Data;
 }
 
+# Request accepted by a ToolExecutor already bound to one tool. Deliberately
+# contains no ToolId: authority comes from the interface reference.
+struct ToolRequest {
+    request     @0 :RequestId;
+    arguments   @1 :Artifact;
+    annotations @2 :T.StringMap;
+    custom      @3 :Data;
+}
+
+# A ToolExecutor returned by open() is a capability bound to exactly one tool.
+# It has no ToolId argument: changing an input ID cannot redirect its authority.
+# An implementation MUST validate current authority and revocation on every call.
+interface ToolExecutor {
+    describe @0 () -> (tool :ToolId, declaration :ToolDeclaration);
+    invoke   @1 (request :ToolRequest) -> (outcome :ToolOutcome);
+}
+
 interface ToolRegistry {
     register   @0 (tool :Artifact, declaration :ToolDeclaration) -> (tool :ToolId);
     unregister @1 (tool :ToolId) -> T.VoidResult;
     get        @2 (tool :ToolId) -> (declaration :ToolDeclaration);
     list       @3 (page :T.Pagination) -> (tools :List(ToolDeclaration), total :UInt64);
-    invoke     @4 (invocation :ToolInvocation) -> (outcome :ToolOutcome);
+    # Opens only the requested tool's executor. Implementations must check
+    # caller authority for this tool and must not treat registry possession
+    # as permission to delegate arbitrary tools to an untrusted agent.
+    open       @4 (tool :ToolId) -> (executor :ToolExecutor);
 }
 
 # ── Agents ──────────────────────────────────────────────────────────────
@@ -384,14 +406,26 @@ struct AgentDeclaration {
     memory       @5 :Artifact;        # memory described by content type,
                                       # implemented however the backend likes
     annotations  @6 :T.StringMap;
+    # Explicit least-privilege allowlist. Empty means NO tools, never all.
+    # These IDs must exactly match the scoped bindings supplied to spawn().
+    tools        @7 :List(ToolId);
+}
+
+# A spawn-time binding pairs an allowed ToolId with its independently scoped
+# executor capability. It is not returned through AgentDescriptor, which is
+# descriptive state and must not become a way to export authority.
+struct AgentToolBinding {
+    tool        @0 :ToolId;
+    executor    @1 :ToolExecutor;
+    annotations @2 :T.StringMap;
+    custom      @3 :Data;
 }
 
 struct AgentDescriptor {
-    id                @0 :AgentId;
-    declaration       @1 :AgentDeclaration;
-    grantedAuthority  @2 :List(Capability);  # reported, not checked here
-    status            @3 :Text;        # opaque token; unknown values ignored
-    state             @4 :T.StringMap;
+    id          @0 :AgentId;
+    declaration @1 :AgentDeclaration;
+    status      @2 :Text;        # opaque token; unknown values ignored
+    state       @3 :T.StringMap;
 }
 
 struct AgentMessage {
@@ -429,8 +463,17 @@ struct AgentFilter {
     annotations @4 :T.StringMap;
 }
 
+# Security invariant for implementations:
+# - declared tool IDs and binding tool IDs must match exactly;
+# - duplicates, missing/extraneous bindings, or an executor whose describe()
+#   returns a different ToolId MUST fail closed;
+# - the runtime receives only the supplied ToolExecutor references, never a
+#   ToolRegistry/global invoke capability;
+# - an empty allowlist means no tool execution authority.
+# AgentService must not widen the caller's grants when creating the agent.
 interface AgentService {
-    spawn      @0 (agent :AgentDeclaration) -> (agent :AgentId);
+    spawn      @0 (agent :AgentDeclaration, toolBindings :List(AgentToolBinding))
+              -> (agent :AgentId);
     terminate  @1 (agent :AgentId, graceful :Bool) -> T.VoidResult;
     send       @2 (message :AgentMessage) -> (result :AgentSendResult);
     describe   @3 (agent :AgentId) -> (descriptor :AgentDescriptor);

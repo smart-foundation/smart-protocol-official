@@ -528,6 +528,7 @@ stripped first, so a phrase in prose is not evidence.
 | E12 | One canonical home per type name |
 | E13 | Interface method ordinals sequential and declared in order |
 | E14 | Every interface reachable; no declared type unreferenced |
+| E15 | Agent tool authority is per-tool, explicit and deny-by-default; descriptors do not export authority snapshots |
 
 `docs/VERIFICATION.md` states the current result of each rule, the severity
 model, and every residual finding by name.
@@ -543,6 +544,12 @@ model, and every residual finding by name.
   every message for no gain.
 - **E14** — an interface accepted as a *parameter* counts as reachable, because
   a registered callback is supplied by the caller and invoked by the peer.
+- **E15** — agents receive only the explicitly supplied per-tool executor
+  references, never a global registry that accepts an arbitrary tool ID at
+  invocation time. An empty allowlist means no tools. A descriptive agent record
+  is not an authority registry; capability state remains owned by the capability
+  service. The validator checks this schema shape, while implementations must
+  still prove matching bindings, fail-closed behavior and revocation enforcement.
 - **E12** — satisfied by elimination, not exemption. There is no sanctioned
   duplicates list.
 

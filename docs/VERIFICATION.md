@@ -80,6 +80,7 @@ intent is explicit: **every schema reaches zero in every rule.**
 | E12 | One canonical home per type name | REPORT |
 | E13 | Method ordinals sequential and declared in order | ENFORCED |
 | E14 | Every interface reachable; no declared type unreferenced | ENFORCED |
+| E15 | Agent tool authority is per-tool, explicit and deny-by-default | ERROR in `ai.capnp` |
 
 ---
 
@@ -219,7 +220,13 @@ number in all three.
 
 ---
 
-## 6. What this gate does not measure
+## 6. Proposed 2026-10-26 security gate — E15
+
+E15 mechanically rejects the old broad tool invocation shape. `ToolRegistry` exposes no generic `invoke(ToolId, ...)`; it opens a `ToolExecutor` bound to one tool. `ToolExecutor.invoke` accepts `ToolRequest`, which contains no `ToolId`. `AgentDeclaration.tools` is an explicit allowlist whose empty value means no tools, and `AgentService.spawn` receives matching `AgentToolBinding` records. `AgentDescriptor` contains no embedded capability snapshot.
+
+This is a structural schema check, **not proof of runtime enforcement**. A conforming implementation must verify that allowlisted IDs and bindings match exactly, reject duplicate/missing/extraneous or misbound executors, never pass the global registry to agent code, and re-check revocation when an executor is invoked. Run `python3 scripts/validate.py` and `capnp compile -I schema -o- schema/*.capnp`; the pull request's CI and runtime tests must confirm these claims before merge. The historical counts above describe the 2026-10-23 tree and are not a result for the proposed branch.
+
+## 7. What this gate does not measure
 
 A validator is a floor, not a proof. It does not measure:
 
@@ -240,7 +247,7 @@ checkable, so they are checked.
 
 ---
 
-## 7. The rule for changing the gate
+## 8. The rule for changing the gate
 
 Do not edit `scripts/validate.py` to silence a finding. A schema that adds a
 finding must justify it in its own header, by name and reason. A rule that is
