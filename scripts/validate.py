@@ -424,6 +424,7 @@ def main():
     ai_structs = {n: b for n, b, _ in find_blocks(ai, "struct")}
     ai_ifaces = {n: b for n, b, _ in find_blocks(ai, "interface")}
     decl_fields = fields_of(ai_structs.get("AgentDeclaration", ""))
+    descriptor_fields = fields_of(ai_structs.get("AgentDescriptor", ""))
     binding_fields = fields_of(ai_structs.get("AgentToolBinding", ""))
     request_fields = fields_of(ai_structs.get("ToolRequest", ""))
     registry_methods = methods_of(ai_ifaces.get("ToolRegistry", ""))
@@ -431,6 +432,10 @@ def main():
     agent_methods = methods_of(ai_ifaces.get("AgentService", ""))
     declaration_tools = any(n == "tools" and t.replace(" ", "") == "List(ToolId)"
                             for n, _, t in decl_fields)
+    descriptor_exports_authority = any(
+        n.lower() in ("grantedauthority", "grantedcapabilities")
+        or "Capability" in t
+        for n, _, t in descriptor_fields)
     binding_executor = any(n == "executor" and t.strip() == "ToolExecutor"
                            for n, _, t in binding_fields)
     request_has_tool_id = any(t.strip().split(".")[-1] == "ToolId"
@@ -451,13 +456,14 @@ def main():
         name == "spawn" and "AgentDeclaration" in params
         and "AgentToolBinding" in params
         for name, _, params, _ in agent_methods)
-    if not (declaration_tools and binding_executor and registry_open
-            and not registry_has_unscoped_invoke
+    if not (declaration_tools and not descriptor_exports_authority
+            and binding_executor and registry_open and not registry_has_unscoped_invoke
             and executor_describe and executor_invoke and spawn_scoped):
         errors.append(
             "E15 ai.capnp lacks scoped agent tool authority: require "
-            "AgentDeclaration.tools, AgentToolBinding.executor, ToolRegistry.open "
-            "returning ToolExecutor, no ToolRegistry.invoke(ToolId, ...), "
+            "AgentDeclaration.tools, an AgentDescriptor with no embedded authority, "
+            "AgentToolBinding.executor, ToolRegistry.open returning ToolExecutor, "
+            "no ToolRegistry.invoke(ToolId, ...), "
             "ToolExecutor.invoke(ToolRequest without ToolId), and "
             "AgentService.spawn(toolBindings)")
 
