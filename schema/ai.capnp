@@ -93,7 +93,6 @@
 # ══════════════════════════════════════════════════════════════════════
 
 using T = import "types.capnp";
-using import "capability.capnp".Capability;
 
 # ── Identifiers ─────────────────────────────────────────────────────────
 # Opaque references (Opacity Principle). A ModelId is not a file path, a
