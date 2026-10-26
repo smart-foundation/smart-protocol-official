@@ -423,11 +423,10 @@ struct AgentToolBinding {
 }
 
 struct AgentDescriptor {
-    id                @0 :AgentId;
-    declaration       @1 :AgentDeclaration;
-    grantedAuthority  @2 :List(Capability);  # reported, not checked here
-    status            @3 :Text;        # opaque token; unknown values ignored
-    state             @4 :T.StringMap;
+    id          @0 :AgentId;
+    declaration @1 :AgentDeclaration;
+    status      @2 :Text;        # opaque token; unknown values ignored
+    state       @3 :T.StringMap;
 }
 
 struct AgentMessage {
